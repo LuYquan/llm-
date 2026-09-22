@@ -1,0 +1,131 @@
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+/// 获取应用数据根目录 (%APPDATA%/LLM-Serial)
+pub fn get_app_dir() -> PathBuf {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        PathBuf::from(appdata).join("LLM-Serial")
+    } else if let Ok(home) = std::env::var("USERPROFILE") {
+        PathBuf::from(home).join(".llm-serial")
+    } else {
+        PathBuf::from("LLM-Serial")
+    }
+}
+
+/// 获取日志目录 (%APPDATA%/LLM-Serial/logs)
+pub fn get_log_dir() -> PathBuf {
+    get_app_dir().join("logs")
+}
+
+/// 清理超过 max_days 天的历史旧日志 (PRD Step 2.1 保留 7 天)
+pub fn cleanup_old_logs(log_dir: &std::path::Path, max_days: u64) {
+    if !log_dir.exists() {
+        return;
+    }
+    let max_age = Duration::from_secs(max_days * 24 * 3600);
+    let now = SystemTime::now();
+
+    if let Ok(entries) = fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(metadata) = entry.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        if let Ok(age) = now.duration_since(modified) {
+                            if age > max_age {
+                                let _ = fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 初始化系统级轮转日志 (控制台输出 + 每日轮转文件)
+pub fn init_logger() -> Option<WorkerGuard> {
+    let log_dir = get_log_dir();
+    let _ = fs::create_dir_all(&log_dir);
+    cleanup_old_logs(&log_dir, 7);
+
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "llm-serial.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,llm_serial_lib=debug"));
+
+    let subscriber = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stdout)
+                .with_target(false)
+                .with_thread_ids(false),
+        )
+        .with(
+            fmt::layer()
+                .with_writer(non_blocking)
+                .with_ansi(false)
+                .with_target(true),
+        );
+
+    if subscriber.try_init().is_ok() {
+        tracing::info!("Logger initialized. Log dir: {}", log_dir.display());
+        Some(guard)
+    } else {
+        None
+    }
+}
+
+/// 在系统文件资源管理器中打开日志目录
+pub fn open_log_directory() -> Result<String, String> {
+    let log_dir = get_log_dir();
+    fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&log_dir)
+            .spawn()
+            .map_err(|e| format!("无法打开资源管理器: {}", e))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&log_dir)
+            .spawn()
+            .map_err(|e| format!("无法打开目录: {}", e))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&log_dir)
+            .spawn()
+            .map_err(|e| format!("无法打开目录: {}", e))?;
+    }
+
+    Ok(log_dir.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_dir_path() {
+        let log_dir = get_log_dir();
+        assert!(log_dir.to_string_lossy().contains("LLM-Serial"));
+        assert!(log_dir.to_string_lossy().contains("logs"));
+    }
+
+    #[test]
+    fn test_cleanup_old_logs_nonexistent_dir() {
+        let dummy_dir = PathBuf::from("nonexistent_test_dir_12345");
+        // Should not panic on non-existent directory
+        cleanup_old_logs(&dummy_dir, 7);
+    }
+}
