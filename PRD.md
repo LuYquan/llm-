@@ -94,9 +94,17 @@
 
 **核心原则**：Rust 做所有"重活"（IO、解析、缓冲、分析），TypeScript 只做 UI 渲染与 AI API 调用。算法只在 Rust 端写一遍，前端通过 Tauri IPC 纯消费。
 
-### 2.4 核心数据结构与 IPC 规范冻结
+### 2.4 核心契约修订与 IPC 规范冻结 (PR-001)
 
-#### 2.4.1 Rust 核心数据模型
+#### 2.4.1 开工前六大工程边界
+1. **115200bps 与 1kHz**：115200bps 8N1 有效上限约 11.5KB/s。1kHz 压测使用 Mock 或 ≥460800bps 串口；115200bps 验收使用短报文速率。不得把物理带宽不足记作软件丢包。
+2. **≤15MB 安装包**：以 Windows NSIS `.exe` 安装包为测量对象，使用系统 WebView2 Runtime，不内嵌完整运行时。
+3. **≤100MB 内存**：验收口径为**应用主进程及其 WebView2 子进程合计内存**。
+4. **AI ≤5 秒**：本地 Mock AI 与正常网络作为性能目标。超时、失败或 JSON 无效时，5 秒内结束等待并展示离线建议，绝不下发。
+5. **软件急停**：空格键和高优先级写队列提供尽力而为的串口急停，不能替代硬件急停或设备看门狗。
+6. **日志“2000 行”与“不丢失”**：UI 和内存环形缓冲保留最近 2000 行；默认另行写入带轮转策略的串口归档文件。
+
+#### 2.4.2 Rust 核心数据模型 (PR-001)
 ```rust
 pub struct SerialConfig {
     pub port: String,
@@ -105,10 +113,12 @@ pub struct SerialConfig {
 
 pub struct SamplePoint {
     pub timestamp_us: u64,
-    pub values: Vec<f64>,
+    pub values: Vec<Option<f64>>, // 支持 Teleplot 稀疏通道异步更新
 }
 
 pub struct WaveformBatch {
+    pub session_id: String,
+    pub channel_epoch: u64,
     pub channel_names: Vec<String>,
     pub points: Vec<SamplePoint>,
 }
@@ -116,24 +126,30 @@ pub struct WaveformBatch {
 pub struct LogLine {
     pub timestamp_us: u64,
     pub direction: LogDirection, // Rx | Tx
-    pub level: LogLevel,         // Info | Warn | Error
+    pub level: LogLevel,         // Info | Warn | Error | Data
     pub text: String,
+    pub raw_hex: Option<String>, // 常规终端 HEX 保真呈现
 }
 
 pub struct StepMetrics {
-    pub overshoot_percent: f64,
+    pub overshoot_percent: Option<f64>,
     pub settling_time_s: Option<f64>,
     pub rise_time_s: Option<f64>,
-    pub steady_state_error: f64,
+    pub steady_state_error: Option<f64>,
 }
 
 pub struct StepSnapshot {
     pub id: String,
+    pub session_id: String,
     pub timestamp_us: u64,
     pub target_before: f64,
     pub target_after: f64,
+    pub channel_binding: ChannelMapping,
+    pub status: StepAnalysisStatus, // Completed | Interrupted | InsufficientData
     pub metrics: StepMetrics,
-    pub samples: Vec<SamplePoint>,
+    pub quality_scores: QualityScores,
+    pub offline_advice: Option<String>,
+    pub samples: Vec<SamplePoint>, // 降采样后的专属切片 (最多约 512 点)
 }
 
 pub struct PidParams {
@@ -143,21 +159,24 @@ pub struct PidParams {
 }
 ```
 
-#### 2.4.2 Tauri Command 冻结列表
-- `list_serial_ports`：枚举系统串口
-- `connect_serial` / `disconnect_serial`：串口连接与断开
-- `send_bytes`：通用字节发送（支持 HEX/ASCII）
+#### 2.4.3 Tauri Command 完整列表 (PR-001 冻结)
+- `list_serial_ports`：枚举系统可用 COM 端口
+- `connect_serial` / `disconnect_serial`：单例串口连接与断开
+- `send_bytes`：通用字节发送（常规与急停队列）
 - `start_mock` / `stop_mock`：启停虚拟仿真源
-- `approve_pid_params`：核准并下发 PID 参数
-- `get_workspace_config` / `save_workspace_config`：工作区状态存取
-- `open_log_directory`：打开本地日志文件夹
+- `approve_pid_params`：人工核准并经 SafetyGuard 校验后下发 PID
+- `get_waveform_window`：按时间段获取 Rust 环形缓冲降采样历史数据（缩放/平移）
+- `start_periodic_send` / `stop_periodic_send`：Rust 调度高精度定时循环发送
+- `calculate_checksums`：Rust 侧常用校验码快速计算（CRC16/CRC32/和校验）
+- `get_workspace_config` / `save_workspace_config`：工作区状态静默存取
+- `open_log_directory`：打开本地日志与归档文件夹
 
-#### 2.4.3 Tauri Event 冻结列表
-- `serial://status`：串口连接状态变更
-- `waveform://batch`：60Hz 批量时序数据派发
-- `logs://batch`：10Hz 批量日志数据派发
-- `step://snapshot`：捕获到新阶跃时生成的静态快照事件
-- `parser://stats`：解析错误与丢弃统计（脏数据监控）
+#### 2.4.4 Tauri Event 完整列表 (PR-001 冻结)
+- `serial://status`：串口连接状态、错误码与会话 ID 变更
+- `waveform://batch`：60Hz 增量时序波形数据派发
+- `logs://batch`：10Hz 批量终端与日志数据派发（含原始字节与文本）
+- `step://snapshot`：捕获到新阶跃时生成的静态不可变快照事件
+- `parser://stats`：解析错误、丢弃统计与通道纪元监控
 
 ---
 
