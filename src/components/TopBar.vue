@@ -52,13 +52,11 @@ function onBaudChange(event: Event) {
     <!-- 品牌与双模切换中枢 -->
     <div class="left-group">
       <div class="brand">
-        <div class="logo-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
-          </svg>
+        <div class="logo-avatar-wrap">
+          <img src="../assets/avatar.png" alt="LLM 串口 Logo" class="brand-avatar" />
         </div>
         <span class="logo-title">LLM 串口</span>
-        <span class="version-tag">v0.2.0</span>
+        <span class="version-tag">AI 调参娘 v1.0</span>
       </div>
 
       <!-- 核心双模切换器 (Step 2.5 核心) -->
@@ -262,20 +260,30 @@ function onBaudChange(event: Event) {
   gap: 8px;
 }
 
-.logo-icon {
-  width: 28px;
-  height: 28px;
-  background: linear-gradient(135deg, #0284c7, #0ea5e9);
-  border-radius: 6px;
+.logo-avatar-wrap {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  overflow: hidden;
+  border: 1.5px solid var(--accent-cyan, #0ea5e9);
+  box-shadow: 0 0 10px rgba(14, 165, 233, 0.4);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #fff;
+  background-color: #1e293b;
+  flex-shrink: 0;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
 
-.logo-icon svg {
-  width: 18px;
-  height: 18px;
+.logo-avatar-wrap:hover {
+  transform: scale(1.1) rotate(5deg);
+  box-shadow: 0 0 14px rgba(14, 165, 233, 0.7);
+}
+
+.brand-avatar {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .logo-title {

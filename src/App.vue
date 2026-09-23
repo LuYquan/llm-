@@ -742,8 +742,13 @@ onUnmounted(() => {
       <div class="modal-card" @click.stop>
         <div class="modal-header">
           <div class="modal-title-group">
-            <span class="modal-sparkle">💡</span>
-            <span class="modal-title">AI 单行日志诊断 (Log Explainer)</span>
+            <div class="modal-avatar-badge">
+              <img src="./assets/avatar.png" alt="AI 调参娘" class="modal-mascot-img" />
+            </div>
+            <div class="modal-title-wrap">
+              <span class="modal-title">AI 调参娘 · 故障日志诊断 (Log Explainer)</span>
+              <span class="modal-subtitle">结合上下文进行硬件/固件异常推理</span>
+            </div>
           </div>
           <button class="modal-close" @click="showLogDiagnoseModal = false">✕</button>
         </div>
@@ -1199,17 +1204,44 @@ onUnmounted(() => {
 .modal-title-group {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
 }
 
-.modal-sparkle {
-  font-size: 16px;
+.modal-avatar-badge {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent-cyan);
+  box-shadow: 0 0 6px rgba(14, 165, 233, 0.4);
+  overflow: hidden;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: #0f172a;
+}
+
+.modal-mascot-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.modal-title-wrap {
+  display: flex;
+  flex-direction: column;
 }
 
 .modal-title {
-  font-size: 14px;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 700;
   color: var(--text-primary);
+  line-height: 1.2;
+}
+
+.modal-subtitle {
+  font-size: 10px;
+  color: var(--text-muted);
 }
 
 .modal-close {

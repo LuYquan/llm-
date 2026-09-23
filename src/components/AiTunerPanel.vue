@@ -124,8 +124,14 @@ function formatDelta(delta: number): string {
   <div class="ai-tuner-card">
     <div class="card-header">
       <div class="title-group">
-        <span class="ai-sparkle">✨</span>
-        <span class="card-title">AI 调参专家 (闭环核准)</span>
+        <div class="ai-avatar-badge">
+          <img src="../assets/avatar.png" alt="AI 调参娘" class="ai-mascot-img" />
+          <span class="online-dot" :class="{ 'is-diagnosing': isDiagnosing }"></span>
+        </div>
+        <div class="title-text-wrap">
+          <span class="card-title">AI 调参娘</span>
+          <span class="card-subtitle">PID 闭环智能专家</span>
+        </div>
       </div>
       <div class="header-actions">
         <span class="provider-badge" :class="aiConfig.api_key ? 'badge-online' : 'badge-offline'">
@@ -337,17 +343,67 @@ function formatDelta(delta: number): string {
 .title-group {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 
-.ai-sparkle {
-  font-size: 14px;
+.ai-avatar-badge {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent-cyan, #0ea5e9);
+  box-shadow: 0 0 8px rgba(14, 165, 233, 0.4);
+  background-color: #0f172a;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.ai-mascot-img {
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.online-dot {
+  position: absolute;
+  bottom: -1px;
+  right: -1px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #10b981;
+  border: 1.5px solid #0f172a;
+}
+
+.online-dot.is-diagnosing {
+  background-color: #f59e0b;
+  animation: pulse-dot 1s infinite alternate;
+}
+
+@keyframes pulse-dot {
+  from { transform: scale(0.9); opacity: 0.6; }
+  to { transform: scale(1.3); opacity: 1; box-shadow: 0 0 6px #f59e0b; }
+}
+
+.title-text-wrap {
+  display: flex;
+  flex-direction: column;
 }
 
 .card-title {
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 700;
   color: var(--text-primary);
+  line-height: 1.2;
+}
+
+.card-subtitle {
+  font-size: 9px;
+  color: var(--text-muted, #94a3b8);
+  letter-spacing: 0.3px;
 }
 
 .header-actions {
