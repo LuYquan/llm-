@@ -1,30 +1,48 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, shallowRef } from 'vue';
 import uPlot from 'uplot';
+import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
-interface WaveformBatch {
-  timestamps: number[];
-  series: number[][];
-  channel_names: string[];
-}
+import type { WaveformBatch, ChannelMapping } from '../types/ipc';
+
+const emit = defineEmits<{
+  (e: 'update-mapping', mapping: ChannelMapping): void;
+}>();
 
 const chartContainer = ref<HTMLDivElement | null>(null);
 const uplotInstance = shallowRef<uPlot | null>(null);
+
+// 通道语义绑定
+const channelMapping = ref<ChannelMapping>({
+  target: 'setpoint',
+  actual: 'actual',
+  output: 'output',
+});
+
+// 可选通道列表
+const availableChannels = ref<string[]>(['setpoint', 'actual', 'output']);
 
 // 最新数值指示
 const currentSetpoint = ref<number | null>(null);
 const currentActual = ref<number | null>(null);
 const currentOutput = ref<number | null>(null);
 const currentError = ref<number | null>(null);
-const channelNames = ref<string[]>(['setpoint', 'actual', 'output']);
+
+// 历史窗口模式 (PR-001 get_waveform_window)
+const isHistoryMode = ref(false);
+const isLoadingHistory = ref(false);
 
 // 环形缓冲容量 (保留最近 3000 点，对应 100Hz 下 30 秒)
 const MAX_POINTS = 3000;
 let xData: number[] = [];
-let y0Data: number[] = []; // setpoint
-let y1Data: number[] = []; // actual
-let y2Data: number[] = []; // output
+let y0Data: number[] = []; // Target
+let y1Data: number[] = []; // Actual
+let y2Data: number[] = []; // Output
+
+// 双缓冲与 requestAnimationFrame 60FPS 顺滑刷新
+let pendingBatches: WaveformBatch[] = [];
+let rafId: number | null = null;
 
 let unlisteners: UnlistenFn[] = [];
 let resizeObserver: ResizeObserver | null = null;
@@ -52,20 +70,20 @@ function initChart() {
         value: (_u, v) => (v == null ? '-' : v.toFixed(2) + 's'),
       },
       {
-        label: '目标值 (setpoint)',
+        label: `目标 (${channelMapping.value.target})`,
         stroke: '#38bdf8', // 天蓝
         width: 2,
         dash: [6, 4],
         value: (_u, v) => (v == null ? '-' : v.toFixed(2)),
       },
       {
-        label: '实际响应 (actual)',
+        label: `响应 (${channelMapping.value.actual})`,
         stroke: '#34d399', // 翡翠绿
         width: 2,
         value: (_u, v) => (v == null ? '-' : v.toFixed(2)),
       },
       {
-        label: '控制输出 (output)',
+        label: `输出 (${channelMapping.value.output})`,
         stroke: '#fbbf24', // 琥珀黄
         width: 1.5,
         value: (_u, v) => (v == null ? '-' : v.toFixed(2)),
@@ -88,7 +106,7 @@ function initChart() {
       },
     ],
     cursor: {
-      drag: { x: true, y: false },
+      drag: { x: true, y: false, setScale: true },
       sync: { key: 'waveform' },
     },
   };
@@ -108,21 +126,90 @@ function initChart() {
     }
   });
   resizeObserver.observe(chartContainer.value);
+
+  // 滚轮缩放支持 (Mouse Wheel Zoom)
+  chartContainer.value.addEventListener('wheel', handleWheel, { passive: false });
+  // 双击重置缩放
+  chartContainer.value.addEventListener('dblclick', handleDoubleClick);
 }
 
-function handleBatch(batch: WaveformBatch) {
-  if (!batch.timestamps || batch.timestamps.length === 0) return;
+function handleWheel(e: WheelEvent) {
+  if (!uplotInstance.value || xData.length === 0) return;
+  e.preventDefault();
 
-  if (batch.channel_names && batch.channel_names.length > 0) {
-    channelNames.value = batch.channel_names;
+  const factor = e.deltaY < 0 ? 0.8 : 1.25;
+  const minX = uplotInstance.value.scales.x.min ?? xData[0];
+  const maxX = uplotInstance.value.scales.x.max ?? xData[xData.length - 1];
+  const range = maxX - minX;
+  if (range <= 0.05 && factor < 1) return; // 最小限制
+
+  const mid = (minX + maxX) / 2;
+  const newRange = range * factor;
+  uplotInstance.value.setScale('x', {
+    min: mid - newRange / 2,
+    max: mid + newRange / 2,
+  });
+}
+
+function handleDoubleClick() {
+  if (!uplotInstance.value || xData.length === 0) return;
+  uplotInstance.value.setScale('x', {
+    min: xData[0],
+    max: xData[xData.length - 1],
+  });
+}
+
+function queueBatch(batch: WaveformBatch) {
+  pendingBatches.push(batch);
+  if (!rafId) {
+    rafId = requestAnimationFrame(flushPendingBatches);
   }
+}
 
-  const count = batch.timestamps.length;
-  for (let i = 0; i < count; i++) {
-    xData.push(batch.timestamps[i]);
-    y0Data.push(batch.series[0]?.[i] ?? 0);
-    y1Data.push(batch.series[1]?.[i] ?? 0);
-    y2Data.push(batch.series[2]?.[i] ?? 0);
+let currentSessionId = '';
+
+function flushPendingBatches() {
+  rafId = null;
+  if (pendingBatches.length === 0) return;
+
+  const batches = pendingBatches;
+  pendingBatches = [];
+
+  for (const batch of batches) {
+    if (!batch.timestamps || batch.timestamps.length === 0) continue;
+
+    if (batch.session_id && currentSessionId && batch.session_id !== currentSessionId) {
+      // 会话变更，清空旧数据以防止时序图混乱跨界 (PR-001 W2)
+      xData = [];
+      y0Data = [];
+      y1Data = [];
+      y2Data = [];
+    }
+    if (batch.session_id) {
+      currentSessionId = batch.session_id;
+    }
+
+    // 更新可用通道列表
+    if (batch.channel_names && batch.channel_names.length > 0) {
+      for (const ch of batch.channel_names) {
+        if (!availableChannels.value.includes(ch)) {
+          availableChannels.value.push(ch);
+        }
+      }
+    }
+
+    const channelNames = batch.channel_names || ['setpoint', 'actual', 'output'];
+    const targetIdx = channelNames.indexOf(channelMapping.value.target);
+    const actualIdx = channelNames.indexOf(channelMapping.value.actual);
+    const outputIdx = channelNames.indexOf(channelMapping.value.output);
+
+    const count = batch.timestamps.length;
+    for (let i = 0; i < count; i++) {
+      xData.push(batch.timestamps[i]);
+      y0Data.push(batch.series[targetIdx >= 0 ? targetIdx : 0]?.[i] ?? 0);
+      y1Data.push(batch.series[actualIdx >= 0 ? actualIdx : 1]?.[i] ?? 0);
+      y2Data.push(batch.series[outputIdx >= 0 ? outputIdx : 2]?.[i] ?? 0);
+    }
   }
 
   // 超过最大容量时丢弃最旧数据点
@@ -143,13 +230,69 @@ function handleBatch(batch: WaveformBatch) {
     currentError.value = Number((y0Data[lastIdx] - y1Data[lastIdx]).toFixed(2));
   }
 
-  // 刷新 uPlot 图表 (60FPS 高效绘制，开启动态尺度自适应以支持时间轴滚动)
-  if (uplotInstance.value) {
+  // 刷新 uPlot 图表 (非历史模式下 60FPS 高效绘制)
+  if (uplotInstance.value && !isHistoryMode.value) {
     uplotInstance.value.setData([xData, y0Data, y1Data, y2Data], true);
   }
 }
 
+async function toggleHistoryMode() {
+  if (isHistoryMode.value) {
+    // 退出历史模式，恢复实时波形
+    isHistoryMode.value = false;
+    if (uplotInstance.value) {
+      uplotInstance.value.setData([xData, y0Data, y1Data, y2Data], true);
+    }
+  } else {
+    // 进入历史模式，从 Rust 环形缓冲获取降采样历史切片 (PR-001 get_waveform_window)
+    isLoadingHistory.value = true;
+    try {
+      const nowUs = Math.round(Date.now() * 1000);
+      const batch = await invoke<WaveformBatch | null>('get_waveform_window', {
+        startUs: 0,
+        endUs: nowUs,
+        maxPoints: 1000,
+      });
+
+      if (batch && batch.timestamps && batch.timestamps.length > 0) {
+        isHistoryMode.value = true;
+        const channelNames = batch.channel_names || ['setpoint', 'actual', 'output'];
+        const targetIdx = channelNames.indexOf(channelMapping.value.target);
+        const actualIdx = channelNames.indexOf(channelMapping.value.actual);
+        const outputIdx = channelNames.indexOf(channelMapping.value.output);
+
+        const hX = batch.timestamps;
+        const hY0 = batch.series[targetIdx >= 0 ? targetIdx : 0] || [];
+        const hY1 = batch.series[actualIdx >= 0 ? actualIdx : 1] || [];
+        const hY2 = batch.series[outputIdx >= 0 ? outputIdx : 2] || [];
+
+        if (uplotInstance.value) {
+          uplotInstance.value.setData([hX, hY0, hY1, hY2], true);
+        }
+      }
+    } catch (err) {
+      console.error('获取历史波形窗口失败:', err);
+    } finally {
+      isLoadingHistory.value = false;
+    }
+  }
+}
+
+async function updateMapping() {
+  try {
+    await invoke('set_channel_mapping', { mapping: channelMapping.value });
+    emit('update-mapping', channelMapping.value);
+  } catch (err) {
+    console.warn('Failed to sync channel mapping:', err);
+  }
+}
+
 function resetData() {
+  pendingBatches = [];
+  if (rafId) {
+    cancelAnimationFrame(rafId);
+    rafId = null;
+  }
   xData = [];
   y0Data = [];
   y1Data = [];
@@ -158,7 +301,6 @@ function resetData() {
   currentActual.value = null;
   currentOutput.value = null;
   currentError.value = null;
-  channelNames.value = ['setpoint', 'actual', 'output'];
   if (uplotInstance.value) {
     uplotInstance.value.setData([[], [], [], []], true);
   }
@@ -168,9 +310,25 @@ onMounted(async () => {
   initChart();
 
   try {
+    // 读取后端已持久化的通道映射
+    const savedMapping = await invoke<ChannelMapping>('get_channel_mapping');
+    if (savedMapping) {
+      channelMapping.value = savedMapping;
+      emit('update-mapping', savedMapping);
+      for (const ch of [savedMapping.target, savedMapping.actual, savedMapping.output]) {
+        if (ch && !availableChannels.value.includes(ch)) {
+          availableChannels.value.push(ch);
+        }
+      }
+    }
+  } catch (err) {
+    // 降级使用默认
+  }
+
+  try {
     // 监听统一 IPC 事件 waveform://batch (PRD 2.4.3)
     const u1 = await listen<WaveformBatch>('waveform://batch', (event) => {
-      handleBatch(event.payload);
+      queueBatch(event.payload);
     });
     unlisteners.push(u1);
 
@@ -186,6 +344,14 @@ onMounted(async () => {
 onUnmounted(() => {
   unlisteners.forEach((u) => u());
   unlisteners = [];
+  if (rafId) {
+    cancelAnimationFrame(rafId);
+    rafId = null;
+  }
+  if (chartContainer.value) {
+    chartContainer.value.removeEventListener('wheel', handleWheel);
+    chartContainer.value.removeEventListener('dblclick', handleDoubleClick);
+  }
   if (resizeObserver && chartContainer.value) {
     resizeObserver.unobserve(chartContainer.value);
     resizeObserver.disconnect();
@@ -198,7 +364,7 @@ onUnmounted(() => {
 
 defineExpose({
   resetData,
-  handleBatch,
+  queueBatch,
 });
 </script>
 
@@ -207,31 +373,68 @@ defineExpose({
     <!-- 图表顶部通道与当前值状态条 -->
     <div class="waveform-header">
       <div class="channel-indicators">
+        <!-- Target 下拉绑定 -->
         <div class="channel-tag tag-setpoint">
           <span class="legend-line line-dashed"></span>
-          <span class="channel-name">目标 ({{ channelNames[0] || 'setpoint' }}):</span>
+          <span class="binding-label">目标:</span>
+          <select
+            class="channel-select font-mono"
+            v-model="channelMapping.target"
+            @change="updateMapping"
+          >
+            <option v-for="ch in availableChannels" :key="ch" :value="ch">{{ ch }}</option>
+          </select>
           <span class="channel-val font-mono">{{ currentSetpoint != null ? currentSetpoint.toFixed(2) : '--' }}</span>
         </div>
+
+        <!-- Actual 下拉绑定 -->
         <div class="channel-tag tag-actual">
           <span class="legend-line line-solid"></span>
-          <span class="channel-name">响应 ({{ channelNames[1] || 'actual' }}):</span>
+          <span class="binding-label">响应:</span>
+          <select
+            class="channel-select font-mono"
+            v-model="channelMapping.actual"
+            @change="updateMapping"
+          >
+            <option v-for="ch in availableChannels" :key="ch" :value="ch">{{ ch }}</option>
+          </select>
           <span class="channel-val font-mono">{{ currentActual != null ? currentActual.toFixed(2) : '--' }}</span>
         </div>
+
+        <!-- Output 下拉绑定 -->
         <div class="channel-tag tag-output">
           <span class="legend-line line-solid line-amber"></span>
-          <span class="channel-name">输出 ({{ channelNames[2] || 'output' }}):</span>
+          <span class="binding-label">输出:</span>
+          <select
+            class="channel-select font-mono"
+            v-model="channelMapping.output"
+            @change="updateMapping"
+          >
+            <option v-for="ch in availableChannels" :key="ch" :value="ch">{{ ch }}</option>
+          </select>
           <span class="channel-val font-mono">{{ currentOutput != null ? currentOutput.toFixed(2) : '--' }}</span>
         </div>
       </div>
 
       <div class="stats-indicators">
+        <button
+          class="btn-history font-mono"
+          :class="{ 'btn-history-active': isHistoryMode }"
+          @click="toggleHistoryMode"
+          :disabled="isLoadingHistory"
+          title="从 Rust 环形缓冲查询并展示完整历史窗口 (LTTB 降采样)"
+        >
+          <span v-if="isLoadingHistory">⏳ 查询中...</span>
+          <span v-else-if="isHistoryMode">🔴 恢复实时</span>
+          <span v-else>📜 历史窗口</span>
+        </button>
         <div class="stat-item" :class="{ 'stat-warn': currentError != null && Math.abs(currentError) > 1.0 }">
           <span class="stat-label">实时误差 e(t):</span>
           <span class="stat-val font-mono">{{ currentError != null ? currentError.toFixed(2) : '--' }}</span>
         </div>
         <div class="stat-item">
           <span class="stat-label">点数缓冲:</span>
-          <span class="stat-val font-mono">{{ xData.length }} / {{ MAX_POINTS }}</span>
+          <span class="stat-val font-mono">{{ isHistoryMode ? '历史降采样 (1000点)' : `${xData.length} / ${MAX_POINTS}` }}</span>
         </div>
       </div>
     </div>
@@ -253,8 +456,8 @@ defineExpose({
 }
 
 .waveform-header {
-  height: 36px;
-  background-color: rgba(19, 27, 38, 0.7);
+  height: 38px;
+  background-color: rgba(19, 27, 38, 0.85);
   border-bottom: 1px solid var(--border-color);
   display: flex;
   align-items: center;
@@ -277,8 +480,28 @@ defineExpose({
   font-size: 12px;
 }
 
+.binding-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.channel-select {
+  background-color: rgba(15, 23, 42, 0.7);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  color: var(--text-primary);
+  font-size: 11px;
+  padding: 1px 4px;
+  outline: none;
+  cursor: pointer;
+}
+
+.channel-select:hover {
+  border-color: var(--accent-cyan);
+}
+
 .legend-line {
-  width: 16px;
+  width: 14px;
   height: 2px;
   border-radius: 1px;
 }
@@ -307,12 +530,9 @@ defineExpose({
   color: var(--accent-amber);
 }
 
-.channel-name {
-  opacity: 0.85;
-}
-
 .channel-val {
   font-weight: 600;
+  min-width: 42px;
 }
 
 .stats-indicators {
@@ -321,6 +541,33 @@ defineExpose({
   gap: 16px;
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+.btn-history {
+  padding: 2px 8px;
+  font-size: 10px;
+  background-color: rgba(14, 165, 233, 0.1);
+  border: 1px solid rgba(14, 165, 233, 0.3);
+  color: var(--accent-cyan);
+  border-radius: 3px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-history:hover:not(:disabled) {
+  background-color: rgba(14, 165, 233, 0.25);
+  border-color: var(--accent-cyan);
+}
+
+.btn-history-active {
+  background-color: rgba(239, 68, 68, 0.2);
+  border-color: var(--accent-rose);
+  color: var(--accent-rose);
+}
+
+.btn-history:disabled {
+  opacity: 0.5;
+  cursor: wait;
 }
 
 .stat-item {
@@ -345,7 +592,7 @@ defineExpose({
 .chart-box {
   flex: 1;
   width: 100%;
-  height: calc(100% - 36px);
+  height: calc(100% - 38px);
   min-height: 0;
   min-width: 0;
   position: relative;

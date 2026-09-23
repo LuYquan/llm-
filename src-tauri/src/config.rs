@@ -14,6 +14,7 @@ pub struct AppConfig {
     pub ai_config: AiConfig,
     pub channel_mapping: ChannelMapping,
     pub quick_commands: Vec<QuickCommand>,
+    pub emergency_command: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -76,22 +77,23 @@ impl Default for AppConfig {
                 QuickCommand {
                     id: "cmd_rst".to_string(),
                     name: "复位".to_string(),
-                    command: "RST\\n".to_string(),
+                    command: "RST\n".to_string(),
                     is_hex: false,
                 },
                 QuickCommand {
                     id: "cmd_calib".to_string(),
                     name: "校准".to_string(),
-                    command: "CALIB\\n".to_string(),
+                    command: "CALIB\n".to_string(),
                     is_hex: false,
                 },
                 QuickCommand {
                     id: "cmd_stop".to_string(),
                     name: "急停".to_string(),
-                    command: "CMD:STOP\\n".to_string(),
+                    command: "CMD:STOP\n".to_string(),
                     is_hex: false,
                 },
             ],
+            emergency_command: None,
         }
     }
 }
@@ -147,6 +149,7 @@ mod tests {
         assert_eq!(config.active_tab, "waveform");
         assert_eq!(config.channel_mapping.target, "setpoint");
         assert_eq!(config.quick_commands.len(), 3);
+        assert_eq!(config.emergency_command, None);
     }
 
     #[test]
@@ -155,6 +158,7 @@ mod tests {
         config.port_name = Some("COM4".to_string());
         config.baud_rate = 921600;
         config.active_tab = "debug".to_string();
+        config.emergency_command = Some("CMD:STOP\\n".to_string());
 
         let json = serde_json::to_string(&config).expect("Serialization failed");
         let deserialized: AppConfig = serde_json::from_str(&json).expect("Deserialization failed");
@@ -163,6 +167,7 @@ mod tests {
         assert_eq!(deserialized.port_name, Some("COM4".to_string()));
         assert_eq!(deserialized.baud_rate, 921600);
         assert_eq!(deserialized.active_tab, "debug");
+        assert_eq!(deserialized.emergency_command, Some("CMD:STOP\\n".to_string()));
     }
 
     #[test]

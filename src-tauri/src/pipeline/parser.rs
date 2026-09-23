@@ -70,12 +70,18 @@ impl TeleplotAligner {
         let is_rollover = is_var_repeat || is_idle_timeout;
 
         if is_rollover && !self.current_frame_vars.is_empty() {
-            // 打包当前缓存为上一个周期的 SamplePoint
+            // 打包当前缓存为上一个周期的 SamplePoint (PR-001 稀疏通道：当前帧更新的为 Some，未更新的为 None)
             let ts = self.current_frame_timestamp_us.unwrap_or(timestamp_us);
-            let values: Vec<f64> = self
+            let values: Vec<Option<f64>> = self
                 .channel_order
                 .iter()
-                .map(|ch| self.cache.get(ch).copied().unwrap_or(0.0))
+                .map(|ch| {
+                    if self.current_frame_vars.contains(ch) {
+                        self.cache.get(ch).copied()
+                    } else {
+                        None
+                    }
+                })
                 .collect();
 
             completed_point = Some(SamplePoint {
@@ -111,10 +117,16 @@ impl TeleplotAligner {
         }
 
         let ts = self.current_frame_timestamp_us.unwrap_or(0);
-        let values: Vec<f64> = self
+        let values: Vec<Option<f64>> = self
             .channel_order
             .iter()
-            .map(|ch| self.cache.get(ch).copied().unwrap_or(0.0))
+            .map(|ch| {
+                if self.current_frame_vars.contains(ch) {
+                    self.cache.get(ch).copied()
+                } else {
+                    None
+                }
+            })
             .collect();
 
         self.current_frame_vars.clear();
@@ -265,6 +277,7 @@ impl TextParser {
             direction,
             level,
             text: text.trim().to_string(),
+            raw_hex: None,
         }
     }
 
@@ -390,7 +403,7 @@ mod tests {
         assert!(p1.is_some());
         let p1 = p1.unwrap();
         assert_eq!(p1.timestamp_us, 1000); // 对齐至第一变量时间戳
-        assert_eq!(p1.values, vec![10.0, 9.2, 30.1]); // 完整打包三个变量
+        assert_eq!(p1.values, vec![Some(10.0), Some(9.2), Some(30.1)]); // 完整打包三个变量
 
         // 周期 2 继续输入
         assert_eq!(aligner.feed("act", 9.5, 11010), None);
@@ -401,7 +414,7 @@ mod tests {
         assert!(p2.is_some());
         let p2 = p2.unwrap();
         assert_eq!(p2.timestamp_us, 11000);
-        assert_eq!(p2.values, vec![10.0, 9.5, 28.4]);
+        assert_eq!(p2.values, vec![Some(10.0), Some(9.5), Some(28.4)]);
     }
 
     #[test]
@@ -419,7 +432,7 @@ mod tests {
         assert!(p1.is_some());
         let p1 = p1.unwrap();
         assert_eq!(p1.timestamp_us, 100);
-        assert_eq!(p1.values, vec![1.0, 2.0]);
+        assert_eq!(p1.values, vec![Some(1.0), Some(2.0)]);
     }
 
     #[test]
@@ -461,7 +474,7 @@ mod tests {
         assert!(p1.is_some(), "Repeat of 'sp' should trigger cycle rollover");
         let p1 = p1.unwrap();
         assert_eq!(p1.timestamp_us, 0);
-        assert_eq!(p1.values, vec![10.0, 9.2, 30.1]);
+        assert_eq!(p1.values, vec![Some(10.0), Some(9.2), Some(30.1)]);
 
         // 周期 2 继续到达
         assert_eq!(aligner.feed("act", 9.5, 11400), None);
@@ -470,7 +483,7 @@ mod tests {
         // 手动 flush
         let p2 = aligner.flush().unwrap();
         assert_eq!(p2.timestamp_us, 10000);
-        assert_eq!(p2.values, vec![10.0, 9.5, 28.0]);
+        assert_eq!(p2.values, vec![Some(10.0), Some(9.5), Some(28.0)]);
     }
 
     #[test]
@@ -481,7 +494,26 @@ mod tests {
 
         assert_eq!(aligner.channel_order(), &["voltage", "current"]);
         let p = aligner.flush().unwrap();
-        assert_eq!(p.values, vec![3.3, 0.45]); // 严禁出现 ghost 0.0
+        assert_eq!(p.values, vec![Some(3.3), Some(0.45)]);
+    }
+
+    #[test]
+    fn test_teleplot_aligner_sparse_channels() {
+        let mut aligner = TeleplotAligner::new();
+        // 周期 1: 3 个通道
+        aligner.feed("ch0", 1.0, 1000);
+        aligner.feed("ch1", 2.0, 1010);
+        aligner.feed("ch2", 3.0, 1020);
+
+        // 周期 2: 仅更新 ch0 和 ch2 (ch1 未更新)
+        let p1 = aligner.feed("ch0", 1.5, 11000).unwrap();
+        assert_eq!(p1.values, vec![Some(1.0), Some(2.0), Some(3.0)]);
+
+        aligner.feed("ch2", 3.5, 11020);
+        // 周期 3
+        let p2 = aligner.feed("ch0", 2.0, 21000).unwrap();
+        // 周期 2 中 ch1 没有更新，因此应为 None！
+        assert_eq!(p2.values, vec![Some(1.5), None, Some(3.5)]);
     }
 }
 

@@ -128,4 +128,18 @@ mod tests {
         // Should not panic on non-existent directory
         cleanup_old_logs(&dummy_dir, 7);
     }
+
+    #[test]
+    fn test_cleanup_old_logs_with_temp_dir() {
+        let temp_dir = std::env::temp_dir().join("llm_serial_test_logger_cleanup");
+        let _ = fs::create_dir_all(&temp_dir);
+        let file1 = temp_dir.join("recent.log");
+        fs::write(&file1, "recent log content").unwrap();
+
+        // With max_days = 10, newly created file should NOT be removed
+        cleanup_old_logs(&temp_dir, 10);
+        assert!(file1.exists());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 }

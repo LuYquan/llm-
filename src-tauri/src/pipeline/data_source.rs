@@ -12,6 +12,16 @@ pub trait DataSource: Send + 'static {
     /// 异步读取下一行原始文本/数据流
     fn read_line(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<String>, String>> + Send + '_>>;
 
+    /// 向底层数据源发送字节流 (Step 4.1 & 7.1)
+    fn write_bytes(&mut self, _bytes: Vec<u8>) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// 向底层数据源发送最高优先级急停字节流 (PR-001 W2 & W7)
+    fn write_emergency_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        self.write_bytes(bytes)
+    }
+
     /// 是否处于连接/激活状态
     fn is_connected(&self) -> bool;
 
@@ -22,6 +32,11 @@ pub trait DataSource: Send + 'static {
     fn stop(&mut self) {}
 }
 
+struct SerialWriteQueue {
+    emergency: VecDeque<Vec<u8>>,
+    normal: VecDeque<Vec<u8>>,
+}
+
 /// 物理串口数据源 (Step 2.3 & 2.4)
 pub struct SerialDataSource {
     port_name: String,
@@ -30,6 +45,42 @@ pub struct SerialDataSource {
     is_running: Arc<AtomicBool>,
     dirty_data_count: Arc<AtomicU64>,
     line_rx: tokio::sync::mpsc::Receiver<Result<String, String>>,
+    queue: Arc<(std::sync::Mutex<SerialWriteQueue>, std::sync::Condvar)>,
+}
+
+/// 从串口原始字节切片中提取完整行并防御乱码与超长数据 (M7 Step 7.2 & 7.3)
+pub fn process_serial_bytes(
+    read_bytes: &[u8],
+    line_buf: &mut Vec<u8>,
+    dirty_counter: &AtomicU64,
+) -> Vec<String> {
+    line_buf.extend_from_slice(read_bytes);
+    let mut lines = Vec::new();
+
+    // 提取以 \n 结尾的每一行
+    while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
+        let line_bytes: Vec<u8> = line_buf.drain(..=pos).collect();
+        match std::str::from_utf8(&line_bytes) {
+            Ok(s) => {
+                let trimmed = s.trim_end_matches(['\r', '\n']);
+                if !trimmed.is_empty() {
+                    lines.push(trimmed.to_string());
+                }
+            }
+            Err(_) => {
+                // 遇到乱码或非 UTF-8 字符时，静默丢弃单行，累计错误计数，不影响后续数据 (Step 7.3)
+                dirty_counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // 防御性设计：超过 16KB 无换行符的巨型二进制数据截断
+    if line_buf.len() > 16384 {
+        dirty_counter.fetch_add(1, Ordering::Relaxed);
+        line_buf.clear();
+    }
+
+    lines
 }
 
 impl SerialDataSource {
@@ -38,6 +89,15 @@ impl SerialDataSource {
             .timeout(Duration::from_millis(50))
             .open()
             .map_err(|e| format!("无法打开串口 [{}]: {}", port_name, e))?;
+
+        let mut write_port = port.try_clone().map_err(|e| format!("克隆串口写入句柄失败: {}", e))?;
+        let queue = Arc::new((
+            std::sync::Mutex::new(SerialWriteQueue {
+                emergency: VecDeque::new(),
+                normal: VecDeque::new(),
+            }),
+            std::sync::Condvar::new(),
+        ));
 
         let (line_tx, line_rx) = tokio::sync::mpsc::channel::<Result<String, String>>(1000);
         let is_running = Arc::new(AtomicBool::new(true));
@@ -49,6 +109,46 @@ impl SerialDataSource {
         let is_connected_thread = is_connected.clone();
         let dirty_counter = dirty_data_count.clone();
         let app_thread = app.clone();
+
+        // 启动后台写入线程 (高优先级急停队列优先弹出)
+        let is_running_write = is_running.clone();
+        let port_name_write = port_name.to_string();
+        let queue_write = queue.clone();
+
+        std::thread::Builder::new()
+            .name(format!("serial-writer-{}", port_name))
+            .spawn(move || {
+                use std::io::Write;
+                let (lock, cvar) = &*queue_write;
+                while is_running_write.load(Ordering::Relaxed) {
+                    let mut q = lock.lock().unwrap();
+                    while q.emergency.is_empty() && q.normal.is_empty() && is_running_write.load(Ordering::Relaxed) {
+                        q = match cvar.wait_timeout(q, Duration::from_millis(50)) {
+                            Ok((guard, _)) => guard,
+                            Err(poisoned) => poisoned.into_inner().0,
+                        };
+                    }
+                    if !is_running_write.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    // 最高优先级急停优先处理
+                    let to_write = if let Some(bytes) = q.emergency.pop_front() {
+                        Some(bytes)
+                    } else {
+                        q.normal.pop_front()
+                    };
+                    drop(q);
+
+                    if let Some(bytes) = to_write {
+                        if let Err(e) = write_port.write_all(&bytes) {
+                            tracing::warn!("串口 [{}] 写入失败: {}", port_name_write, e);
+                        } else {
+                            let _ = write_port.flush();
+                        }
+                    }
+                }
+            })
+            .map_err(|e| format!("启动串口写入线程失败: {}", e))?;
 
         std::thread::Builder::new()
             .name(format!("serial-reader-{}", port_name))
@@ -63,31 +163,11 @@ impl SerialDataSource {
                             std::thread::sleep(Duration::from_millis(2));
                         }
                         Ok(n) => {
-                            line_buf.extend_from_slice(&read_buf[..n]);
-
-                            // 提取以 \n 结尾的每一行
-                            while let Some(pos) = line_buf.iter().position(|&b| b == b'\n') {
-                                let line_bytes: Vec<u8> = line_buf.drain(..=pos).collect();
-                                match std::str::from_utf8(&line_bytes) {
-                                    Ok(s) => {
-                                        let trimmed = s.trim_end_matches(['\r', '\n']);
-                                        if !trimmed.is_empty() {
-                                            if line_tx.blocking_send(Ok(trimmed.to_string())).is_err() {
-                                                return;
-                                            }
-                                        }
-                                    }
-                                    Err(_) => {
-                                        // 遇到乱码或非 UTF-8 字符时，静默丢弃单行，累计错误计数，不影响后续数据 (Step 2.4)
-                                        dirty_counter.fetch_add(1, Ordering::Relaxed);
-                                    }
+                            let extracted = process_serial_bytes(&read_buf[..n], &mut line_buf, &dirty_counter);
+                            for line in extracted {
+                                if line_tx.blocking_send(Ok(line)).is_err() {
+                                    return;
                                 }
-                            }
-
-                            // 防御性设计：超过 16KB 无换行符的巨型二进制数据截断
-                            if line_buf.len() > 16384 {
-                                dirty_counter.fetch_add(1, Ordering::Relaxed);
-                                line_buf.clear();
                             }
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
@@ -124,6 +204,7 @@ impl SerialDataSource {
             is_running,
             dirty_data_count,
             line_rx,
+            queue,
         })
     }
 
@@ -158,6 +239,31 @@ impl DataSource for SerialDataSource {
         self.is_connected.load(Ordering::Relaxed)
     }
 
+    fn write_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        if !self.is_connected.load(Ordering::Relaxed) {
+            return Err("串口未连接".to_string());
+        }
+        let (lock, cvar) = &*self.queue;
+        let mut q = lock.lock().unwrap();
+        if q.normal.len() >= 200 {
+            return Err("写入队列溢出".to_string());
+        }
+        q.normal.push_back(bytes);
+        cvar.notify_one();
+        Ok(())
+    }
+
+    fn write_emergency_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        if !self.is_connected.load(Ordering::Relaxed) {
+            return Err("串口未连接".to_string());
+        }
+        let (lock, cvar) = &*self.queue;
+        let mut q = lock.lock().unwrap();
+        q.emergency.push_back(bytes);
+        cvar.notify_one();
+        Ok(())
+    }
+
     fn reset(&mut self) {
         self.dirty_data_count.store(0, Ordering::Relaxed);
     }
@@ -165,6 +271,7 @@ impl DataSource for SerialDataSource {
     fn stop(&mut self) {
         self.is_running.store(false, Ordering::SeqCst);
         self.is_connected.store(false, Ordering::SeqCst);
+        self.queue.1.notify_all();
     }
 }
 
@@ -441,6 +548,41 @@ impl DataSource for MockDataSource {
         self.is_active = false;
         self.pending_lines.clear();
     }
+
+    fn write_emergency_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        self.y = 0.0;
+        self.dy = 0.0;
+        self.pending_lines.push_back("[EMERGENCY] 最高优先级急停命令已生效，输出已切断至 0\n".to_string());
+        self.write_bytes(bytes)
+    }
+
+    fn write_bytes(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        if let Ok(s) = std::str::from_utf8(&bytes) {
+            let trimmed = s.trim();
+            if trimmed.starts_with("SET:") {
+                let mut kp = self.kp;
+                let mut ki = self.ki;
+                let mut kd = self.kd;
+                for part in trimmed.trim_start_matches("SET:").split(',') {
+                    let mut kv = part.split('=');
+                    if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
+                        match k.trim().to_uppercase().as_str() {
+                            "KP" => if let Ok(val) = v.trim().parse::<f64>() { kp = val; },
+                            "KI" => if let Ok(val) = v.trim().parse::<f64>() { ki = val; },
+                            "KD" => if let Ok(val) = v.trim().parse::<f64>() { kd = val; },
+                            _ => {}
+                        }
+                    }
+                }
+                self.update_pid(kp, ki, kd);
+            } else if trimmed.contains("STOP") {
+                self.pending_lines.push_back("[EMERGENCY] 急停命令已生效，输出已切断至 0\n".to_string());
+            } else {
+                self.pending_lines.push_back(format!("[ECHO] 收到指令: {}\n", trimmed));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -535,6 +677,55 @@ mod tests {
         let (r, _, _) = source.step();
         assert_eq!(r, 10.0);
     }
+
+    #[test]
+    fn test_process_serial_bytes_normal_and_partial_chunks() {
+        let dirty_counter = AtomicU64::new(0);
+        let mut line_buf = Vec::new();
+
+        // 阶段 1: 不完整块
+        let lines1 = process_serial_bytes(b">sp:10.5", &mut line_buf, &dirty_counter);
+        assert!(lines1.is_empty());
+        assert_eq!(dirty_counter.load(Ordering::Relaxed), 0);
+
+        // 阶段 2: 补全并包含下一行
+        let lines2 = process_serial_bytes(b"\r\n>act:9.8\n", &mut line_buf, &dirty_counter);
+        assert_eq!(lines2, vec![">sp:10.5", ">act:9.8"]);
+        assert!(line_buf.is_empty());
+        assert_eq!(dirty_counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_process_serial_bytes_garbled_non_utf8_recovery() {
+        let dirty_counter = AtomicU64::new(0);
+        let mut line_buf = Vec::new();
+
+        // 模拟上电瞬态非 UTF-8 乱码 (如 0xFF, 0xFE, 0xC0) 紧随 \n
+        let garbled = [0xFF, 0xFE, 0xC0, b'\n'];
+        let lines_garbled = process_serial_bytes(&garbled, &mut line_buf, &dirty_counter);
+        assert!(lines_garbled.is_empty(), "Garbled line should be dropped");
+        assert_eq!(dirty_counter.load(Ordering::Relaxed), 1, "Dirty counter should increment");
+
+        // 乱码后立即恢复正常数据解析
+        let valid = b"CMD:OK\n";
+        let lines_valid = process_serial_bytes(valid, &mut line_buf, &dirty_counter);
+        assert_eq!(lines_valid, vec!["CMD:OK"], "Subsequent valid line must be recovered cleanly");
+        assert_eq!(dirty_counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_process_serial_bytes_overflow_protection() {
+        let dirty_counter = AtomicU64::new(0);
+        let mut line_buf = Vec::new();
+
+        // 超过 16KB 无换行符的巨型垃圾数据截断防御 (M7 Step 7.3)
+        let huge_chunk = vec![b'A'; 17_000];
+        let lines = process_serial_bytes(&huge_chunk, &mut line_buf, &dirty_counter);
+        assert!(lines.is_empty());
+        assert_eq!(dirty_counter.load(Ordering::Relaxed), 1, "Buffer overflow should trigger dirty counter");
+        assert!(line_buf.is_empty(), "Line buffer should be wiped clean on overflow");
+    }
 }
+
 
 

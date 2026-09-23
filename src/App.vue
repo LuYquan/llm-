@@ -2,8 +2,16 @@
 import { ref, onMounted, onUnmounted, watch } from 'vue';
 import TopBar, { SerialPortInfo } from './components/TopBar.vue';
 import WaveformViewer from './components/WaveformViewer.vue';
+import GeneralTerminal, { type LogLine } from './components/GeneralTerminal.vue';
+import QuickCommandPanel, { type QuickCmd } from './components/QuickCommandPanel.vue';
+import CrcTools from './components/CrcTools.vue';
+import SnapshotStream from './components/SnapshotStream.vue';
+import MetricRadar, { type RadarScores } from './components/MetricRadar.vue';
+import AiTunerPanel from './components/AiTunerPanel.vue';
+import { explainLog, type AiConfig, type PidParams } from './services/ai';
 import { invoke } from '@tauri-apps/api/core';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { SerialStatusEvent, StepSnapshot } from './types/ipc';
 
 interface PipelineStatus {
   is_running: boolean;
@@ -18,38 +26,21 @@ interface AppConfig {
   baud_rate: number;
   mode: string;
   active_tab: string;
-  ai_config: {
-    provider: string;
-    api_key: string;
-    api_url: string;
-    model: string;
-  };
+  ai_config: AiConfig;
   channel_mapping: {
     target: string;
     actual: string;
     output: string;
   };
-  quick_commands: Array<{
-    id: string;
-    name: string;
-    command: string;
-    is_hex: boolean;
-  }>;
-}
-
-interface LogEntry {
-  id: number;
-  time: string;
-  tag: string;
-  level: 'info' | 'warn' | 'error';
-  text: string;
+  quick_commands: QuickCmd[];
+  emergency_command?: string | null;
 }
 
 // 核心工作区状态
 const isRunning = ref(false);
 const connectionState = ref<'connected' | 'disconnected' | 'connecting' | 'reconnecting' | 'error'>('disconnected');
 const mode = ref('mock');
-const activeTab = ref('waveform'); // 'debug' | 'waveform' (Step 2.5 核心双模)
+const activeTab = ref('waveform'); // 'waveform' | 'debug' (核心双模)
 const selectedPort = ref('');
 const selectedBaud = ref('115200');
 const ports = ref<SerialPortInfo[]>([]);
@@ -57,10 +48,24 @@ const isRefreshingPorts = ref(false);
 const totalSamples = ref(0);
 const sampleRate = ref(100);
 
+// 组件引用
+const terminalRef = ref<InstanceType<typeof GeneralTerminal> | null>(null);
+const snapshotStreamRef = ref<InstanceType<typeof SnapshotStream> | null>(null);
+
+// 快照与雷达状态
+const activeSnapshot = ref<StepSnapshot | null>(null);
+const radarScores = ref<RadarScores>({
+  overshoot_score: 85,
+  speed_score: 75,
+  steady_score: 90,
+  damping_score: 80,
+  robust_score: 88,
+});
+
 // 底栏抽屉与日志
 const isLogDrawerOpen = ref(false);
 let logIdCounter = 0;
-const logs = ref<LogEntry[]>([
+const logs = ref<LogLine[]>([
   {
     id: ++logIdCounter,
     time: formatTime(new Date()),
@@ -84,23 +89,22 @@ let disconnectTimer: number | null = null;
 
 // 急停提示 Toast (ADR 0004)
 const showEmergencyToast = ref(false);
+const emergencyToastTitle = ref('');
+const emergencyToastDesc = ref('');
+const emergencyToastLevel = ref<'warn' | 'error' | 'success'>('warn');
 let emergencyTimer: number | null = null;
 
-// 常规调试模式发送区临时状态
-const sendText = ref('');
-const sendAsHex = ref(false);
-const appendNewline = ref(true);
-
-// 快捷指令列表
-const quickCommands = ref([
-  { id: 'rst', name: '复位', cmd: 'RST\\n' },
-  { id: 'calib', name: '校准', cmd: 'CALIB\\n' },
-  { id: 'stop', name: '急停', cmd: 'CMD:STOP\\n', danger: true },
-]);
+// 单行日志 AI 诊断弹窗
+const showLogDiagnoseModal = ref(false);
+const diagnosingLog = ref<LogLine | null>(null);
+const isExplainingLog = ref(false);
+const logDiagnosisText = ref('');
 
 let statusInterval: number | null = null;
 let unlistenSerialDisconnect: UnlistenFn | null = null;
 let unlistenLogsBatch: UnlistenFn | null = null;
+let unlistenStepSnapshot: UnlistenFn | null = null;
+let unlistenSerialStatus: UnlistenFn | null = null;
 let saveConfigTimer: number | null = null;
 
 function formatTime(d: Date): string {
@@ -117,7 +121,7 @@ function appendLog(level: 'info' | 'warn' | 'error', tag: string, text: string) 
     level,
     text,
   });
-  if (logs.value.length > 500) {
+  if (logs.value.length > 1000) {
     logs.value.shift();
   }
 }
@@ -139,10 +143,11 @@ const appConfig = ref<AppConfig>({
     output: 'output',
   },
   quick_commands: [
-    { id: 'cmd_rst', name: '复位', command: 'RST\\n', is_hex: false },
-    { id: 'cmd_calib', name: '校准', command: 'CALIB\\n', is_hex: false },
-    { id: 'cmd_stop', name: '急停', command: 'CMD:STOP\\n', is_hex: false },
+    { id: 'cmd_rst', name: '复位', command: 'RST\n', is_hex: false },
+    { id: 'cmd_calib', name: '校准', command: 'CALIB\n', is_hex: false },
+    { id: 'cmd_stop', name: '急停', command: 'CMD:STOP\n', is_hex: false, danger: true },
   ],
+  emergency_command: null,
 });
 
 // 刷新串口列表 (Step 2.3)
@@ -162,7 +167,7 @@ async function refreshPorts() {
   }
 }
 
-// 加载工作区持久化配置 (Step 2.2)
+// 加载工作区持久化配置 (Step 2.2 & M8)
 async function loadConfig() {
   try {
     const cfg = await invoke<AppConfig>('load_app_config');
@@ -176,7 +181,7 @@ async function loadConfig() {
   }
 }
 
-// 防抖静默保存工作区配置 (Step 2.2)
+// 防抖静默保存工作区配置 (Step 2.2 & M8)
 function debouncedSaveConfig() {
   if (saveConfigTimer) clearTimeout(saveConfigTimer);
   saveConfigTimer = window.setTimeout(async () => {
@@ -299,25 +304,82 @@ function toggleLogDrawer() {
   isLogDrawerOpen.value = !isLogDrawerOpen.value;
 }
 
+// 全局键盘事件处理 (ADR 0004 空格键急停)
 function handleKeyDown(event: KeyboardEvent) {
-  // 空格键全局急停槽位响应 (ADR 0004)
+  const target = event.target as HTMLElement | null;
   if (
     event.code === 'Space' &&
-    (event.target as HTMLElement)?.tagName !== 'INPUT' &&
-    (event.target as HTMLElement)?.tagName !== 'TEXTAREA'
+    target?.tagName !== 'INPUT' &&
+    target?.tagName !== 'TEXTAREA' &&
+    target?.tagName !== 'SELECT' &&
+    !target?.isContentEditable
   ) {
     event.preventDefault();
     triggerEmergencyStop();
   }
 }
 
-function triggerEmergencyStop() {
-  showEmergencyToast.value = true;
-  appendLog('warn', '[EMERGENCY]', '全局空格键触发急停槽位：未绑定设备停机指令，未发出任何字节 (ADR 0004)。');
+// ADR 0004 急停发送状态机
+async function triggerEmergencyStop() {
+  const cmd = appConfig.value.emergency_command?.trim();
+
+  // 1. 未绑定命令：不得发出任何字节，弹出明确提示引导配置
+  if (!cmd) {
+    emergencyToastTitle.value = '急停槽位未绑定命令 (ADR 0004)';
+    emergencyToastDesc.value = '根据安全决策，系统未内置设备特定停机指令，未发出任何字节。请在快捷指令或设置中配置硬件停机命令。';
+    emergencyToastLevel.value = 'warn';
+    showEmergencyToast.value = true;
+    appendLog('warn', '[EMERGENCY]', '全局空格键触发：急停槽位未绑定命令，未发出任何字节 (ADR 0004)。');
+    resetEmergencyTimer();
+    return;
+  }
+
+  // 2. 串口未连接：上报未送达
+  if (!isRunning.value) {
+    emergencyToastTitle.value = '急停未送达：串口未连接 (ADR 0004)';
+    emergencyToastDesc.value = `端口未打开，急停指令 [${cmd}] 无法送达设备。`;
+    emergencyToastLevel.value = 'error';
+    showEmergencyToast.value = true;
+    appendLog('error', '[EMERGENCY]', `全局空格键触发：串口未打开，急停指令未送达: ${cmd} (ADR 0004)。`);
+    resetEmergencyTimer();
+    return;
+  }
+
+  // 3. 已连接且已绑定：走独立的最高优先级发送路径，瞬间下发 (自动判断 HEX / ASCII)
+  try {
+    const isHexCmd = /^[0-9A-Fa-f]{2}(\s+[0-9A-Fa-f]{2})*$/.test(cmd);
+    await invoke('send_emergency_stop', {
+      data: cmd,
+    });
+    emergencyToastTitle.value = '已发出急停指令（未确认回执） (ADR 0004)';
+    emergencyToastDesc.value = `最高优先级急停指令 [${cmd}] 已发出${isHexCmd ? ' (HEX)' : ''}。物理链路无回执，请核查硬件状态。`;
+    emergencyToastLevel.value = 'warn';
+    showEmergencyToast.value = true;
+    appendLog('warn', '[EMERGENCY]', `全局空格键触发：最高优先级急停指令已发出 (未确认回执): ${cmd} (ADR 0004)。`);
+    resetEmergencyTimer();
+  } catch (err: any) {
+    emergencyToastTitle.value = '急停发送失败 (ADR 0004)';
+    emergencyToastDesc.value = `下发急停指令失败: ${err}`;
+    emergencyToastLevel.value = 'error';
+    showEmergencyToast.value = true;
+    appendLog('error', '[EMERGENCY]', `下发急停指令失败: ${err}`);
+    resetEmergencyTimer();
+  }
+}
+
+function resetEmergencyTimer() {
   if (emergencyTimer) clearTimeout(emergencyTimer);
   emergencyTimer = window.setTimeout(() => {
     showEmergencyToast.value = false;
-  }, 3000);
+  }, 4000);
+}
+
+// 一键绑定急停指令快捷入口
+function bindEmergencyCommand(cmd: string) {
+  appConfig.value.emergency_command = cmd;
+  debouncedSaveConfig();
+  showEmergencyToast.value = false;
+  appendLog('info', '[CONFIG]', `急停槽位已成功绑定指令: ${cmd}`);
 }
 
 function triggerDisconnectAlert(msg: string) {
@@ -329,6 +391,91 @@ function triggerDisconnectAlert(msg: string) {
   }, 5000);
 }
 
+// 终端数据发送 (M4 Step 4.1)
+async function handleSendSerialData(data: string, isHex: boolean, appendNewline: boolean) {
+  try {
+    await invoke('send_serial_data', { data, isHex, appendNewline });
+  } catch (err: any) {
+    appendLog('error', '[TX_ERR]', `发送失败: ${err?.message || err}`);
+  }
+}
+
+function handleClearLogs() {
+  logs.value = [];
+}
+
+function handleAppendToSend(text: string) {
+  terminalRef.value?.appendPreset(text);
+}
+
+// 快捷指令发送 (M4 Step 4.2)
+async function handleSendQuickCommand(cmd: QuickCmd) {
+  if (cmd.danger) {
+    triggerEmergencyStop();
+    return;
+  }
+  try {
+    await invoke('send_serial_data', {
+      data: cmd.command,
+      isHex: cmd.is_hex,
+      appendNewline: true,
+    });
+    appendLog('info', '[TX:CMD]', `${cmd.name}: ${cmd.command}`);
+  } catch (err: any) {
+    appendLog('error', '[TX:CMD_ERR]', `${cmd.name} 发送失败: ${err}`);
+  }
+}
+
+function handleUpdateQuickCommands(list: QuickCmd[]) {
+  appConfig.value.quick_commands = list;
+  debouncedSaveConfig();
+}
+
+function handleChannelMappingUpdate(mapping: { target: string; actual: string; output: string }) {
+  appConfig.value.channel_mapping = mapping;
+  debouncedSaveConfig();
+}
+
+// 快照流选中与五维雷达评分计算 (M3 & M6)
+async function handleSelectSnapshot(snapshot: StepSnapshot) {
+  activeSnapshot.value = snapshot;
+  try {
+    const scores = await invoke<RadarScores>('score_step_metrics', {
+      metrics: snapshot.metrics,
+    });
+    radarScores.value = scores;
+  } catch (err) {
+    console.warn('Failed to score step metrics:', err);
+  }
+}
+
+function handleUpdateAiConfig(cfg: AiConfig) {
+  appConfig.value.ai_config = cfg;
+  debouncedSaveConfig();
+}
+
+function handlePidApplied(newPid: PidParams) {
+  appendLog('info', '[PID:APPLY]', `已向设备核准下发新 PID: Kp=${newPid.kp}, Ki=${newPid.ki}, Kd=${newPid.kd}`);
+}
+
+// 单行报错 AI 诊断 (M5 Step 5.4)
+async function handleDiagnoseLog(log: LogLine) {
+  diagnosingLog.value = log;
+  showLogDiagnoseModal.value = true;
+  isExplainingLog.value = true;
+  logDiagnosisText.value = '';
+
+  try {
+    const contextTexts = logs.value.slice(-10).map((l) => `[${l.time}] ${l.tag} ${l.text}`);
+    const explanation = await explainLog(log.text, contextTexts, appConfig.value.ai_config);
+    logDiagnosisText.value = explanation;
+  } catch (err: any) {
+    logDiagnosisText.value = `诊断失败: ${err?.message || err}`;
+  } finally {
+    isExplainingLog.value = false;
+  }
+}
+
 onMounted(async () => {
   window.addEventListener('keydown', handleKeyDown);
 
@@ -338,7 +485,7 @@ onMounted(async () => {
   // 2. 枚举串口列表
   await refreshPorts();
 
-  // 3. 监听串口热插拔断开事件 (Step 2.4 热插拔容错)
+  // 3. 监听串口热插拔断开事件 (Step 2.4 & M7)
   try {
     unlistenSerialDisconnect = await listen('serial-disconnected', (event: any) => {
       const p = event.payload?.port || selectedPort.value;
@@ -350,6 +497,32 @@ onMounted(async () => {
     });
   } catch (e) {
     console.warn('Failed to register serial-disconnected listener:', e);
+  }
+
+  // 3.1 监听统一串口状态与重插检测事件 (PR-001 / W2 serial://status)
+  try {
+    unlistenSerialStatus = await listen<SerialStatusEvent>('serial://status', (event) => {
+      const payload = event.payload;
+      if (payload.reappeared) {
+        appendLog('info', '[SERIAL]', `检测到原串口 [${payload.port || ''}] 已重新插入，可点击重新连接。`);
+        triggerDisconnectAlert(`串口 [${payload.port || ''}] 已重新插入，可点击重新连接`);
+        connectionState.value = 'reconnecting';
+        return;
+      }
+      if (payload.is_connected) {
+        connectionState.value = 'connected';
+        isRunning.value = true;
+      } else {
+        connectionState.value = payload.error ? 'error' : 'disconnected';
+        isRunning.value = false;
+        if (payload.error) {
+          appendLog('warn', '[SERIAL]', `串口连接中断: ${payload.error}`);
+          triggerDisconnectAlert(`串口中断: ${payload.error}`);
+        }
+      }
+    });
+  } catch (e) {
+    console.warn('Failed to register serial://status listener:', e);
   }
 
   // 4. 监听 10Hz 日志批次派发 (M1 Step 1.4: logs://batch)
@@ -367,7 +540,18 @@ onMounted(async () => {
     console.warn('Failed to register logs://batch listener:', e);
   }
 
-  // 5. 定时拉取后端状态
+  // 5. 监听阶跃快照事件 (M3 Step 3.3: step://snapshot)
+  try {
+    unlistenStepSnapshot = await listen<StepSnapshot>('step://snapshot', (event) => {
+      if (!activeSnapshot.value) {
+        handleSelectSnapshot(event.payload);
+      }
+    });
+  } catch (e) {
+    console.warn('Failed to register step://snapshot listener:', e);
+  }
+
+  // 6. 定时拉取后端状态
   checkStatus();
   statusInterval = window.setInterval(checkStatus, 500);
 
@@ -388,7 +572,9 @@ onUnmounted(() => {
   if (disconnectTimer) clearTimeout(disconnectTimer);
   if (saveConfigTimer) clearTimeout(saveConfigTimer);
   if (unlistenSerialDisconnect) unlistenSerialDisconnect();
+  if (unlistenSerialStatus) unlistenSerialStatus();
   if (unlistenLogsBatch) unlistenLogsBatch();
+  if (unlistenStepSnapshot) unlistenStepSnapshot();
 });
 </script>
 
@@ -415,187 +601,64 @@ onUnmounted(() => {
       @refresh-ports="refreshPorts"
     />
 
-    <!-- 主工作区：根据 activeTab 双模平滑切换 -->
+    <!-- 主工作区：根据 activeTab 双模平滑切换 (PRD 核心双模) -->
     <div class="main-body">
-      <!-- 视图 A：【AI波形调参模式】 (VOFA+ 超集) -->
+      <!-- 视图 A：【AI波形调参模式】 (VOFA+ 超集，M2, M3, M5, M6) -->
       <div class="mode-view-wrapper" v-show="activeTab === 'waveform'">
-        <!-- 左区：uPlot 实时波形视窗 -->
+        <!-- 左区：uPlot 实时波形视窗 (M2) -->
         <section class="waveform-panel">
-          <WaveformViewer />
+          <WaveformViewer @update-mapping="handleChannelMappingUpdate" />
         </section>
 
-        <!-- 右区：AI 调参卡片与辅助信息 -->
+        <!-- 右区：阶跃快照流、五维品质雷达、AI 调参卡片 (M3, M5, M6) -->
         <aside class="sidebar-panel">
-          <!-- AI 调参卡片 -->
-          <div class="card ai-card">
-            <div class="card-header">
-              <div class="card-title-group">
-                <span class="ai-sparkle">✨</span>
-                <span class="card-title">AI 调参专家</span>
-              </div>
-              <span class="badge badge-amber">阶段四接入</span>
-            </div>
-            <div class="card-body">
-              <div class="ai-status-box">
-                <span class="ai-hint-title">阶跃指标自动提取</span>
-                <p class="ai-hint-desc">
-                  当检测到目标值阶跃时，系统将在此自动呈现超调量 Mp、调节时间 ts、稳态误差 ess，并由大模型提供 Kp/Ki/Kd 结构化优化建议。
-                </p>
-              </div>
-              <div class="param-preview-group">
-                <div class="param-row">
-                  <span class="param-name">Kp (比例增益)</span>
-                  <span class="param-val font-mono">1.80</span>
-                </div>
-                <div class="param-row">
-                  <span class="param-name">Ki (积分增益)</span>
-                  <span class="param-val font-mono">0.60</span>
-                </div>
-                <div class="param-row">
-                  <span class="param-name">Kd (微分增益)</span>
-                  <span class="param-val font-mono">0.25</span>
-                </div>
-              </div>
-              <button class="btn-ai-action" disabled>
-                <span>请求 AI 诊断 (待接入)</span>
-              </button>
-            </div>
-          </div>
+          <!-- 阶跃快照流历史 (M3) -->
+          <SnapshotStream
+            ref="snapshotStreamRef"
+            @select-snapshot="handleSelectSnapshot"
+          />
 
-          <!-- 控制品质雷达图占位 -->
-          <div class="card radar-card">
-            <div class="card-header">
-              <span class="card-title">PID 品质五维雷达</span>
-              <span class="badge badge-muted">ECharts 占位</span>
-            </div>
-            <div class="card-body radar-placeholder">
-              <div class="radar-circle">
-                <span class="radar-label top">超调 Mp</span>
-                <span class="radar-label right">速度 ts</span>
-                <span class="radar-label bottom-right">阻尼比 ζ</span>
-                <span class="radar-label bottom-left">鲁棒性</span>
-                <span class="radar-label left">稳态 ess</span>
-                <div class="radar-inner-shape"></div>
-              </div>
-            </div>
-          </div>
+          <!-- PID 控制品质五维雷达图 (M6) -->
+          <MetricRadar :scores="radarScores" />
 
-          <!-- 会话与硬件信息 -->
-          <div class="card session-card">
-            <div class="card-header">
-              <span class="card-title">当前通信状态</span>
-            </div>
-            <div class="card-body session-info">
-              <div class="info-item">
-                <span class="info-k">数据源模式:</span>
-                <span class="info-v">{{ mode === 'serial' ? '物理串口驱动' : 'Mock 仿真源 (100Hz)' }}</span>
-              </div>
-              <div class="info-item" v-if="mode === 'serial'">
-                <span class="info-k">当前端口:</span>
-                <span class="info-v font-mono">{{ selectedPort || '未选择' }}</span>
-              </div>
-              <div class="info-item" v-if="mode === 'serial'">
-                <span class="info-k">波特率:</span>
-                <span class="info-v font-mono">{{ selectedBaud }}</span>
-              </div>
-              <div class="info-item">
-                <span class="info-k">刷新频率:</span>
-                <span class="info-v font-mono">60 FPS IPC 批次</span>
-              </div>
-            </div>
-          </div>
+          <!-- AI 调参专家与 SafetyGuard 核准闭环 (M5 & M6) -->
+          <AiTunerPanel
+            :active-snapshot="activeSnapshot"
+            :ai-config="appConfig.ai_config"
+            :is-running="isRunning"
+            @update-config="handleUpdateAiConfig"
+            @pid-applied="handlePidApplied"
+          />
         </aside>
       </div>
 
-      <!-- 视图 B：【常规调试模式】 (XCOM 超集骨架，Step 3 核心) -->
+      <!-- 视图 B：【常规调试模式】 (XCOM 超集，M4) -->
       <div class="mode-view-wrapper" v-show="activeTab === 'debug'">
+        <!-- 左区：现代终端交互监视器 (HEX/ASCII、双向色彩、历史记录) -->
         <section class="debug-terminal-panel">
-          <!-- 终端标题工具栏 -->
-          <div class="terminal-toolbar">
-            <div class="toolbar-left">
-              <span class="terminal-title">终端交互监视器</span>
-              <span class="badge badge-cyan">阶段三即将完整上线</span>
-            </div>
-            <div class="toolbar-right">
-              <button class="tool-btn" @click="handleOpenLogDir" title="在系统资源管理器中打开日志目录">
-                <span>📂 打开日志目录</span>
-              </button>
-            </div>
-          </div>
-
-          <!-- 终端日志区域 -->
-          <div class="terminal-body font-mono">
-            <div v-for="log in logs" :key="log.id" class="terminal-line" :class="log.level">
-              <span class="line-time">[{{ log.time }}]</span>
-              <span class="line-tag">{{ log.tag }}</span>
-              <span class="line-content">{{ log.text }}</span>
-            </div>
-          </div>
-
-          <!-- 发送控制面板 -->
-          <div class="terminal-send-bar">
-            <div class="send-options">
-              <label class="opt-label">
-                <input type="checkbox" v-model="sendAsHex" />
-                <span>HEX 发送</span>
-              </label>
-              <label class="opt-label">
-                <input type="checkbox" v-model="appendNewline" />
-                <span>发送新行 (\r\n)</span>
-              </label>
-            </div>
-            <div class="send-input-group">
-              <input
-                type="text"
-                class="send-input font-mono"
-                v-model="sendText"
-                :placeholder="sendAsHex ? '输入 HEX 字节 (如 01 03 00 00 00 02 C4 0B)' : '输入要发送的命令文本...'"
-                :disabled="!isRunning"
-              />
-              <button class="send-btn" :disabled="!isRunning || !sendText.trim()">
-                <span>发送</span>
-              </button>
-            </div>
-          </div>
+          <GeneralTerminal
+            ref="terminalRef"
+            :logs="logs"
+            :is-running="isRunning"
+            @send-data="handleSendSerialData"
+            @clear-logs="handleClearLogs"
+            @diagnose-log="handleDiagnoseLog"
+          />
         </section>
 
-        <!-- 常规调试模式侧边栏：快捷指令列表 -->
+        <!-- 右区：快捷指令面板与硬件校验工具箱 (M4) -->
         <aside class="debug-sidebar">
-          <div class="card">
-            <div class="card-header">
-              <span class="card-title">快捷指令列表</span>
-              <span class="badge badge-cyan">阶段三接入</span>
-            </div>
-            <div class="card-body">
-              <div class="quick-cmd-list">
-                <div v-for="cmd in quickCommands" :key="cmd.id" class="cmd-row">
-                  <div class="cmd-info">
-                    <span class="cmd-name">{{ cmd.name }}</span>
-                    <code class="cmd-code font-mono">{{ cmd.cmd }}</code>
-                  </div>
-                  <button
-                    class="cmd-send-btn"
-                    :class="{ 'btn-danger': cmd.danger }"
-                    :disabled="!isRunning"
-                    @click="cmd.danger ? triggerEmergencyStop() : null"
-                  >
-                    发送
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
+          <!-- 快捷指令管理与循环发送 (M4 Step 4.2) -->
+          <QuickCommandPanel
+            :commands="appConfig.quick_commands"
+            :is-running="isRunning"
+            @send-command="handleSendQuickCommand"
+            @update-commands="handleUpdateQuickCommands"
+            @emergency-stop="triggerEmergencyStop"
+          />
 
-          <div class="card">
-            <div class="card-header">
-              <span class="card-title">校验与工具</span>
-            </div>
-            <div class="card-body">
-              <p class="tool-desc">
-                阶段三将在此集成 Modbus CRC16、CRC32、Checksum8 等校验码即时生成器，以及单行报错一键【💡AI 智能诊断】。
-              </p>
-            </div>
-          </div>
+          <!-- 硬件校验计算器 (M4 Step 4.3: Modbus CRC16 / CRC32 / Sum8 / Xor8) -->
+          <CrcTools @append-to-send="handleAppendToSend" />
         </aside>
       </div>
     </div>
@@ -612,8 +675,9 @@ onUnmounted(() => {
           <button class="drawer-btn" @click="handleOpenLogDir" title="打开系统日志文件夹 (%APPDATA%/LLM-Serial/logs)">
             <span>📂 日志目录</span>
           </button>
-          <span class="emergency-tip">
-            <kbd class="kbd-key">Space</kbd> 急停槽位 (ADR 0004)
+          <span class="emergency-tip" :class="{ 'bound': appConfig.emergency_command }">
+            <kbd class="kbd-key">Space</kbd>
+            <span>急停: {{ appConfig.emergency_command ? `[${appConfig.emergency_command.trim()}]` : '未绑定 (ADR 0004)' }}</span>
           </span>
         </div>
       </div>
@@ -630,10 +694,15 @@ onUnmounted(() => {
 
         <div class="quick-commands-bar">
           <span class="cmd-label">快捷指令:</span>
-          <button class="cmd-btn" disabled>RST\n</button>
-          <button class="cmd-btn" disabled>CALIB\n</button>
-          <button class="cmd-btn btn-danger" @click="triggerEmergencyStop">
-            CMD:STOP\n (急停)
+          <button
+            v-for="cmd in appConfig.quick_commands"
+            :key="cmd.id"
+            class="cmd-btn"
+            :class="{ 'btn-danger': cmd.danger }"
+            :disabled="!isRunning"
+            @click="handleSendQuickCommand(cmd)"
+          >
+            {{ cmd.name }}
           </button>
         </div>
       </div>
@@ -653,16 +722,49 @@ onUnmounted(() => {
 
     <!-- ADR 0004 急停提示 Toast -->
     <transition name="fade">
-      <div v-if="showEmergencyToast" class="emergency-toast">
+      <div v-if="showEmergencyToast" class="emergency-toast" :class="emergencyToastLevel">
         <div class="toast-icon">⚠️</div>
         <div class="toast-content">
-          <div class="toast-title">急停槽位未绑定命令 (ADR 0004)</div>
-          <div class="toast-desc">
-            根据安全决策，系统未内置设备特定停机指令，未发出任何字节。请在设置中配置你的硬件停机命令。
+          <div class="toast-title">{{ emergencyToastTitle }}</div>
+          <div class="toast-desc">{{ emergencyToastDesc }}</div>
+          <div v-if="!appConfig.emergency_command" class="bind-quick-action">
+            <button class="btn-bind-quick" @click="bindEmergencyCommand('CMD:STOP\n')">
+              ⚡ 一键绑定为 CMD:STOP\n
+            </button>
           </div>
         </div>
+        <button class="toast-close" @click="showEmergencyToast = false">✕</button>
       </div>
     </transition>
+
+    <!-- 单行日志 AI 智能诊断弹窗 (M5 Step 5.4) -->
+    <div v-if="showLogDiagnoseModal" class="modal-backdrop" @click="showLogDiagnoseModal = false">
+      <div class="modal-card" @click.stop>
+        <div class="modal-header">
+          <div class="modal-title-group">
+            <span class="modal-sparkle">💡</span>
+            <span class="modal-title">AI 单行日志诊断 (Log Explainer)</span>
+          </div>
+          <button class="modal-close" @click="showLogDiagnoseModal = false">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="diagnose-target font-mono">
+            <span class="target-tag">{{ diagnosingLog?.tag }}</span>
+            <span class="target-text">{{ diagnosingLog?.text }}</span>
+          </div>
+          <div v-if="isExplainingLog" class="loading-state">
+            <span class="spinner">⏳</span>
+            <span>大模型控制与固件专家正在诊断中...</span>
+          </div>
+          <div v-else class="diagnose-content">
+            <div class="diagnosis-text">{{ logDiagnosisText }}</div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn-modal-close" @click="showLogDiagnoseModal = false">关闭</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -704,7 +806,7 @@ onUnmounted(() => {
   background-color: var(--bg-main);
 }
 
-/* 右区 ~30% 侧边栏 */
+/* 右区 ~30% 侧边栏 (波形调参模式) */
 .sidebar-panel {
   flex: 3;
   min-width: 320px;
@@ -718,418 +820,28 @@ onUnmounted(() => {
   overflow-y: auto;
 }
 
-/* 常规调试模式面板 */
+/* 常规调试模式左区终端 */
 .debug-terminal-panel {
   flex: 7;
   height: 100%;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   background-color: #080c14;
   border-right: 1px solid var(--border-color);
 }
 
-.terminal-toolbar {
-  height: 40px;
-  background-color: var(--bg-panel);
-  border-bottom: 1px solid var(--border-color);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 16px;
-}
-
-.toolbar-left {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.terminal-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.tool-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 8px;
-  background-color: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: 4px;
-  color: var(--text-secondary);
-  font-size: 11px;
-  cursor: pointer;
-  transition: all 0.2s;
-}
-
-.tool-btn:hover {
-  background-color: var(--bg-card-hover);
-  color: var(--text-primary);
-}
-
-.terminal-body {
-  flex: 1;
-  padding: 12px;
-  overflow-y: auto;
-  font-size: 12px;
-  line-height: 1.7;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-
-.terminal-line {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-}
-
-.line-time {
-  color: var(--text-muted);
-  flex-shrink: 0;
-}
-
-.line-tag {
-  font-weight: 600;
-  flex-shrink: 0;
-}
-
-.terminal-line.info .line-tag {
-  color: var(--accent-cyan);
-}
-
-.terminal-line.warn .line-tag {
-  color: var(--accent-amber);
-}
-
-.terminal-line.error .line-tag {
-  color: var(--accent-rose);
-}
-
-.line-content {
-  color: var(--text-primary);
-  word-break: break-all;
-}
-
-.terminal-send-bar {
-  background-color: var(--bg-panel);
-  border-top: 1px solid var(--border-color);
-  padding: 10px 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.send-options {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
-
-.opt-label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 11px;
-  color: var(--text-secondary);
-  cursor: pointer;
-}
-
-.send-input-group {
-  display: flex;
-  gap: 8px;
-}
-
-.send-input {
-  flex: 1;
-  background-color: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: 4px;
-  padding: 6px 10px;
-  font-size: 12px;
-  color: var(--text-primary);
-  outline: none;
-}
-
-.send-input:focus {
-  border-color: var(--accent-cyan);
-}
-
-.send-btn {
-  padding: 6px 18px;
-  background-color: #0284c7;
-  border: 1px solid #0ea5e9;
-  border-radius: 4px;
-  color: #fff;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background-color 0.2s;
-}
-
-.send-btn:hover:not(:disabled) {
-  background-color: #0369a1;
-}
-
-.send-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
+/* 常规调试模式右区侧边栏 */
 .debug-sidebar {
   flex: 3;
   min-width: 300px;
-  max-width: 400px;
+  max-width: 420px;
   padding: 12px;
   display: flex;
   flex-direction: column;
   gap: 12px;
   background-color: var(--bg-panel);
   overflow-y: auto;
-}
-
-.quick-cmd-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.cmd-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 8px;
-  background-color: rgba(11, 15, 23, 0.4);
-  border: 1px solid var(--border-subtle);
-  border-radius: 4px;
-}
-
-.cmd-info {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.cmd-name {
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--text-primary);
-}
-
-.cmd-code {
-  font-size: 11px;
-  color: var(--accent-cyan);
-  background-color: rgba(14, 165, 233, 0.1);
-  padding: 1px 4px;
-  border-radius: 3px;
-}
-
-.cmd-send-btn {
-  padding: 3px 8px;
-  font-size: 11px;
-  background-color: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: 3px;
-  color: var(--text-primary);
-  cursor: pointer;
-}
-
-.cmd-send-btn:hover:not(:disabled) {
-  background-color: var(--bg-card-hover);
-}
-
-.tool-desc {
-  font-size: 12px;
-  color: var(--text-secondary);
-  line-height: 1.6;
-}
-
-.card {
-  background-color: var(--bg-card);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.card-header {
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--border-subtle);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  background-color: rgba(24, 34, 50, 0.6);
-}
-
-.card-title-group {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.ai-sparkle {
-  font-size: 14px;
-}
-
-.card-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-
-.badge {
-  font-size: 10px;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-weight: 500;
-}
-
-.badge-amber {
-  background-color: rgba(245, 158, 11, 0.15);
-  color: var(--accent-amber);
-  border: 1px solid rgba(245, 158, 11, 0.3);
-}
-
-.badge-cyan {
-  background-color: rgba(14, 165, 233, 0.15);
-  color: var(--accent-cyan);
-  border: 1px solid rgba(14, 165, 233, 0.3);
-}
-
-.badge-muted {
-  background-color: rgba(100, 116, 139, 0.15);
-  color: var(--text-muted);
-  border: 1px solid rgba(100, 116, 139, 0.2);
-}
-
-.card-body {
-  padding: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.ai-status-box {
-  background-color: rgba(11, 15, 23, 0.6);
-  border: 1px solid var(--border-subtle);
-  border-radius: 4px;
-  padding: 8px 10px;
-}
-
-.ai-hint-title {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--accent-cyan);
-  display: block;
-  margin-bottom: 4px;
-}
-
-.ai-hint-desc {
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--text-secondary);
-}
-
-.param-preview-group {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  background-color: rgba(11, 15, 23, 0.4);
-  padding: 8px;
-  border-radius: 4px;
-  border: 1px solid var(--border-subtle);
-}
-
-.param-row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  font-size: 12px;
-}
-
-.param-name {
-  color: var(--text-secondary);
-}
-
-.param-val {
-  font-weight: 600;
-  color: var(--accent-emerald);
-}
-
-.btn-ai-action {
-  width: 100%;
-  padding: 8px;
-  background: linear-gradient(135deg, #0284c7, #0369a1);
-  border: 1px solid #0ea5e9;
-  border-radius: 4px;
-  color: #fff;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  opacity: 0.6;
-}
-
-/* 雷达图占位 */
-.radar-placeholder {
-  height: 160px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.radar-circle {
-  width: 120px;
-  height: 120px;
-  border-radius: 50%;
-  border: 1px dashed var(--border-color);
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.radar-inner-shape {
-  width: 70px;
-  height: 70px;
-  background-color: rgba(56, 189, 248, 0.15);
-  border: 1.5px solid var(--accent-cyan);
-  clip-path: polygon(50% 0%, 100% 38%, 82% 100%, 18% 100%, 0% 38%);
-}
-
-.radar-label {
-  position: absolute;
-  font-size: 9px;
-  color: var(--text-muted);
-}
-
-.radar-label.top { top: -14px; }
-.radar-label.right { right: -36px; }
-.radar-label.bottom-right { bottom: -14px; right: -10px; }
-.radar-label.bottom-left { bottom: -14px; left: -10px; }
-.radar-label.left { left: -36px; }
-
-/* 会话信息 */
-.session-info {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  font-size: 11px;
-}
-
-.info-item {
-  display: flex;
-  justify-content: space-between;
-}
-
-.info-k {
-  color: var(--text-muted);
-}
-
-.info-v {
-  color: var(--text-primary);
 }
 
 /* 底栏抽屉 */
@@ -1214,6 +926,10 @@ onUnmounted(() => {
   gap: 4px;
 }
 
+.emergency-tip.bound {
+  color: var(--accent-amber);
+}
+
 .kbd-key {
   padding: 1px 5px;
   background-color: #1e293b;
@@ -1282,11 +998,13 @@ onUnmounted(() => {
   align-items: center;
   padding: 0 12px;
   gap: 8px;
+  overflow-x: auto;
 }
 
 .cmd-label {
   font-size: 11px;
   color: var(--text-muted);
+  flex-shrink: 0;
 }
 
 .cmd-btn {
@@ -1298,6 +1016,7 @@ onUnmounted(() => {
   font-size: 11px;
   font-family: var(--font-mono);
   cursor: pointer;
+  flex-shrink: 0;
 }
 
 .cmd-btn:hover:not(:disabled) {
@@ -1363,7 +1082,7 @@ onUnmounted(() => {
   color: var(--text-primary);
 }
 
-/* 急停 Toast 提示 */
+/* 急停 Toast 提示 (ADR 0004) */
 .emergency-toast {
   position: fixed;
   bottom: 48px;
@@ -1372,30 +1091,222 @@ onUnmounted(() => {
   background-color: #1e1b2e;
   border: 1px solid var(--accent-rose);
   border-radius: 6px;
-  padding: 10px 16px;
+  padding: 12px 18px;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5), 0 0 12px rgba(244, 63, 94, 0.25);
   z-index: 1000;
-  max-width: 480px;
+  max-width: 520px;
+}
+
+.emergency-toast.warn {
+  border-color: var(--accent-amber);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5), 0 0 12px rgba(245, 158, 11, 0.25);
 }
 
 .toast-icon {
   font-size: 20px;
 }
 
+.toast-content {
+  flex: 1;
+}
+
 .toast-title {
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 700;
   color: var(--accent-rose);
+}
+
+.emergency-toast.warn .toast-title {
+  color: var(--accent-amber);
 }
 
 .toast-desc {
   font-size: 11px;
   color: var(--text-secondary);
-  line-height: 1.4;
-  margin-top: 2px;
+  line-height: 1.5;
+  margin-top: 4px;
+}
+
+.bind-quick-action {
+  margin-top: 8px;
+}
+
+.btn-bind-quick {
+  padding: 4px 10px;
+  font-size: 11px;
+  background-color: rgba(244, 63, 94, 0.15);
+  border: 1px solid var(--accent-rose);
+  border-radius: 4px;
+  color: #fda4af;
+  cursor: pointer;
+  font-weight: 600;
+  transition: all 0.2s;
+}
+
+.btn-bind-quick:hover {
+  background-color: var(--accent-rose);
+  color: #fff;
+}
+
+.toast-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.toast-close:hover {
+  color: var(--text-primary);
+}
+
+/* AI Log Explainer 弹窗 */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background-color: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+}
+
+.modal-card {
+  width: 520px;
+  max-width: 90vw;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.7);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background-color: rgba(19, 27, 38, 0.8);
+}
+
+.modal-title-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.modal-sparkle {
+  font-size: 16px;
+}
+
+.modal-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.modal-close:hover {
+  color: var(--text-primary);
+}
+
+.modal-body {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.diagnose-target {
+  padding: 8px 10px;
+  background-color: rgba(11, 15, 23, 0.6);
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  font-size: 12px;
+  display: flex;
+  gap: 8px;
+}
+
+.target-tag {
+  color: var(--accent-rose);
+  font-weight: 600;
+}
+
+.target-text {
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+.loading-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--accent-cyan);
+  padding: 20px 0;
+  justify-content: center;
+}
+
+.spinner {
+  font-size: 18px;
+  animation: spin 1.5s infinite linear;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.diagnose-content {
+  background-color: rgba(11, 15, 23, 0.4);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.diagnosis-text {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+}
+
+.modal-footer {
+  padding: 10px 16px;
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  justify-content: flex-end;
+  background-color: rgba(19, 27, 38, 0.8);
+}
+
+.btn-modal-close {
+  padding: 6px 14px;
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.btn-modal-close:hover {
+  background-color: var(--bg-card-hover);
 }
 
 .fade-enter-active, .fade-leave-active {

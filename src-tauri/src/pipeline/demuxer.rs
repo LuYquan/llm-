@@ -117,7 +117,7 @@ impl StreamDemuxer {
                 }
                 return DemuxOutput::Sample(SamplePoint {
                     timestamp_us,
-                    values,
+                    values: values.into_iter().map(Some).collect(),
                 });
             } else {
                 // 包含逗号但不满足纯数值 CSV。
@@ -189,7 +189,7 @@ mod tests {
         match out {
             DemuxOutput::Sample(s) => {
                 assert_eq!(s.timestamp_us, 1000);
-                assert_eq!(s.values, vec![10.0, 9.2, 30.1]);
+                assert_eq!(s.values, vec![Some(10.0), Some(9.2), Some(30.1)]);
             }
             _ => panic!("Expected DemuxOutput::Sample"),
         }
@@ -218,7 +218,7 @@ mod tests {
         match out {
             DemuxOutput::Sample(s) => {
                 assert_eq!(s.timestamp_us, 1000);
-                assert_eq!(s.values, vec![10.0, 9.2, 30.1]);
+                assert_eq!(s.values, vec![Some(10.0), Some(9.2), Some(30.1)]);
             }
             _ => panic!("Expected DemuxOutput::Sample on cycle rollover"),
         }
@@ -303,7 +303,7 @@ mod tests {
         let out = demuxer.demux_line("10.0,20.0,30.0\n", 500, LogDirection::Rx);
         match out {
             DemuxOutput::Sample(s) => {
-                assert_eq!(s.values, vec![10.0, 20.0, 30.0]);
+                assert_eq!(s.values, vec![Some(10.0), Some(20.0), Some(30.0)]);
             }
             _ => panic!("Expected DemuxOutput::Sample"),
         }
