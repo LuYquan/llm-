@@ -1,0 +1,115 @@
+{
+  "fixture_name": "03_csv_and_log_mixed",
+  "category": "csv_and_log_mixed",
+  "description": "CSV 数值波形与常规 printf 日志混合流，验证智能分流与日志等级分类",
+  "raw_lines": [
+    "[INFO] System Boot OK, firmware v1.2.0",
+    "10.0,9.1,30.0",
+    "[WARN] Battery voltage low: 3.35V",
+    "10.0,9.3,29.8",
+    "Motor calibrated successfully, 0 errors",
+    "10.0,9.5,29.5",
+    "[ERROR] I2C bus timeout on sensor 2",
+    "10.0,9.8,29.0",
+    "Debug message without prefix",
+    "10.0,10.0,28.5"
+  ],
+  "expected_outputs": [
+    {
+      "index": 0,
+      "type": "log",
+      "level": "Info",
+      "text": "[INFO] System Boot OK, firmware v1.2.0"
+    },
+    {
+      "index": 1,
+      "type": "sample",
+      "values": [10.0, 9.1, 30.0],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "index": 2,
+      "type": "log",
+      "level": "Warn",
+      "text": "[WARN] Battery voltage low: 3.35V"
+    },
+    {
+      "index": 3,
+      "type": "sample",
+      "values": [10.0, 9.3, 29.8],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "index": 4,
+      "type": "log",
+      "level": "Info",
+      "text": "Motor calibrated successfully, 0 errors"
+    },
+    {
+      "index": 5,
+      "type": "sample",
+      "values": [10.0, 9.5, 29.5],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "index": 6,
+      "type": "log",
+      "level": "Error",
+      "text": "[ERROR] I2C bus timeout on sensor 2"
+    },
+    {
+      "index": 7,
+      "type": "sample",
+      "values": [10.0, 9.8, 29.0],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "index": 8,
+      "type": "log",
+      "level": "Info",
+      "text": "Debug message without prefix"
+    },
+    {
+      "index": 9,
+      "type": "sample",
+      "values": [10.0, 10.0, 28.5],
+      "channels": ["setpoint", "actual", "output"]
+    }
+  ],
+  "samples": [
+    { "values": [10.0, 9.1, 30.0] },
+    { "values": [10.0, 9.3, 29.8] },
+    { "values": [10.0, 9.5, 29.5] },
+    { "values": [10.0, 9.8, 29.0] },
+    { "values": [10.0, 10.0, 28.5] }
+  ],
+  "logs": [
+    {
+      "level": "Info",
+      "text": "[INFO] System Boot OK, firmware v1.2.0"
+    },
+    {
+      "level": "Warn",
+      "text": "[WARN] Battery voltage low: 3.35V"
+    },
+    {
+      "level": "Info",
+      "text": "Motor calibrated successfully, 0 errors"
+    },
+    {
+      "level": "Error",
+      "text": "[ERROR] I2C bus timeout on sensor 2"
+    },
+    {
+      "level": "Info",
+      "text": "Debug message without prefix"
+    }
+  ],
+  "summary": {
+    "total_raw_lines": 10,
+    "sample_count": 5,
+    "log_count": 5,
+    "byte_dirty_count": 0,
+    "demux_error_count": 0
+  }
+}

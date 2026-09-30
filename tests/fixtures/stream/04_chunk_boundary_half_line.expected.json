@@ -1,0 +1,80 @@
+{
+  "fixture_name": "04_chunk_boundary_half_line",
+  "category": "chunk_boundary_half_line",
+  "description": "跨 chunk 半行截断拼接验证，确保分块到达与完整行到达解析结果 100% 一致",
+  "raw_lines": [
+    "10.0,20.0,30.0",
+    "[INFO] Pipeline connected",
+    ">sp:15.0",
+    ">act:14.2",
+    "12.5,22.0,32.0"
+  ],
+  "chunk_steps": [
+    {
+      "chunk_index": 0,
+      "chunk_data": "10.0,20",
+      "extracted_lines": []
+    },
+    {
+      "chunk_index": 1,
+      "chunk_data": ".0,30.0\n[IN",
+      "extracted_lines": ["10.0,20.0,30.0"]
+    },
+    {
+      "chunk_index": 2,
+      "chunk_data": "FO] Pipeline connected\r\n>s",
+      "extracted_lines": ["[INFO] Pipeline connected"]
+    },
+    {
+      "chunk_index": 3,
+      "chunk_data": "p:15.0\n>act:14.2\n12.5,",
+      "extracted_lines": [">sp:15.0", ">act:14.2"]
+    },
+    {
+      "chunk_index": 4,
+      "chunk_data": "22.0,32.0\n",
+      "extracted_lines": ["12.5,22.0,32.0"]
+    }
+  ],
+  "expected_outputs": [
+    {
+      "type": "sample",
+      "values": [10.0, 20.0, 30.0],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "type": "log",
+      "level": "Info",
+      "text": "[INFO] Pipeline connected"
+    },
+    {
+      "type": "sample",
+      "values": [12.5, 22.0, 32.0],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "type": "sample",
+      "comment": "Teleplot 行在流末尾 flush 产生",
+      "values": [15.0, 14.2],
+      "channels": ["sp", "act"]
+    }
+  ],
+  "samples": [
+    { "values": [10.0, 20.0, 30.0] },
+    { "values": [12.5, 22.0, 32.0] },
+    { "values": [15.0, 14.2], "from_flush": true }
+  ],
+  "logs": [
+    {
+      "level": "Info",
+      "text": "[INFO] Pipeline connected"
+    }
+  ],
+  "summary": {
+    "total_raw_lines": 5,
+    "sample_count": 3,
+    "log_count": 1,
+    "byte_dirty_count": 0,
+    "demux_error_count": 0
+  }
+}

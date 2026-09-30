@@ -1,0 +1,24 @@
+[package]
+name = "llm-serial"
+version = "0.1.1-beta.1"
+description = "LLM Serial - Serial and Waveform Workbench"
+authors = ["LLM Serial Team"]
+edition = "2021"
+
+[lib]
+name = "llm_serial_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+serialport = "4.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "default-tls"] }

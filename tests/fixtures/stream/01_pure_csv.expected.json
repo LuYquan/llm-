@@ -1,0 +1,67 @@
+{
+  "fixture_name": "01_pure_csv",
+  "category": "pure_csv",
+  "description": "纯 CSV 格式多通道数据流解析（含负数、零、科学计数法、首尾空白）",
+  "raw_lines": [
+    "10.0,20.0,30.0",
+    "15.5,-8.25,102.5",
+    "0.0,0.0,0.0",
+    "1.2e2,3.4e-1,-5.6e1",
+    "  18.75 , 24.125 , 33.5  ",
+    "-100.5,50.25,-25.125"
+  ],
+  "expected_outputs": [
+    {
+      "index": 0,
+      "type": "sample",
+      "values": [10.0, 20.0, 30.0],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "index": 1,
+      "type": "sample",
+      "values": [15.5, -8.25, 102.5],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "index": 2,
+      "type": "sample",
+      "values": [0.0, 0.0, 0.0],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "index": 3,
+      "type": "sample",
+      "values": [120.0, 0.34, -56.0],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "index": 4,
+      "type": "sample",
+      "values": [18.75, 24.125, 33.5],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "index": 5,
+      "type": "sample",
+      "values": [-100.5, 50.25, -25.125],
+      "channels": ["setpoint", "actual", "output"]
+    }
+  ],
+  "samples": [
+    { "values": [10.0, 20.0, 30.0] },
+    { "values": [15.5, -8.25, 102.5] },
+    { "values": [0.0, 0.0, 0.0] },
+    { "values": [120.0, 0.34, -56.0] },
+    { "values": [18.75, 24.125, 33.5] },
+    { "values": [-100.5, 50.25, -25.125] }
+  ],
+  "logs": [],
+  "summary": {
+    "total_raw_lines": 6,
+    "sample_count": 6,
+    "log_count": 0,
+    "byte_dirty_count": 0,
+    "demux_error_count": 0
+  }
+}

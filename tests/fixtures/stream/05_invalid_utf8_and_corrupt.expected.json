@@ -1,0 +1,88 @@
+{
+  "fixture_name": "05_invalid_utf8_and_corrupt",
+  "category": "invalid_utf8_and_corrupt",
+  "description": "非法 UTF-8 乱码字节、破损 CSV、非法 Teleplot 键值行、NaN 与尾随空字段的防御与错误统计",
+  "test_steps": [
+    {
+      "step": 0,
+      "name": "正常前置 CSV 行",
+      "input": "10.0,20.0,30.0\n",
+      "expected_action": "parsed_as_sample",
+      "expected_values": [10.0, 20.0, 30.0]
+    },
+    {
+      "step": 1,
+      "name": "非 UTF-8 乱码字节 (0xFF 0xFE 0xFD 0xAA 0x0A)",
+      "input_hex": "FF FE FD AA 0A",
+      "expected_action": "discarded_by_process_serial_bytes",
+      "byte_dirty_increment": 1
+    },
+    {
+      "step": 2,
+      "name": "数值字段破坏的 CSV (10.0,??#$%,30.0)",
+      "input": "10.0,??#$%,30.0\n",
+      "expected_action": "discarded_by_demuxer_corrupt_csv",
+      "demux_error_increment": 1
+    },
+    {
+      "step": 3,
+      "name": "缺少冒号的非法 Teleplot 行 (>broken_teleplot_no_colon)",
+      "input": ">broken_teleplot_no_colon\n",
+      "expected_action": "discarded_by_demuxer_invalid_teleplot",
+      "demux_error_increment": 1
+    },
+    {
+      "step": 4,
+      "name": "非有限数值的 Teleplot 行 (>key:NaN)",
+      "input": ">key:NaN\n",
+      "expected_action": "discarded_by_demuxer_nan_teleplot",
+      "demux_error_increment": 1
+    },
+    {
+      "step": 5,
+      "name": "包含 NaN 的 CSV 行 (1.0,NaN,3.0)",
+      "input": "1.0,NaN,3.0\n",
+      "expected_action": "discarded_by_demuxer_nan_csv",
+      "demux_error_increment": 1
+    },
+    {
+      "step": 6,
+      "name": "尾随逗号空字段的 CSV 行 (1.0,2.0,)",
+      "input": "1.0,2.0,\n",
+      "expected_action": "discarded_by_demuxer_trailing_comma_csv",
+      "demux_error_increment": 1
+    },
+    {
+      "step": 7,
+      "name": "恢复正常 CSV 行 (12.0,22.0,32.0)",
+      "input": "12.0,22.0,32.0\n",
+      "expected_action": "parsed_as_sample",
+      "expected_values": [12.0, 22.0, 32.0]
+    }
+  ],
+  "expected_outputs": [
+    {
+      "type": "sample",
+      "values": [10.0, 20.0, 30.0],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "type": "sample",
+      "values": [12.0, 22.0, 32.0],
+      "channels": ["setpoint", "actual", "output"]
+    }
+  ],
+  "samples": [
+    { "values": [10.0, 20.0, 30.0] },
+    { "values": [12.0, 22.0, 32.0] }
+  ],
+  "logs": [],
+  "summary": {
+    "total_raw_lines_or_packets": 8,
+    "valid_extracted_lines": 7,
+    "sample_count": 2,
+    "log_count": 0,
+    "byte_dirty_count": 1,
+    "demux_error_count": 5
+  }
+}

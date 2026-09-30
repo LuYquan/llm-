@@ -1,0 +1,58 @@
+[
+  {
+    "name": "justfloat_dirty_prefix_fixed_channels",
+    "config": {
+      "type": "justfloat",
+      "channels": 2
+    },
+    "chunks": [
+      [238, 255, 0, 0, 128],
+      [63, 0, 0, 0, 64, 0],
+      [0, 64, 64, 0, 0, 128, 127]
+    ],
+    "expected": {
+      "frames": [[2, 3]],
+      "droppedBytes": 6,
+      "errorCount": 2
+    }
+  },
+  {
+    "name": "rawdata_f32_nonfinite_frame",
+    "config": {
+      "type": "rawdata",
+      "mode": "decode",
+      "format": "f32le",
+      "channels": 2
+    },
+    "chunks": [
+      [0, 0, 192, 63, 0],
+      [0, 0, 192, 0, 0, 192, 127, 0, 0, 128, 64, 18, 52]
+    ],
+    "expected": {
+      "frames": [[1.5, -2]],
+      "droppedBytes": 8,
+      "errorCount": 1
+    }
+  },
+  {
+    "name": "custom_crc16_big_endian_and_resync",
+    "config": {
+      "type": "custom",
+      "header": [170, 85],
+      "tail": [13, 10],
+      "channels": 2,
+      "dataType": "i16le",
+      "checksum": "crc16_ccitt",
+      "checksumByteOrder": "big"
+    },
+    "chunks": [
+      [170, 85, 2, 0, 3, 0, 0, 0, 13, 10, 170, 85, 1],
+      [0, 254, 255, 88, 138, 13, 10]
+    ],
+    "expected": {
+      "frames": [[1, -2]],
+      "droppedBytes": 10,
+      "errorCount": 1
+    }
+  }
+]

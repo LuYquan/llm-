@@ -1,0 +1,40 @@
+{
+  "fixture_name": "06_overlong_line_protection",
+  "category": "overlong_line_protection",
+  "description": "超过 64KiB (65536 字节) 无换行符的连续字节流防护与恢复",
+  "protection_threshold_bytes": 65536,
+  "test_steps": [
+    {
+      "step": 0,
+      "name": "注入 65537 字节无换行连续流 (模拟异常输入)",
+      "input_length": 65537,
+      "expected_action": "buffer_overflow_cleared",
+      "byte_dirty_increment": 1
+    },
+    {
+      "step": 1,
+      "name": "注入正常 CSV 行 (10.0,20.0,30.0\n)",
+      "input": "10.0,20.0,30.0\n",
+      "expected_action": "parsed_as_sample",
+      "expected_values": [10.0, 20.0, 30.0]
+    }
+  ],
+  "expected_outputs": [
+    {
+      "type": "sample",
+      "values": [10.0, 20.0, 30.0],
+      "channels": ["setpoint", "actual", "output"]
+    }
+  ],
+  "samples": [
+    { "values": [10.0, 20.0, 30.0] }
+  ],
+  "logs": [],
+  "summary": {
+    "total_chunks": 2,
+    "sample_count": 1,
+    "log_count": 0,
+    "byte_dirty_count": 1,
+    "demux_error_count": 0
+  }
+}

@@ -1,0 +1,8 @@
+10.0,20.0,30.0
+11.0,21.0,31.0
+[INFO] Windows CRLF log line
+[WARN] Unix LF log line
+>sp:10.0
+>act:9.5
+>sp:12.0
+12.0,22.0,32.0

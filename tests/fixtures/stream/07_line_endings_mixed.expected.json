@@ -1,0 +1,85 @@
+{
+  "fixture_name": "07_line_endings_mixed",
+  "category": "line_endings_mixed",
+  "description": "Windows CRLF (\\r\\n) 与 Unix LF (\\n) 混合行尾符号解析与尾随空白剥离",
+  "raw_lines": [
+    "10.0,20.0,30.0",
+    "11.0,21.0,31.0",
+    "[INFO] Windows CRLF log line",
+    "[WARN] Unix LF log line",
+    ">sp:10.0",
+    ">act:9.5",
+    ">sp:12.0",
+    "12.0,22.0,32.0"
+  ],
+  "expected_outputs": [
+    {
+      "index": 0,
+      "type": "sample",
+      "values": [10.0, 20.0, 30.0],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "index": 1,
+      "type": "sample",
+      "values": [11.0, 21.0, 31.0],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "index": 2,
+      "type": "log",
+      "level": "Info",
+      "text": "[INFO] Windows CRLF log line"
+    },
+    {
+      "index": 3,
+      "type": "log",
+      "level": "Warn",
+      "text": "[WARN] Unix LF log line"
+    },
+    {
+      "index": 6,
+      "type": "sample",
+      "comment": "由第 6 行 >sp:12.0 翻转触发产生上一周期的 Sample",
+      "values": [10.0, 9.5],
+      "channels": ["sp", "act"]
+    },
+    {
+      "index": 7,
+      "type": "sample",
+      "values": [12.0, 22.0, 32.0],
+      "channels": ["setpoint", "actual", "output"]
+    },
+    {
+      "index": "flush",
+      "type": "sample",
+      "comment": "流结束 flush 产生 >sp:12.0",
+      "values": [12.0, null],
+      "channels": ["sp", "act"]
+    }
+  ],
+  "samples": [
+    { "values": [10.0, 20.0, 30.0] },
+    { "values": [11.0, 21.0, 31.0] },
+    { "values": [10.0, 9.5] },
+    { "values": [12.0, 22.0, 32.0] },
+    { "values": [12.0, null], "from_flush": true }
+  ],
+  "logs": [
+    {
+      "level": "Info",
+      "text": "[INFO] Windows CRLF log line"
+    },
+    {
+      "level": "Warn",
+      "text": "[WARN] Unix LF log line"
+    }
+  ],
+  "summary": {
+    "total_raw_lines": 8,
+    "sample_count": 5,
+    "log_count": 2,
+    "byte_dirty_count": 0,
+    "demux_error_count": 0
+  }
+}

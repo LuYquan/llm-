@@ -1,0 +1,10 @@
+[INFO] System Boot OK, firmware v1.2.0
+10.0,9.1,30.0
+[WARN] Battery voltage low: 3.35V
+10.0,9.3,29.8
+Motor calibrated successfully, 0 errors
+10.0,9.5,29.5
+[ERROR] I2C bus timeout on sensor 2
+10.0,9.8,29.0
+Debug message without prefix
+10.0,10.0,28.5

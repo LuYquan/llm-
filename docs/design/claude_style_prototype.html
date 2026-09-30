@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LLM Serial Studio — Claude Aesthetic Prototype</title>
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      /* Claude 经典暖白基调 (Warm Alabaster / Oat Milk) */
+      --bg-base: #FAF9F5;
+      --bg-surface: #FFFFFF;
+      --bg-elevated: #F5F4EF;
+      --border-subtle: #E8E6DF;
+      --border-strong: #D5D3CB;
+      --text-main: #262420;
+      --text-muted: #7E7C74;
+      --text-soft: #A3A199;
+      --accent-terracotta: #CC785C;
+      --accent-terracotta-hover: #B9664C;
+      --accent-terracotta-soft: rgba(204, 120, 92, 0.12);
+      --wave-1: #CC785C; /* 陶土红 */
+      --wave-2: #5E8B7E; /* 鼠尾草绿 */
+      --wave-3: #587B94; /* 石板蓝 */
+      --grid-line: rgba(38, 36, 32, 0.05);
+      --card-shadow: 0 1px 3px rgba(38, 36, 32, 0.04), 0 4px 12px rgba(38, 36, 32, 0.02);
+    }
+
+    html.dark {
+      /* Claude 优雅暖深灰 (Warm Charcoal Taupe / Espresso) */
+      --bg-base: #1F1E1D;
+      --bg-surface: #272623;
+      --bg-elevated: #2F2E2A;
+      --border-subtle: #383633;
+      --border-strong: #4A4843;
+      --text-main: #ECEAE4;
+      --text-muted: #9E9C94;
+      --text-soft: #706E66;
+      --accent-terracotta: #DA7756;
+      --accent-terracotta-hover: #E58565;
+      --accent-terracotta-soft: rgba(218, 119, 86, 0.18);
+      --wave-1: #DA7756;
+      --wave-2: #7AA89B;
+      --wave-3: #759CB5;
+      --grid-line: rgba(236, 234, 228, 0.05);
+      --card-shadow: 0 1px 3px rgba(0, 0, 0, 0.2), 0 4px 16px rgba(0, 0, 0, 0.3);
+    }
+
+    body {
+      font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      transition: background-color 0.25s ease, color 0.25s ease;
+    }
+
+    .font-serif-claude {
+      font-family: 'Newsreader', Georgia, serif;
+    }
+
+    .font-mono-code {
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .claude-card {
+      background-color: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 14px;
+      box-shadow: var(--card-shadow);
+      transition: all 0.2s ease;
+    }
+
+    .claude-card:hover {
+      border-color: var(--border-strong);
+    }
+
+    .claude-input-box {
+      background-color: var(--bg-surface);
+      border: 1px solid var(--border-strong);
+      border-radius: 18px;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+      transition: all 0.2s ease;
+    }
+
+    .claude-input-box:focus-within {
+      border-color: var(--accent-terracotta);
+      box-shadow: 0 0 0 3px var(--accent-terracotta-soft);
+    }
+
+    /* 自定义滑块 */
+    input[type=range] {
+      accent-color: var(--accent-terracotta);
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col p-4 md:p-6 select-none">
+
+  <!-- 顶部状态栏 -->
+  <header class="flex items-center justify-between pb-4 border-b border-[var(--border-subtle)] mb-4">
+    <div class="flex items-center space-x-3">
+      <!-- Claude 风格精致标志 -->
+      <div class="w-8 h-8 rounded-xl bg-[var(--accent-terracotta)] flex items-center justify-center text-white font-serif-claude text-xl font-bold shadow-sm">
+        S
+      </div>
+      <div>
+        <div class="flex items-center space-x-2">
+          <h1 class="text-base font-semibold tracking-tight">LLM 串口调试工作台</h1>
+          <span class="text-xs px-2 py-0.5 rounded-full bg-[var(--accent-terracotta-soft)] text-[var(--accent-terracotta)] font-medium">Claude 风格设计提案</span>
+        </div>
+        <p class="text-xs text-[var(--text-muted)] font-serif-claude italic">优雅、舒适、克制的高精度数字控制仪器</p>
+      </div>
+    </div>
+
+    <!-- 快捷连接与主题切换 -->
+    <div class="flex items-center space-x-3">
+      <!-- 串口状态指示胶囊 -->
+      <div class="flex items-center space-x-2 px-3 py-1.5 rounded-full bg-[var(--bg-elevated)] border border-[var(--border-subtle)] text-xs font-mono-code">
+        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+        <span class="font-medium">COM3: 115200 bps</span>
+        <span class="text-[var(--text-soft)]">|</span>
+        <span class="text-[var(--accent-terracotta)] font-semibold">100 Hz</span>
+      </div>
+
+      <!-- 急停防呆胶囊 -->
+      <button class="px-3 py-1.5 rounded-full border border-red-300 dark:border-red-900 bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400 text-xs font-semibold hover:bg-red-100 transition-colors" title="紧急停止 (空格键)">
+        🛑 急停 [Space]
+      </button>
+
+      <!-- 双模切换按钮 -->
+      <button id="themeToggleBtn" class="flex items-center space-x-1.5 px-3 py-1.5 rounded-full bg-[var(--bg-surface)] border border-[var(--border-subtle)] text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] hover:border-[var(--border-strong)] transition-all">
+        <span id="themeIcon">☀️</span>
+        <span id="themeLabel">经典暖白</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- 主视区：左侧 48px Dock + 画布中央区 + 右侧通道抽屉 -->
+  <main class="flex-1 flex gap-4 min-h-0">
+    <!-- 左侧 48px 垂直导航条 (Claude 简约微侧边栏) -->
+    <aside class="w-12 flex flex-col items-center py-2 space-y-3 bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-2xl p-1.5">
+      <button class="w-9 h-9 rounded-xl flex items-center justify-center bg-[var(--accent-terracotta-soft)] text-[var(--accent-terracotta)] transition-all" title="工作台画布">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 3v11.25A2.25 2.25 0 006 16.5h2.25M3.75 3h-1.5m1.5 0h16.5m0 0h1.5m-1.5 0v11.25A2.25 2.25 0 0118 16.5h-2.25m-7.5 0h7.5m-7.5 0l-1 3m8.5-3l1 3m0 0l.5 1.5m-.5-1.5h-9.5m0 0l-.5 1.5M9 11.25v1.5M12 9v3.75m3-6v6"></path></svg>
+      </button>
+      <button class="w-9 h-9 rounded-xl flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-elevated)] transition-all" title="连接与协议">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13.19 8.688a4.5 4.5 0 011.242 7.244l-4.5 4.5a4.5 4.5 0 01-6.364-6.364l1.757-1.757m13.35-.622l1.757-1.757a4.5 4.5 0 00-6.364-6.364l-4.5 4.5a4.5 4.5 0 001.242 7.244"></path></svg>
+      </button>
+      <button class="w-9 h-9 rounded-xl flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-elevated)] transition-all" title="元器件仓库">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M21 7.5l-9-5.25L3 7.5m18 0l-9 5.25m9-5.25v9l-9 5.25M3 7.5l9 5.25M3 7.5v9l9 5.25m0-9v9"></path></svg>
+      </button>
+      <button class="w-9 h-9 rounded-xl flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-elevated)] transition-all" title="预设指令簿">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M8.25 6.75h12M8.25 12h12m-12 5.25h12M3.75 6.75h.007v.008H3.75V6.75zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 12h.007v.008H3.75V12zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm-.375 5.25h.007v.008H3.75v-.008zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z"></path></svg>
+      </button>
+      <div class="flex-1"></div>
+      <button class="w-9 h-9 rounded-xl flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--bg-elevated)] transition-all" title="画布锁定开关">
+        🔒
+      </button>
+    </aside>
+
+    <!-- 中央核心工作区：波形图 + 仪表元器件 -->
+    <div class="flex-1 flex flex-col gap-4 min-w-0">
+      <div class="flex-1 grid grid-cols-12 gap-4">
+        <!-- 旗舰实时示波画布 (8 列) -->
+        <div class="col-span-8 claude-card p-4 flex flex-col">
+          <div class="flex items-center justify-between mb-3 pb-2 border-b border-[var(--border-subtle)]">
+            <div class="flex items-center space-x-2">
+              <span class="w-2.5 h-2.5 rounded-full bg-[var(--accent-terracotta)]"></span>
+              <span class="text-sm font-semibold">多通道高精度实时波形 (Realtime Oscilloscope)</span>
+            </div>
+            <!-- 通道色标与图例 -->
+            <div class="flex items-center space-x-3 text-xs font-mono-code">
+              <span class="flex items-center space-x-1"><span class="w-2 h-2 rounded-full" style="background-color: var(--wave-1)"></span><span>!0 目标角速度</span></span>
+              <span class="flex items-center space-x-1"><span class="w-2 h-2 rounded-full" style="background-color: var(--wave-2)"></span><span>!1 实际转速</span></span>
+              <span class="flex items-center space-x-1"><span class="w-2 h-2 rounded-full" style="background-color: var(--wave-3)"></span><span>!2 PWM输出</span></span>
+            </div>
+          </div>
+          <!-- 动态实时 Canvas -->
+          <div class="flex-1 relative rounded-xl overflow-hidden bg-[var(--bg-elevated)] border border-[var(--border-subtle)] flex items-center justify-center">
+            <canvas id="waveformCanvas" class="w-full h-full block"></canvas>
+            <div class="absolute bottom-2 right-3 px-2 py-0.5 rounded bg-[var(--bg-surface)]/80 text-[10px] font-mono-code text-[var(--text-muted)] border border-[var(--border-subtle)]">
+              uPlot 零拷贝引擎 · 60 FPS
+            </div>
+          </div>
+        </div>
+
+        <!-- 控件群与 Claude AI 诊断卡片 (4 列) -->
+        <div class="col-span-4 flex flex-col gap-4">
+          <!-- 暖色平滑圆形表盘 (GaugeWidget) -->
+          <div class="claude-card p-4 flex flex-col items-center relative">
+            <div class="w-full flex items-center justify-between text-xs text-[var(--text-muted)] mb-1">
+              <span class="font-medium">!1 实际转速表 (RPM)</span>
+              <span class="font-mono-code font-bold text-[var(--accent-terracotta)]" id="gaugeValText">128.40</span>
+            </div>
+            <!-- 表盘 SVG -->
+            <div class="w-44 h-32 relative flex items-center justify-center">
+              <svg viewBox="0 0 200 130" class="w-full h-full">
+                <!-- 背景圆弧 -->
+                <path d="M 25 115 A 75 75 0 0 1 175 115" fill="none" stroke="var(--border-strong)" stroke-width="10" stroke-linecap="round" />
+                <!-- 进度圆弧 -->
+                <path d="M 25 115 A 75 75 0 0 1 140 50" fill="none" stroke="var(--accent-terracotta)" stroke-width="10" stroke-linecap="round" />
+                <!-- 刻度点 -->
+                <circle cx="25" cy="115" r="2.5" fill="var(--text-soft)" />
+                <circle cx="100" cy="40" r="2.5" fill="var(--text-soft)" />
+                <circle cx="175" cy="115" r="2.5" fill="var(--text-soft)" />
+                <!-- 指针中心点与指针 -->
+                <line id="gaugeNeedle" x1="100" y1="115" x2="135" y2="55" stroke="var(--text-main)" stroke-width="2.5" stroke-linecap="round" />
+                <circle cx="100" cy="115" r="6" fill="var(--accent-terracotta)" />
+              </svg>
+            </div>
+          </div>
+
+          <!-- 精密滑动调参条 (SliderWidget) -->
+          <div class="claude-card p-4 flex flex-col space-y-2">
+            <div class="flex items-center justify-between text-xs">
+              <span class="font-medium">Kp 比例增益微调</span>
+              <span class="font-mono-code text-[var(--accent-terracotta)] font-bold text-sm" id="sliderVal">3.250</span>
+            </div>
+            <input id="demoSlider" type="range" min="0" max="10" step="0.05" value="3.25" class="w-full h-1.5 bg-[var(--border-strong)] rounded-lg cursor-pointer" />
+            <div class="flex justify-between text-[10px] text-[var(--text-soft)] font-mono-code">
+              <span>0.00</span>
+              <span>5.00</span>
+              <span>10.00</span>
+            </div>
+          </div>
+
+          <!-- Claude 风格人文卡片：AI 控制诊断卡片 (Copilot Card) -->
+          <div class="claude-card p-4 flex-1 flex flex-col justify-between bg-gradient-to-br from-[var(--bg-surface)] to-[var(--bg-elevated)] border-l-4 border-l-[var(--accent-terracotta)]">
+            <div>
+              <div class="flex items-center space-x-2 mb-2">
+                <span class="text-sm">✦</span>
+                <span class="text-xs font-serif-claude italic font-semibold text-[var(--text-main)]">Claude 控制专家诊断</span>
+              </div>
+              <p class="text-xs leading-relaxed text-[var(--text-muted)] font-serif-claude">
+                当前回路在阶跃响应中呈现 <strong class="text-[var(--text-main)] font-sans">超调量 Mp=14.2%</strong>，闭环相位裕度约为 <strong class="text-[var(--text-main)] font-sans">γ=38.5°</strong>。建议提升阻尼系数，下微调 Kp 至 2.85。
+              </p>
+            </div>
+            <button class="mt-3 w-full py-1.5 rounded-lg bg-[var(--accent-terracotta-soft)] text-[var(--accent-terracotta)] text-xs font-medium hover:bg-[var(--accent-terracotta)] hover:text-white transition-all text-center">
+              填入建议调参指令 (SET_PID 2.85 0.20 0.05)
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 底部 Claude 经典对话框样式的单行极简控制条 (38px 悬浮条) -->
+      <div class="claude-input-box px-4 py-2.5 flex items-center space-x-3">
+        <!-- 格式选单切换 -->
+        <button class="text-xs px-2.5 py-1 rounded-lg bg-[var(--bg-elevated)] border border-[var(--border-subtle)] font-mono-code font-medium hover:border-[var(--accent-terracotta)] transition-colors">
+          Abc
+        </button>
+
+        <!-- 主命令输入框 -->
+        <input type="text" placeholder="向单片机发送控制指令或参数 (支持 ↑/↓ 历史指令循环召回，Enter 立即发送)..." class="flex-1 bg-transparent text-sm focus:outline-none placeholder-[var(--text-soft)] font-mono-code text-[var(--text-main)]" value="SET:SPEED_TARGET=150.0" />
+
+        <!-- 换行符微选单 -->
+        <span class="text-xs text-[var(--text-soft)] font-mono-code hidden sm:inline">\r\n (CRLF)</span>
+
+        <!-- 常用指令快速气泡 -->
+        <button class="text-xs px-2.5 py-1 rounded-full bg-[var(--bg-elevated)] border border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors">
+          READ_STATUS
+        </button>
+
+        <!-- Claude 标志性陶土色圆形发送按钮 -->
+        <button class="w-8 h-8 rounded-full bg-[var(--accent-terracotta)] text-white flex items-center justify-center hover:bg-[var(--accent-terracotta-hover)] shadow-sm transition-transform active:scale-95" title="发送指令 (Alt + S / Enter)">
+          <svg class="w-4 h-4 transform rotate-90" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4.5 10.5L12 3m0 0l7.5 7.5M12 3v18"></path></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- 右侧 Claude 侧边栏式通道监控列表 (220px) -->
+    <aside class="w-56 claude-card p-3.5 flex flex-col">
+      <div class="flex items-center justify-between pb-2 border-b border-[var(--border-subtle)] mb-2">
+        <span class="text-xs font-semibold text-[var(--text-main)]">活跃数据通道 (5)</span>
+        <button class="text-xs text-[var(--text-soft)] hover:text-[var(--text-main)]">贴边收起 ▶</button>
+      </div>
+
+      <div class="flex-1 flex flex-col space-y-1.5 overflow-y-auto">
+        <div class="flex items-center justify-between p-2 rounded-xl bg-[var(--bg-elevated)] text-xs font-mono-code cursor-pointer hover:bg-[var(--accent-terracotta-soft)] transition-colors">
+          <div class="flex items-center space-x-2">
+            <span class="w-2.5 h-2.5 rounded-full" style="background-color: var(--wave-1)"></span>
+            <span class="font-medium">!0 速度设定</span>
+          </div>
+          <span class="font-bold text-[var(--accent-terracotta)]">150.000</span>
+        </div>
+
+        <div class="flex items-center justify-between p-2 rounded-xl bg-[var(--bg-surface)] text-xs font-mono-code cursor-pointer hover:bg-[var(--bg-elevated)] transition-colors">
+          <div class="flex items-center space-x-2">
+            <span class="w-2.5 h-2.5 rounded-full" style="background-color: var(--wave-2)"></span>
+            <span class="font-medium">!1 实际速度</span>
+          </div>
+          <span class="font-bold">128.402</span>
+        </div>
+
+        <div class="flex items-center justify-between p-2 rounded-xl bg-[var(--bg-surface)] text-xs font-mono-code cursor-pointer hover:bg-[var(--bg-elevated)] transition-colors">
+          <div class="flex items-center space-x-2">
+            <span class="w-2.5 h-2.5 rounded-full" style="background-color: var(--wave-3)"></span>
+            <span class="font-medium">!2 PWM占比</span>
+          </div>
+          <span class="font-bold">42.180</span>
+        </div>
+
+        <div class="flex items-center justify-between p-2 rounded-xl bg-[var(--bg-surface)] text-xs font-mono-code cursor-pointer hover:bg-[var(--bg-elevated)] transition-colors">
+          <div class="flex items-center space-x-2">
+            <span class="w-2.5 h-2.5 rounded-full bg-amber-500"></span>
+            <span class="font-medium">!3 电流母线</span>
+          </div>
+          <span class="font-bold">1.450</span>
+        </div>
+
+        <div class="flex items-center justify-between p-2 rounded-xl bg-[var(--bg-surface)] text-xs font-mono-code cursor-pointer hover:bg-[var(--bg-elevated)] transition-colors">
+          <div class="flex items-center space-x-2">
+            <span class="w-2.5 h-2.5 rounded-full bg-purple-500"></span>
+            <span class="font-medium">!4 芯片温度</span>
+          </div>
+          <span class="font-bold">39.800</span>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script>
+    // 1. 双模主题切换逻辑
+    const htmlEl = document.documentElement;
+    const themeBtn = document.getElementById('themeToggleBtn');
+    const themeIcon = document.getElementById('themeIcon');
+    const themeLabel = document.getElementById('themeLabel');
+
+    let isDark = false;
+    themeBtn.addEventListener('click', () => {
+      isDark = !isDark;
+      if (isDark) {
+        htmlEl.classList.add('dark');
+        themeIcon.textContent = '🌙';
+        themeLabel.textContent = '优雅暖黑';
+      } else {
+        htmlEl.classList.remove('dark');
+        themeIcon.textContent = '☀️';
+        themeLabel.textContent = '经典暖白';
+      }
+    });
+
+    // 2. 模拟波形图实时绘制
+    const canvas = document.getElementById('waveformCanvas');
+    const ctx = canvas.getContext('2d');
+    let phase = 0;
+
+    function resizeCanvas() {
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * window.devicePixelRatio;
+      canvas.height = rect.height * window.devicePixelRatio;
+      ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    function drawWaveforms() {
+      const w = canvas.width / window.devicePixelRatio;
+      const h = canvas.height / window.devicePixelRatio;
+      ctx.clearRect(0, 0, w, h);
+
+      // 绘制背景微弱网格
+      ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--grid-line');
+      ctx.lineWidth = 1;
+      const step = 32;
+      for (let x = 0; x < w; x += step) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, h);
+        ctx.stroke();
+      }
+      for (let y = 0; y < h; y += step) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(w, y);
+        ctx.stroke();
+      }
+
+      // 曲线 1: 陶土红 (目标波)
+      const c1 = getComputedStyle(document.documentElement).getPropertyValue('--wave-1');
+      ctx.strokeStyle = c1.trim();
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      for (let x = 0; x < w; x++) {
+        const y = h / 2 + Math.sin((x * 0.015) + phase) * (h * 0.28);
+        if (x === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+
+      // 曲线 2: 鼠尾草绿 (实际反馈波，带轻微阻尼与相位差)
+      const c2 = getComputedStyle(document.documentElement).getPropertyValue('--wave-2');
+      ctx.strokeStyle = c2.trim();
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      for (let x = 0; x < w; x++) {
+        const y = h / 2 + Math.sin((x * 0.015) + phase - 0.45) * (h * 0.26) + Math.cos(x * 0.04) * 6;
+        if (x === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+
+      // 曲线 3: 石板蓝 (控制量输出)
+      const c3 = getComputedStyle(document.documentElement).getPropertyValue('--wave-3');
+      ctx.strokeStyle = c3.trim();
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      for (let x = 0; x < w; x++) {
+        const y = h / 2 + Math.cos((x * 0.02) + phase * 1.2) * (h * 0.18);
+        if (x === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      phase += 0.035;
+      requestAnimationFrame(drawWaveforms);
+    }
+    requestAnimationFrame(drawWaveforms);
+
+    // 3. 滑块联动演示
+    const slider = document.getElementById('demoSlider');
+    const sliderVal = document.getElementById('sliderVal');
+    const needle = document.getElementById('gaugeNeedle');
+    const gaugeText = document.getElementById('gaugeValText');
+
+    slider.addEventListener('input', (e) => {
+      const val = parseFloat(e.target.value);
+      sliderVal.textContent = val.toFixed(3);
+      // 动态旋转指针
+      const angle = (val / 10) * 140 - 70; // -70deg ~ 70deg
+      const rad = (angle - 90) * (Math.PI / 180);
+      const nx = 100 + Math.cos(rad) * 65;
+      const ny = 115 + Math.sin(rad) * 65;
+      needle.setAttribute('x2', nx);
+      needle.setAttribute('y2', ny);
+      gaugeText.textContent = (val * 40 + 20).toFixed(2);
+    });
+  </script>
+</body>
+</html>

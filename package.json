@@ -1,0 +1,34 @@
+{
+  "name": "llm-serial",
+  "private": true,
+  "version": "0.1.1-beta.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "build:web": "vite build --mode web",
+    "build:portable": "node scripts/build-portable.mjs",
+    "build:beta": "node scripts/build-portable.mjs --beta",
+    "test": "node scripts/run-checks.mjs --frontend-only",
+    "check:release": "node scripts/run-checks.mjs",
+    "release": "node scripts/build-portable.mjs",
+    "test:widget": "node --experimental-strip-types --import ./tests/register-ts-loader.mjs ./scripts/test-widget-core.mjs",
+    "test:tuning": "node --experimental-strip-types --import ./tests/register-ts-loader.mjs ./tests/tuning-engine.test.ts",
+    "test:transport": "node --experimental-strip-types --import ./tests/register-ts-loader.mjs ./tests/transport.test.ts",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.2.0",
+    "uplot": "^1.6.31",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.2.0",
+    "@types/node": "^22.10.2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3",
+    "vue-tsc": "^2.2.0"
+  }
+}
