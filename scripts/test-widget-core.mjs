@@ -4,6 +4,11 @@ import '../tests/simulation-comparison.test.ts';
 import '../tests/tuning-scenarios.test.ts';
 import '../tests/bandwidth-policy.test.ts';
 import '../tests/bode-precision.test.ts';
+import '../tests/cascade-dependencies.test.ts';
+import '../tests/scenario-cascade-model.test.ts';
+import '../tests/tuning-confirmed-context.test.ts';
+import '../tests/tuning-feedback-evidence.test.ts';
+import '../tests/tuning-alignment.test.ts';
 import {
   parseEscapeSequences,
   encodeNumberToHex,

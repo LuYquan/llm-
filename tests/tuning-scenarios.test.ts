@@ -26,7 +26,10 @@ export function runTuningScenarioTests(): void {
   }
   assert.equal(deriveScenarioPlant('balance-car', 'upright', 'upright', {}).status, 'needs-input');
   assert.equal(deriveScenarioPlant('flight-control', 'rate', 'attitude', {}).status, 'unsupported');
-  assert.ok(getScenarioPhysicalFields('flight-control', 'attitude').some(item => item.id === 'inner_bandwidth'));
+  assert.ok(!getScenarioPhysicalFields('flight-control', 'attitude').some(item => item.id === 'inner_bandwidth'));
+  assert.ok(getScenarioPhysicalFields('flight-control', 'attitude').some(item => item.id === 'inner_feedback_gain'));
+  assert.ok(getScenarioPhysicalFields('flight-control', 'attitude').some(item => item.id === 'inner_derivative_filter_time'));
+  assert.ok(getScenarioPhysicalFields('flight-control', 'attitude').some(item => item.id === 'angle_rate_unit_scale'));
   assert.ok(!getScenarioPhysicalFields('flight-control', 'attitude').some(item => item.id === 'axis_inertia'));
 
   const balanceInputs = { body_mass: 1, total_mass: 2, center_height: 0.2, body_inertia: 0.02, wheel_radius: 0.05, torque_gain: 0.1, pitch_damping: 0, actuator_time: 0, delay: 0 };
@@ -42,8 +45,13 @@ export function runTuningScenarioTests(): void {
   const flight = deriveScenarioPlant('flight-control', 'rate', 'rate', { axis_inertia: 0.02, torque_gain: 0.3, axis_damping: 0, actuator_time: 0.04, delay: 0.002 });
   assert.equal(flight.status, 'ready');
   assert.deepEqual(flight.model!.denominator, [0.0008, 0.02, 0]);
-  const attitude = deriveScenarioPlant('flight-control', 'rate-attitude', 'attitude', { inner_bandwidth: 20, delay: 0 });
-  assert.deepEqual(attitude.model!.denominator, [0.05, 1, 0]);
+  const attitudeInputs = { inner_feedback_gain: 1, inner_derivative_filter_time: 0, angle_rate_unit_scale: 1, delay: 0 };
+  assert.equal(deriveScenarioPlant('flight-control', 'rate-attitude', 'attitude', { inner_bandwidth: 20, delay: 0 }).status, 'needs-input');
+  assert.equal(deriveScenarioPlant('flight-control', 'rate-attitude', 'attitude', attitudeInputs).status, 'needs-input');
+  const attitude = deriveScenarioPlant('flight-control', 'rate-attitude', 'attitude', attitudeInputs, { plant: { family: 'fopdt', k: 2, t: 0.5, tau: 0 }, params: { kp: 4, ki: 0, kd: 0, tf: 0 }, feedbackGain: 1 });
+  assert.equal(attitude.status, 'ready', attitude.warnings.join(' '));
+  assert.deepEqual(attitude.model!.numerator, [8]);
+  assert.deepEqual(attitude.model!.denominator, [0.5, 9, 0]);
 
   const parsed = parseTransferFunctionInput('[2]', '0.3, 1', 0.02);
   assert.ok(parsed.model);

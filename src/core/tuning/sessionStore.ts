@@ -14,6 +14,28 @@ export function loadTuningStageSession(groupId: string, scenarioId: string, topo
     && session.plan.suite?.id === scenarioId && session.plan.suite.topologyId === topologyId && session.plan.suite.stageId === stageId);
 }
 
+/** Configuration/history only. Device authority lives in the current UI instance. */
+export function loadTuningGroupSessions(groupId: string): TuningSession[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    const candidates = Array.isArray(parsed) ? parsed : [parsed];
+    return candidates.filter((value): value is TuningSession => isTuningSession(value)
+      && (value.scenarioGroupId ?? value.id) === groupId)
+      .map((value) => {
+        const draft = JSON.parse(JSON.stringify(value)) as TuningSession;
+        draft.plan.baseline.confirmed = false;
+        draft.plan.baseline.stableBaseConfirmed = false;
+        if (draft.plan.suite) draft.plan.suite.modelConfirmed = false;
+        draft.lastConfirmed = null;
+        return draft;
+      });
+  } catch {
+    return [];
+  }
+}
+
 function readSession(matches: (session: TuningSession) => boolean = () => true): TuningSession | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);

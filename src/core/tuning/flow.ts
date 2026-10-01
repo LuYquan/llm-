@@ -1,3 +1,5 @@
+import type { TuningPlan, TuningSession, TuningTrial } from './types';
+
 export interface ManualCandidateEligibilityInput {
   planErrorCount: number;
   isWorking: boolean;
@@ -33,6 +35,33 @@ export function executionSafetyStopReason(input: { connected: boolean; telemetry
   if (!input.connected) return '串口已断开，设备停止字节可能无法送达。';
   if (!input.telemetryFresh || !Number.isFinite(input.output)) return '实时遥测过期、会话变化或控制输出无效。';
   if (!Number.isFinite(input.maximumOutputMagnitude) || Math.abs(input.output!) > input.maximumOutputMagnitude!) return '控制输出超过用户设置的绝对上限。';
+  return null;
+}
+
+/** Recheck after asynchronous waits, before evaluation or runtime evidence. */
+export function confirmedTrialContextFailure(input: {
+  trial: TuningTrial;
+  plan: TuningPlan;
+  lastConfirmed: TuningSession['lastConfirmed'];
+  generation: number;
+  sessionContext: { sessionId: string | null; epoch: number | null };
+  authorizedScopeMatches: boolean;
+  working: boolean;
+  stopped: boolean;
+  connected: boolean;
+  executionEnabled: boolean;
+}): string | null {
+  const { trial, plan, lastConfirmed } = input;
+  if (!input.working || input.stopped || !input.connected || !input.executionEnabled || !input.authorizedScopeMatches) return '试验授权、连接或执行条件已变化，不能记录本轮评价。';
+  if (!['confirmed', 'evaluated'].includes(trial.status) || !trial.writeRequestId
+    || !Number.isFinite(trial.writeCompletedAt) || trial.writeCompletedAt! < 0 || !Number.isSafeInteger(input.generation) || input.generation < 0
+    || trial.sourceChannelGeneration !== input.generation || trial.writeChannelGeneration !== input.generation
+    || !input.sessionContext.sessionId || trial.writeSessionId !== input.sessionContext.sessionId
+    || !Number.isSafeInteger(input.sessionContext.epoch) || input.sessionContext.epoch! < 0 || trial.writeEpoch !== input.sessionContext.epoch) return '本轮驱动确认与当前设备会话不一致，不能记录已验证结果。';
+  if (!lastConfirmed || !Number.isFinite(lastConfirmed.at) || lastConfirmed.at < trial.writeCompletedAt!
+    || lastConfirmed.mode !== trial.confirmationMode || !plan.baseline.confirmed || !plan.baseline.params
+    || !(['kp', 'ki', 'kd'] as const).every(key => Number.isFinite(trial.candidate[key])
+      && lastConfirmed.params[key] === trial.candidate[key] && plan.baseline.params![key] === trial.candidate[key])) return '设备确认参数或当前基线已变化，本轮评价依据已失效。';
   return null;
 }
 

@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { calculateModelCandidate, createCandidateRecord, evaluateResponse, formatTuningParameter, importCapabilityPlan, isTrialForPlan, matchesParameterReadback, packagePlan, trialBudgetUsed, validateCandidate, validateCandidateInputs, validateCapabilityPackage, validatePlan } from '../src/core/tuning/engine.ts';
-import { buildFeedbackRequest, parsePlantModelDraft } from '../src/services/tuningAgent.ts';
-import { loadTuningSession, loadTuningStageSession, saveTuningSession } from '../src/core/tuning/sessionStore.ts';
+import { buildFeedbackRequest, parsePlantModelDraft, proposeFeedbackCandidate, validateFeedbackObservation } from '../src/services/tuningAgent.ts';
+import { cascadeStageConfigurationSignature } from '../src/core/tuning/cascadeDependencies.ts';
+import type { TelemetryEvidence } from '../src/core/tuning/feedbackEvidence.ts';
+import { loadTuningSession, loadTuningStageSession, loadTuningGroupSessions, saveTuningSession } from '../src/core/tuning/sessionStore.ts';
 import type { TuningPlan } from '../src/core/tuning/types.ts';
 import type { TuningSession } from '../src/core/tuning/types.ts';
 import { isAcknowledgementForWrite, isFreshChannelValue, isWriteResultForTrial } from '../src/core/tuning/write-correlation.ts';
@@ -289,6 +291,23 @@ plan.goal.maximumSteadyError = 99;
 assert.equal(feedbackInputs.evidence.target.maximumSteadyError, 0.1, 'asynchronous AI evidence owns an immutable request snapshot');
 plan.goal.maximumSteadyError = 0.1;
 assert.equal(feedbackInputs.operatingGuidance.userConstraints, plan.prompt);
+assert.equal(feedbackInputs.evidence.telemetryWindow, null, 'a pure legacy snapshot does not manufacture window provenance');
+const observation: TelemetryEvidence = { source: 'baseline-window', configurationSignature: cascadeStageConfigurationSignature(plan).signature!,
+  generation: 2, sessionId: 'device-current', epoch: 0, params: { ...plan.baseline.params! }, windowStart: 10, windowEnd: 100,
+  baselineConfirmedAt: 1000, sampleCount: settled.metrics!.sampleCount };
+validateFeedbackObservation(plan, plan.baseline.params!, settled.metrics!, observation);
+const windowRequest = buildFeedbackRequest(plan, plan.baseline.params!, settled.metrics!, observation);
+observation.params.kp = 99;
+observation.windowEnd = 101;
+assert.equal(windowRequest.evidence.telemetryWindow?.params.kp, plan.baseline.params!.kp, 'request owns copied observation params');
+assert.equal(windowRequest.evidence.telemetryWindow?.windowEnd, 100, 'request owns copied window identity');
+const validObservation = windowRequest.evidence.telemetryWindow!;
+for (const bad of [null, { ...validObservation, configurationSignature: 'old' }, { ...validObservation, sampleCount: 1 },
+  { ...validObservation, params: { ...validObservation.params, kp: 9 } }, { ...validObservation, windowEnd: validObservation.windowStart },
+  { ...validObservation, unexpected: 'unbounded' }]) assert.throws(() => validateFeedbackObservation(plan, plan.baseline.params!, settled.metrics!, bad), /反馈窗口/);
+assert.throws(() => validateFeedbackObservation(plan, plan.baseline.params!, { ...settled.metrics!, extra: 1 } as any, validObservation), /实测指标/);
+await assert.rejects(() => proposeFeedbackCandidate({ config: { provider: 'ollama' } as any, plan, params: plan.baseline.params!,
+  metrics: settled.metrics!, telemetryEvidence: { ...validObservation, configurationSignature: 'stale' } }), /反馈窗口/, 'stale observation is refused before network I/O');
 const modelDraftRaw = {
   canModel: true, title: '单轴模型草稿', numerator: ['torque_gain'], denominator: ['axis_inertia', 'damping'], tau: '0',
   physicalFields: [{ id: 'torque_gain', label: '力矩增益', unit: 'N·m/%', required: true }, { id: 'axis_inertia', label: '轴惯量', unit: 'kg·m²', required: true, min: 0 }, { id: 'damping', label: '等效阻尼', unit: 'N·m·s/rad', required: true, min: 0 }],
@@ -339,6 +358,13 @@ try {
   assert.equal(restoredInner?.plan.baseline.confirmed, false, 'stage restore grants no device authority');
   assert.equal(restoredInner?.plan.suite?.modelConfirmed, false, 'restored models require review');
   assert.equal(loadTuningStageSession('cascade-B', 'balance-car', 'upright-velocity', 'upright'), null, 'a different scenario session cannot borrow stage history');
+  const groupDrafts = loadTuningGroupSessions('cascade-A');
+  assert.equal(groupDrafts.length, 2, 'upstream configuration reads stay within the exact scenario group');
+  assert.ok(groupDrafts.every((draft) => !draft.plan.baseline.confirmed && !draft.plan.baseline.stableBaseConfirmed
+    && !draft.plan.suite?.modelConfirmed && draft.lastConfirmed === null), 'configuration/history reads never recreate current device evidence');
+  groupDrafts[0].plan.baseline.params!.kp = 999;
+  assert.notEqual(loadTuningGroupSessions('cascade-A')[0].plan.baseline.params?.kp, 999, 'readers receive independent configuration snapshots');
+  assert.equal(loadTuningGroupSessions('cascade-B').length, 0);
   storageValues.set('llm-serial-tuning-sessions-v1', JSON.stringify(firstSession));
   assert.equal(loadTuningSession()?.id, 'first-session', 'legacy single-session drafts remain readable');
   storageValues.set('llm-serial-tuning-sessions-v1', JSON.stringify({ ...firstSession, plan: { ...plan, channels: null } }));

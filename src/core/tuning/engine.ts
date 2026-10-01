@@ -1,6 +1,7 @@
 import type { PlantModel, SolvePidResult } from '../control/types';
 import { solvePid } from '../control/solvePid';
 import { getPlantControlGain, validatePlantModel, withPlantGainMultiplier } from '../control/transferFunction';
+import { isCascadeDependencySnapshot } from './cascadeDependencies';
 import type { LoopStructure, PidValues } from '../project/types';
 import type {
   CandidateValidation,
@@ -340,7 +341,7 @@ export function packagePlan(plan: TuningPlan, title = plan.name): unknown {
     compatibility: { app: '^0.1.0', features: ['tuning-workspace-v1'] },
     skills: plan.prompt.trim() ? [{ id: 'project-guidance', title: '项目调参知识', instructions: plan.prompt }] : [],
     tools: plan.suite?.tools ?? (plan.route === 'model' ? ['local.pid-solver'] : ['ai.feedback-candidate']),
-    plan: { ...JSON.parse(JSON.stringify(plan)), id: createId(), prompt: '', suite: plan.suite ? { ...plan.suite, modelConfirmed: false } : undefined, baseline: { params: null, source: 'unset', confirmed: false, stableBaseConfirmed: false } },
+    plan: { ...JSON.parse(JSON.stringify(plan)), id: createId(), prompt: '', cascadeBinding: undefined, suite: plan.suite ? { ...plan.suite, modelConfirmed: false } : undefined, baseline: { params: null, source: 'unset', confirmed: false, stableBaseConfirmed: false } },
   };
 }
 
@@ -398,6 +399,7 @@ export function validatePlanShape(value: unknown): string[] {
     || !['maximumSteadyError', 'maximumOvershootPct', 'maximumTrackingError', 'targetPhaseMarginDeg', 'targetCrossoverRadPerSec'].every((key) => nullableNumber((p.goal as Record<string, unknown>)[key]))) return ['调参目标格式无效。'];
   if (p.model !== null && (!isObject(p.model) || validatePlantModel(p.model as unknown as PlantModel).length)) return ['对象模型格式无效。'];
   if (p.suite !== undefined && !isScenarioContext(p.suite)) return ['场景套组格式无效。'];
+  if (p.cascadeBinding !== undefined && !isCascadeDependencySnapshot(p.cascadeBinding)) return ['串级内环依赖快照格式无效。'];
   return [];
 }
 
@@ -410,6 +412,7 @@ export function importCapabilityPlan(pkg: TuningCapabilityPackage): TuningPlan {
   plan.prompt = pkg.skills.map((skill) => skill.instructions).join('\n\n');
   plan.baseline = { params: null, source: 'unset', confirmed: false, stableBaseConfirmed: false };
   if (plan.suite) plan.suite.modelConfirmed = false;
+  delete plan.cascadeBinding;
   return plan;
 }
 

@@ -4,15 +4,20 @@ import type { AiConfig } from '../services/ai';
 import { aiServiceNeedsKey } from '../services/ai';
 import { proposeFeedbackCandidate, proposePlantModelDraft } from '../services/tuningAgent';
 import { calculateModelCandidate, createCandidateRecord, evaluateResponse, fingerprint, formatTuningParameter, importCapabilityPlan, isActiveParameter, isTrialForPlan, matchesParameterReadback, packagePlan, trialBudgetUsed, tuningPlanSignature, validateCandidate, validateCandidateInputs, validateCapabilityPackage, validatePlan } from '../core/tuning/engine';
-import { loadTuningSession, loadTuningStageSession, saveTuningSession } from '../core/tuning/sessionStore';
+import { loadTuningSession, loadTuningStageSession, loadTuningGroupSessions, saveTuningSession } from '../core/tuning/sessionStore';
+import { buildCascadeDependencySnapshot, checkCascadeDependencySnapshot, checkCascadeDeviceDependencies, cascadeStageConfigurationSignature } from '../core/tuning/cascadeDependencies';
+import type { CascadeRuntimeEvidence } from '../core/tuning/cascadeDependencies';
+import { selectFeedbackEvidence } from '../core/tuning/feedbackEvidence';
+import { alignTelemetrySnapshots } from '../core/tuning/alignTelemetry';
+import type { BaselineObservationBoundary, EvaluatedTrialContext, TelemetryEvidence } from '../core/tuning/feedbackEvidence';
 import type { FeedbackProposal, PidParameter, TuningCapabilityPackage, TuningMetrics, TuningPlan, TuningSession, TuningTrial, ToolExecutionRecord, WriteConfirmationMode } from '../core/tuning/types';
 import { SCENARIO_SUITES, createScenarioContext, deriveScenarioPlant, getScenarioPhysicalFields, getScenarioSuite, materializeTransferFunctionDraft, parseTransferFunctionInput, validateCustomStages } from '../core/tuning/scenarios';
-import type { ScenarioPhysicalField, ScenarioStage, TransferFunctionDraft, TuningScenarioContext, TuningScenarioId } from '../core/tuning/scenarios';
+import type { ScenarioInnerLoopSource, ScenarioPhysicalField, ScenarioStage, TransferFunctionDraft, TuningScenarioContext, TuningScenarioId } from '../core/tuning/scenarios';
 import type { LoopStructure } from '../core/project/types';
 import { globalChannelStore } from '../core/channel/ChannelStore';
 import { globalProjectModel } from '../core/project/ProjectModel';
 import { isAcknowledgementForWrite, isFreshChannelValue, isWriteResultForTrial } from '../core/tuning/write-correlation';
-import { executionSafetyStopReason, manualCandidateEligibility } from '../core/tuning/flow';
+import { confirmedTrialContextFailure, executionSafetyStopReason, manualCandidateEligibility } from '../core/tuning/flow';
 
 type LogLine = { id: number; time: string; at?: number; tag: string; level: string; text: string };
 type WriteResult = { id: string; requestId?: string; sessionId?: string; epoch?: number; status: 'queued' | 'written' | 'failed'; at: number; error?: string } | null;
@@ -175,6 +180,97 @@ const parameterForm = reactive({
 });
 
 session.value.scenarioGroupId ??= session.value.id;
+const groupStageDrafts = ref<TuningSession[]>(loadTuningGroupSessions(session.value.scenarioGroupId));
+// Intentionally volatile: persisted history is not evidence of the current device.
+const runtimeStageEvidence = ref(new Map<string, CascadeRuntimeEvidence>());
+const evaluatedTrialContexts = ref(new Map<string, EvaluatedTrialContext>());
+const baselineObservation = ref<BaselineObservationBoundary | null>(null);
+const deviceGeneration = ref(observedChannelGeneration);
+const groupedStageSessions = computed(() => [session.value, ...groupStageDrafts.value.filter((entry) => entry.id !== session.value.id)]);
+const dependencyInput = computed(() => ({ plan: plan.value, groupId: session.value.scenarioGroupId ?? session.value.id, sessions: groupedStageSessions.value }));
+const availableDependencies = computed(() => buildCascadeDependencySnapshot(dependencyInput.value));
+const cascadeConfiguration = computed(() => checkCascadeDependencySnapshot({ ...dependencyInput.value, boundSnapshot: plan.value.cascadeBinding }));
+const cascadeDeviceCheck = computed(() => checkCascadeDeviceDependencies({ ...dependencyInput.value, boundSnapshot: plan.value.cascadeBinding, generation: deviceGeneration.value, evidence: runtimeStageEvidence.value }));
+const upstreamStages = computed(() => {
+  const index = sceneStages.value.findIndex((entry) => entry.id === plan.value.suite?.stageId);
+  return index > 0 ? sceneStages.value.slice(0, index) : [];
+});
+const sceneInnerSource = computed<ScenarioInnerLoopSource | undefined>(() => {
+  const context = plan.value.suite;
+  const stage = upstreamStages.value.at(-1);
+  if (!context || !stage) return undefined;
+  const source = groupedStageSessions.value.find((entry) => entry.plan.suite?.id === context.id
+    && entry.plan.suite.topologyId === context.topologyId && entry.plan.suite.stageId === stage.id);
+  const inner = source?.plan;
+  const tf = context.physicalInputs.inner_derivative_filter_time;
+  const feedbackGain = context.physicalInputs.inner_feedback_gain;
+  if (!inner?.model || !inner.baseline.params || !inner.controlDirection || tf === null || tf === undefined
+    || feedbackGain === null || feedbackGain === undefined || !inner.sampleTimeSeconds) return undefined;
+  const direction = inner.controlDirection === 'reverse' ? -1 : 1;
+  return { plant: inner.model, params: { kp: direction * inner.baseline.params.kp, ki: direction * inner.baseline.params.ki,
+    kd: direction * inner.baseline.params.kd, tf, sampleTime: inner.sampleTimeSeconds }, feedbackGain };
+});
+const feedbackEvidenceStatus = computed(() => {
+  void clockNow.value;
+  return selectFeedbackEvidence({ plan: plan.value, currentConfigurationSignature: cascadeStageConfigurationSignature(plan.value).signature ?? '',
+    generation: deviceGeneration.value, sessionContext: globalChannelStore.getSessionContext(), now: clockNow.value,
+    currentTelemetryTimestamp: latestTelemetryTimestamp(), lastConfirmed: session.value.lastConfirmed, trials: session.value.trials,
+    trialContexts: evaluatedTrialContexts.value, baselineBoundary: baselineObservation.value });
+});
+
+function refreshGroupDrafts() {
+  groupStageDrafts.value = loadTuningGroupSessions(session.value.scenarioGroupId ?? session.value.id);
+}
+
+function clearCurrentStageEvidence() {
+  runtimeStageEvidence.value.delete(session.value.id);
+}
+
+function clearVolatileDeviceEvidence() {
+  runtimeStageEvidence.value.clear();
+  evaluatedTrialContexts.value.clear();
+  baselineObservation.value = null;
+}
+
+function rejectPendingStageProposals(reason: string) {
+  for (const trial of session.value.trials) {
+    if (trial.status === 'proposed') { trial.status = 'rejected'; trial.note += ` ${reason}`; }
+  }
+}
+
+function bindUpstreamConfiguration(): boolean {
+  if (plan.value.route === 'model' && modelSource.value === 'physical') syncPhysicalModel();
+  const check = buildCascadeDependencySnapshot(dependencyInput.value);
+  if (!check.ready) {
+    setNotice('warning', '内环依据未就绪', check.issues.join(' '));
+    return false;
+  }
+  if (check.snapshot) plan.value.cascadeBinding = check.snapshot;
+  else delete plan.value.cascadeBinding;
+  return true;
+}
+
+function confirmSceneModel(confirmed: boolean) {
+  if (!plan.value.suite) return;
+  plan.value.suite.modelConfirmed = false;
+  if (confirmed && bindUpstreamConfiguration() && plan.value.model) plan.value.suite.modelConfirmed = true;
+}
+
+function onStoredStagesChanged(event: StorageEvent) {
+  if (event.key === 'llm-serial-tuning-sessions-v1') {
+    invalidateDeviceContext();
+    refreshGroupDrafts();
+  }
+}
+
+function requireCurrentStageRevalidation() {
+  if (session.value.status !== 'completed') return;
+  const proof = runtimeStageEvidence.value.get(session.value.id);
+  const signature = cascadeStageConfigurationSignature(plan.value).signature;
+  if (proof && proof.generation === globalChannelStore.getGeneration() && proof.configSignature === signature) return;
+  session.value.status = 'draft';
+  session.value.stopReason = '历史评价已保留，本次连接中的当前环需要重新确认和验证。';
+}
 
 function captureFormDraft() {
   session.value.formDraft = { modelSource: modelSource.value, ...transferForm, parameters: { ...parameterForm } };
@@ -189,7 +285,8 @@ function restoreFormDraft() {
     modelSource.value = form.modelSource;
     Object.assign(transferForm, { numerator: form.numerator, denominator: form.denominator, delay: form.delay });
     Object.assign(parameterForm, form.parameters);
-  } else {
+  }
+  if (!form || plan.value.baseline.params) {
     for (const key of ['kp', 'ki', 'kd'] as const) parameterForm[key] = plan.value.baseline.params?.[key].toString() ?? '';
   }
 }
@@ -198,16 +295,17 @@ function archiveCurrentStage() {
   captureFormDraft();
   session.value.updatedAt = Date.now();
   if (!saveTuningSession(session.value)) setNotice('warning', '环节草稿未保存', '本地保存失败，请先导出当前套组。');
+  refreshGroupDrafts();
 }
 
 const activeParameters = computed(() => (['kp', 'ki', 'kd'] as PidParameter[]).filter((key) => isActiveParameter(plan.value.structure, key)));
-const planErrors = computed(() => validatePlan(plan.value));
-const candidateErrors = computed(() => validateCandidateInputs(plan.value));
+const planErrors = computed(() => [...validatePlan(plan.value), ...cascadeDeviceCheck.value.issues]);
+const candidateErrors = computed(() => [...validateCandidateInputs(plan.value), ...(plan.value.route === 'model' ? cascadeConfiguration.value.issues : cascadeDeviceCheck.value.issues)]);
 const selectedSuite = computed(() => plan.value.suite ? getScenarioSuite(plan.value.suite.id) : null);
 const selectedTopology = computed(() => selectedSuite.value?.topologies.find((item) => item.id === plan.value.suite?.topologyId));
 const sceneStages = computed(() => plan.value.suite?.id === 'custom' ? customStages.value : selectedTopology.value?.stages ?? []);
 const selectedStage = computed(() => sceneStages.value.find((item) => item.id === plan.value.suite?.stageId));
-const physicalModelResult = computed(() => plan.value.suite ? deriveScenarioPlant(plan.value.suite.id, plan.value.suite.topologyId, plan.value.suite.stageId, plan.value.suite.physicalInputs) : null);
+const physicalModelResult = computed(() => plan.value.suite ? deriveScenarioPlant(plan.value.suite.id, plan.value.suite.topologyId, plan.value.suite.stageId, plan.value.suite.physicalInputs, sceneInnerSource.value) : null);
 const stageErrors = computed(() => plan.value.suite?.id === 'custom' ? validateCustomStages(customStages.value) : []);
 const modelFieldInputs = computed<ScenarioPhysicalField[]>(() => modelSource.value === 'ai' && modelDraft.value ? modelDraft.value.physicalFields : plan.value.suite ? getScenarioPhysicalFields(plan.value.suite.id, plan.value.suite.stageId) : []);
 const aiConfigured = computed(() => Boolean(props.aiConfig.model && (!aiServiceNeedsKey(props.aiConfig) || props.aiConfig.api_key?.trim() || props.aiConfig.api_key_configured)));
@@ -243,9 +341,10 @@ const openIssues = computed(() => {
   else if (!telemetryFresh()) issues.push('等待绑定通道的实时遥测更新后再开始试验。');
   return issues.slice(0, 3);
 });
-const experimentCanStart = computed(() => props.executionEnabled === true && props.connected && telemetryFresh() && planErrors.value.length === 0 && !isWorking.value && session.value.status !== 'completed');
+const experimentCanStart = computed(() => props.executionEnabled === true && props.connected && telemetryFresh() && planErrors.value.length === 0 && !isWorking.value && session.value.status !== 'completed'
+  && (plan.value.route !== 'feedback' || feedbackEvidenceStatus.value.status === 'ready'));
 const canProposeCandidate = computed(() => manualCandidateEligibility({
-  planErrorCount: candidateErrors.value.length,
+  planErrorCount: candidateErrors.value.length + (plan.value.route === 'feedback' && feedbackEvidenceStatus.value.status === 'pending' ? 1 : 0),
   isWorking: isWorking.value,
   sessionStatus: session.value.status,
   route: plan.value.route,
@@ -282,6 +381,69 @@ watch(() => [session.value.trials, session.value.status, session.value.lastConfi
     sessionPersistTimer = null;
   }, 350);
 }, { deep: true });
+
+watch(() => [session.value.id, cascadeStageConfigurationSignature(plan.value).signature] as const, ([sessionId, signature], [previousId, previous]) => {
+  const evidence = runtimeStageEvidence.value.get(sessionId);
+  if (evidence && evidence.configSignature !== signature) clearCurrentStageEvidence();
+  if (sessionId !== previousId || signature === previous) return;
+  rejectPendingStageProposals('当前配置已变化，旧候选已失效。');
+  // A completed response belongs to its exact configuration, not the form forever.
+  if (session.value.status === 'completed') {
+    session.value.status = 'draft';
+    session.value.stopReason = '配置已变化，历史评价保留；当前配置需重新验证。';
+  }
+}, { flush: 'post' });
+
+function captureBaselineObservation() {
+  const signature = cascadeStageConfigurationSignature(plan.value).signature;
+  const context = globalChannelStore.getSessionContext();
+  if (!plan.value.baseline.confirmed || !plan.value.baseline.params || !signature || !props.connected
+    || !context.sessionId || context.epoch === null) {
+    baselineObservation.value = null;
+    return;
+  }
+  baselineObservation.value = { confirmedAt: Date.now(), fromTelemetryTimestamp: latestTelemetryTimestamp(),
+    generation: globalChannelStore.getGeneration(), sessionId: context.sessionId, epoch: context.epoch,
+    params: { ...plan.value.baseline.params }, configurationSignature: signature };
+}
+
+function confirmCurrentBaseline(confirmed: boolean) {
+  if (isWorking.value || aiBusy.value || modelBusy.value) return;
+  plan.value.baseline.confirmed = confirmed && Boolean(plan.value.baseline.params);
+  plan.value.baseline.stableBaseConfirmed = false;
+  session.value.lastConfirmed = null;
+  clearCurrentStageEvidence();
+  for (const trial of session.value.trials) evaluatedTrialContexts.value.delete(trial.id);
+  if (session.value.status === 'completed') {
+    session.value.status = 'draft';
+    session.value.stopReason = '用户重新核对基线；历史目标评价保留，当前依据需重新采集。';
+  }
+  captureBaselineObservation();
+}
+
+watch(() => [session.value.id, plan.value.baseline.confirmed, cascadeStageConfigurationSignature(plan.value).signature] as const,
+  captureBaselineObservation, { flush: 'post' });
+
+watch(() => JSON.stringify({ sessionId: session.value.id, check: cascadeConfiguration.value }), () => {
+  const ready = cascadeConfiguration.value.ready;
+  if (ready || !plan.value.cascadeBinding) return;
+  if (plan.value.suite) plan.value.suite.modelConfirmed = false;
+  clearCurrentStageEvidence();
+  authorizedPlanSignature.value = null;
+  rejectPendingStageProposals('内环配置或顺序已变化，旧候选已失效。');
+  if (isWorking.value) requestSafetyStop('内环依赖已变化，外环试验不能继续。');
+  else if (session.value.status === 'completed' || session.value.status === 'ready') session.value.status = 'draft';
+}, { flush: 'post' });
+
+watch(() => cascadeDeviceCheck.value.ready, (ready) => {
+  if (!ready && isWorking.value) requestSafetyStop('当前设备会话的内环验证依据已失效。');
+}, { flush: 'post' });
+
+watch(physicalModelResult, () => {
+  if (modelSource.value !== 'physical' || !plan.value.suite) return;
+  if (plan.value.suite.modelConfirmed) plan.value.suite.modelConfirmed = false;
+  syncPhysicalModel();
+}, { flush: 'post' });
 
 watch(() => props.writeResult, (result) => {
   if (!result || result.id !== pendingTrialId.value) return;
@@ -355,7 +517,9 @@ watch(() => props.executionEnabled, (enabled) => {
 watch(() => [plan.value.channels, plan.value.confirmation.mode, plan.value.confirmation.acknowledgementText], () => refreshSubscription(), { deep: true });
 
 onMounted(() => {
+  window.addEventListener('storage', onStoredStagesChanged);
   restoreFormDraft();
+  requireCurrentStageRevalidation();
   if (plan.value.suite?.customStages?.length) customStages.value = plan.value.suite.customStages.map((stage) => ({ ...stage, supportedStructures: [...stage.supportedStructures] }));
   freshnessTimer = window.setInterval(() => {
     clockNow.value = Date.now();
@@ -370,6 +534,8 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  window.removeEventListener('storage', onStoredStagesChanged);
+  clearVolatileDeviceEvidence();
   finishApproval(false);
   channelUnsubscribe.value?.();
   channelListUnsubscribe.value?.();
@@ -419,6 +585,8 @@ function selectScenario(scenarioId: TuningScenarioId) {
   plan.value = next;
   session.value = { id: id(), plan: next, status: 'draft', trials: [], bestVerified: null, lastConfirmed: null, startedAt: null, updatedAt: Date.now(), stopReason: null };
   session.value.scenarioGroupId = session.value.id;
+  clearVolatileDeviceEvidence();
+  refreshGroupDrafts();
   parameterForm.kp = parameterForm.ki = parameterForm.kd = '';
   pendingTrialId.value = null;
   modelDraft.value = null;
@@ -460,13 +628,15 @@ function activateStage(context: TuningScenarioContext) {
   if (next.suite?.id === 'custom') next.suite.customStages = customStages.value.map((stage) => ({ ...stage, supportedStructures: [...stage.supportedStructures] }));
   plan.value = next;
   session.value = restored ?? { id: id(), scenarioGroupId: groupId, plan: next, status: 'draft', trials: [], bestVerified: null, lastConfirmed: null, startedAt: null, updatedAt: Date.now(), stopReason: null };
+  refreshGroupDrafts();
   pendingTrialId.value = null;
   manualConfirmation.value = false;
   stopRequested.value = false;
   authorizedPlanSignature.value = null;
   modelInputErrors.value = [];
   restoreFormDraft();
-  if (!restored && modelSource.value === 'physical') syncPhysicalModel();
+  requireCurrentStageRevalidation();
+  if (modelSource.value === 'physical') syncPhysicalModel();
   setNotice('info', restored ? '已恢复这个环节的草稿' : '当前环节已切换', '各环节的模型、配置和记录分别保存。重新核对模型与设备基线后才能执行；先验收内环，再处理外环。');
 }
 
@@ -497,7 +667,7 @@ function setPhysicalInput(fieldId: string, raw: string) {
 function syncPhysicalModel() {
   const context = plan.value.suite;
   if (!context) return;
-  const result = deriveScenarioPlant(context.id, context.topologyId, context.stageId, context.physicalInputs);
+  const result = deriveScenarioPlant(context.id, context.topologyId, context.stageId, context.physicalInputs, sceneInnerSource.value);
   plan.value.model = result.model;
   context.assumptions = [...result.assumptions];
   context.modelOrigin = result.model ? 'physical-inputs' : 'pending';
@@ -535,12 +705,18 @@ async function deriveWithAi() {
     setNotice('warning', '先说明对象与工况', '描述执行器、传感器、输入输出和所控制的运动或过程；AI 将据此提出可核对的模型草稿。');
     return;
   }
-  if (!await requestApproval(`将对象描述、当前场景和补充提示词发送给 AI 服务，用于生成模型草稿及物理输入表。\n\n服务：${props.aiConfig.api_url}\n模型：${props.aiConfig.model}\n\n请核对接收方与待发送描述。`)) return;
-  modelBusy.value = true;
   const scope = tuningPlanSignature(plan.value);
+  const upstreamScope = JSON.stringify(availableDependencies.value);
+  const serviceScope = aiServiceSignature();
+  if (!await requestApproval(`将对象描述、当前场景和补充提示词发送给 AI 服务，用于生成模型草稿及物理输入表。\n\n服务：${props.aiConfig.api_url}\n模型：${props.aiConfig.model}\n\n请核对接收方与待发送描述。`)) return;
+  if (scope !== tuningPlanSignature(plan.value) || upstreamScope !== JSON.stringify(availableDependencies.value) || serviceScope !== aiServiceSignature()) {
+    setNotice('warning', '模型请求范围已变化', '配置或 AI 接收方在确认期间已变化，请重新核对后请求。');
+    return;
+  }
+  modelBusy.value = true;
   try {
     const draft = await proposePlantModelDraft({ config: props.aiConfig, description: plan.value.description, prompt: plan.value.prompt, suite: plan.value.suite });
-    if (tuningPlanSignature(plan.value) !== scope) {
+    if (tuningPlanSignature(plan.value) !== scope || JSON.stringify(availableDependencies.value) !== upstreamScope || serviceScope !== aiServiceSignature()) {
       setNotice('warning', '模型草稿已失效', '对象或场景配置已变化，请重新请求模型推导。');
       return;
     }
@@ -680,7 +856,11 @@ function executionPlanSignature(): string {
   const { baseline, ...executionPlan } = plan.value;
   // Candidate writes legitimately advance the baseline. Keep the preflight
   // stability attestation inside the authorization scope.
-  return JSON.stringify({ ...executionPlan, baselineStableBaseConfirmed: baseline.stableBaseConfirmed });
+  return JSON.stringify({ ...executionPlan, baselineStableBaseConfirmed: baseline.stableBaseConfirmed, aiService: aiServiceSignature() });
+}
+
+function aiServiceSignature(): string {
+  return JSON.stringify({ provider: props.aiConfig.provider, url: props.aiConfig.api_url, model: props.aiConfig.model });
 }
 
 async function proposeCandidate(aiTransferAlreadyAuthorized = false): Promise<TuningTrial | null> {
@@ -720,21 +900,31 @@ async function proposeCandidate(aiTransferAlreadyAuthorized = false): Promise<Tu
       planSignature: capturedPlanSignature,
     };
   } else {
-    const measured = readMetrics();
-    if (!measured.metrics) {
-      setNotice('warning', '实测数据不足', measured.message);
+    const selectedEvidence = selectFeedbackEvidence({ plan: plan.value, currentConfigurationSignature: cascadeStageConfigurationSignature(plan.value).signature ?? '',
+      generation: globalChannelStore.getGeneration(), sessionContext: globalChannelStore.getSessionContext(), now: Date.now(),
+      currentTelemetryTimestamp: latestTelemetryTimestamp(), lastConfirmed: session.value.lastConfirmed, trials: session.value.trials,
+      trialContexts: evaluatedTrialContexts.value, baselineBoundary: baselineObservation.value });
+    if (selectedEvidence.status === 'pending') {
+      setNotice('warning', '等待当前参数的观察窗口', selectedEvidence.reason);
       return null;
     }
+    const measured = selectedEvidence.source === 'evaluated-trial'
+      ? { metrics: selectedEvidence.metrics, message: '采用当前参数对应的已评价窗口。' }
+      : readMetrics(selectedEvidence.afterTimestamp, selectedEvidence.throughTimestamp);
+    if (!measured.metrics) { setNotice('warning', '实测数据不足', measured.message); return null; }
+    const telemetryEvidence: TelemetryEvidence = { ...selectedEvidence.evidence, sampleCount: measured.metrics.sampleCount };
     const planWithoutSending = JSON.parse(JSON.stringify(plan.value)) as TuningPlan;
-    const authorized = aiTransferAlreadyAuthorized || await requestApproval(`AI 将向 ${props.aiConfig.api_url} 发送以下摘要：项目/控制结构、当前参数、目标、约束和遥测统计。\n\n请确认接收方与发送范围，再请求候选。`);
+    const offeredService = aiServiceSignature();
+    const authorized = aiTransferAlreadyAuthorized || await requestApproval(`AI 将向 ${props.aiConfig.api_url}（模型 ${props.aiConfig.model}）发送以下摘要：项目/控制结构、当前参数、目标、约束、遥测统计及窗口身份。\n\n请确认接收方与发送范围，再请求候选。`);
     if (!authorized) return null;
-    if (capturedPlanSignature !== tuningPlanSignature(plan.value) || capturedGeneration !== globalChannelStore.getGeneration()) {
+    if (offeredService !== aiServiceSignature() || capturedPlanSignature !== tuningPlanSignature(plan.value) || capturedGeneration !== globalChannelStore.getGeneration()
+      || aiTransferAlreadyAuthorized && authorizedPlanSignature.value !== executionPlanSignature()) {
       setNotice('warning', '请求范围已变化', '设备会话或配置已变化，请重新核对基线后请求候选。');
       return null;
     }
     aiBusy.value = true;
     try {
-      const result = await proposeFeedbackCandidate({ config: props.aiConfig, plan: planWithoutSending, params: before, metrics: measured.metrics });
+      const result = await proposeFeedbackCandidate({ config: props.aiConfig, plan: planWithoutSending, params: before, metrics: measured.metrics, telemetryEvidence });
       proposal = result.proposal;
       evidence = result.record;
     } catch (error) {
@@ -746,6 +936,11 @@ async function proposeCandidate(aiTransferAlreadyAuthorized = false): Promise<Tu
   }
   if (capturedPlanSignature !== tuningPlanSignature(plan.value) || evidence.planSignature !== capturedPlanSignature || capturedGeneration !== globalChannelStore.getGeneration()) {
     setNotice('warning', '候选已失效', '模型、约束或场景配置在请求期间发生变化。请重新生成候选。');
+    return null;
+  }
+  const dependencyIssues = plan.value.route === 'model' ? cascadeConfiguration.value.issues : cascadeDeviceCheck.value.issues;
+  if (dependencyIssues.length) {
+    setNotice('warning', '内环依据在请求期间变化', dependencyIssues[0]);
     return null;
   }
   if (isWorking.value && (!authorizedPlanSignature.value || executionPlanSignature() !== authorizedPlanSignature.value)) {
@@ -780,7 +975,7 @@ async function sendTrial(trial: TuningTrial, auto = false): Promise<boolean> {
     return false;
   }
   if (trial.status !== 'proposed' || !trial.command) return false;
-  const executionErrors = validatePlan(plan.value);
+  const executionErrors = [...validatePlan(plan.value), ...cascadeDeviceCheck.value.issues];
   if (executionErrors.length || !isTrialForPlan(trial, plan.value, globalChannelStore.getGeneration())) {
     setNotice('warning', '下发条件已变化', executionErrors[0] || '候选生成后配置已变化，请重新生成并核对候选。');
     return false;
@@ -804,6 +999,7 @@ async function sendTrial(trial: TuningTrial, auto = false): Promise<boolean> {
     setNotice('warning', '数据或连接已失效', '恢复连接并等待新遥測数据后重新进行检查。');
     return false;
   }
+  clearCurrentStageEvidence();
   if (!auto && !await requestApproval(`即将向当前设备发送参数写入命令：\n\n${trial.command}\n\n请确认字节与当前设备协议一致。`)) return false;
   checkExecutionSafety();
   if (stopRequested.value || !isWorking.value || !props.writeAccessReady || !authorizedPlanSignature.value || executionPlanSignature() !== authorizedPlanSignature.value || !isTrialForPlan(trial, plan.value, globalChannelStore.getGeneration())) return false;
@@ -893,6 +1089,10 @@ async function waitForWriteConfirmation(trial: TuningTrial): Promise<boolean> {
 }
 
 function acceptWrite(trial: TuningTrial, mode: WriteConfirmationMode, evidence: string) {
+  if (!cascadeDeviceCheck.value.ready) {
+    requestSafetyStop('写入确认前内环依据已失效，不能进入外环评价。');
+    return;
+  }
   if (trial.sourceChannelGeneration !== globalChannelStore.getGeneration() || trial.writeChannelGeneration !== globalChannelStore.getGeneration()) {
     requestSafetyStop('设备或解析会话变化，旧轮次不能升级为设备确认。');
     return;
@@ -914,6 +1114,7 @@ function acceptWrite(trial: TuningTrial, mode: WriteConfirmationMode, evidence: 
     source: mode === 'parameter-channels' ? 'parameter-channels' : 'manual',
     confirmed: true,
   };
+  for (const key of ['kp', 'ki', 'kd'] as const) parameterForm[key] = String(trial.candidate[key]);
   const loop = globalProjectModel.getLoop(plan.value.loopId);
   if (loop) globalProjectModel.updateLoopParams(plan.value.loopId, trial.candidate);
 }
@@ -924,6 +1125,12 @@ async function collectAndEvaluate(trial: TuningTrial, automatic = false): Promis
     session.value.stopReason = '没有当前会话的写入回执与设备确认，不能开始试验评价。';
     return false;
   }
+  const contextFailure = () => confirmedTrialContextFailure({
+    trial, plan: plan.value, lastConfirmed: session.value.lastConfirmed, generation: globalChannelStore.getGeneration(),
+    sessionContext: globalChannelStore.getSessionContext(),
+    authorizedScopeMatches: Boolean(authorizedPlanSignature.value && executionPlanSignature() === authorizedPlanSignature.value),
+    working: isWorking.value, stopped: stopRequested.value, connected: props.connected, executionEnabled: props.executionEnabled === true,
+  });
   session.value.status = 'collecting';
   autoProgress.value = `等待 ${plan.value.evaluationWindowSeconds} 秒遥测窗口`;
   const windowMs = (plan.value.evaluationWindowSeconds ?? 0) * 1000;
@@ -933,6 +1140,11 @@ async function collectAndEvaluate(trial: TuningTrial, automatic = false): Promis
       requestStop('实验配置在执行期间发生变化；本轮采集结束后不会继续试参。');
     }
     if (stopRequested.value || !props.connected) break;
+    if (!cascadeDeviceCheck.value.ready) {
+      trial.status = 'failed';
+      requestSafetyStop('外环采集中内环依据已失效。');
+      return false;
+    }
     if (!telemetryFresh()) {
       trial.status = 'failed';
       requestSafetyStop('采集中遥测超时，未完成当前评价窗口。');
@@ -961,7 +1173,18 @@ async function collectAndEvaluate(trial: TuningTrial, automatic = false): Promis
     return false;
   }
   trial.sampleWindowEnd = latestTelemetryTimestamp();
-  const measured = readMetrics(trial.sampleWindowStart ?? 0);
+  const failureBeforeEvaluation = contextFailure();
+  if (failureBeforeEvaluation) {
+    trial.status = 'failed';
+    requestSafetyStop(failureBeforeEvaluation);
+    return false;
+  }
+  if (!cascadeDeviceCheck.value.ready) {
+    trial.status = 'failed';
+    requestSafetyStop('评价前内环依据已失效，本轮不计为已验证。');
+    return false;
+  }
+  const measured = readMetrics(trial.sampleWindowStart ?? 0, trial.sampleWindowEnd);
   if (!measured.metrics) {
     trial.status = 'failed';
     session.value.status = 'paused';
@@ -977,11 +1200,35 @@ async function collectAndEvaluate(trial: TuningTrial, automatic = false): Promis
     requestSafetyStop('评价窗口的控制输出超过设置上限。');
     return false;
   }
+  const evaluatedSignature = cascadeStageConfigurationSignature(plan.value).signature;
+  const evaluatedSession = globalChannelStore.getSessionContext();
+  if (evaluatedSignature && evaluatedSession.sessionId && evaluatedSession.epoch !== null && session.value.lastConfirmed
+    && trial.sampleWindowStart !== undefined && trial.sampleWindowEnd !== undefined) {
+    evaluatedTrialContexts.value.set(trial.id, { trialId: trial.id, configurationSignature: evaluatedSignature,
+      generation: globalChannelStore.getGeneration(), sessionId: evaluatedSession.sessionId, epoch: evaluatedSession.epoch,
+      params: { ...trial.candidate }, windowStart: trial.sampleWindowStart, windowEnd: trial.sampleWindowEnd,
+      confirmedAt: session.value.lastConfirmed.at, metrics: { ...measured.metrics } });
+  }
   if (measured.passed) {
+    const failureBeforeProof = contextFailure();
+    if (failureBeforeProof) {
+      trial.status = 'failed';
+      requestSafetyStop(failureBeforeProof);
+      return false;
+    }
     session.value.bestVerified = { ...trial.candidate };
     session.value.status = 'completed';
     session.value.stopReason = '当前候选通过用户配置的遥测评价窗口。';
     trial.note = `${trial.note} 本轮遥测达到用户设定目标。`;
+    const configuration = cascadeStageConfigurationSignature(plan.value);
+    const context = plan.value.suite;
+    if (context && configuration.ready && configuration.signature && cascadeDeviceCheck.value.ready) {
+      runtimeStageEvidence.value.set(session.value.id, {
+        groupId: session.value.scenarioGroupId ?? session.value.id, sessionId: session.value.id,
+        scenarioId: context.id, topologyId: context.topologyId, stageId: context.stageId,
+        configSignature: configuration.signature, generation: globalChannelStore.getGeneration(), trialId: trial.id,
+      });
+    }
     setNotice('success', '目标条件已满足', '最佳参数基于设备回传和本轮设定指标标记，永久保存仍需你在固件侧处理。');
     return true;
   }
@@ -1046,7 +1293,7 @@ async function runBoundedExperiment() {
     setNotice('warning', '自动调参执行暂不可用', '请等待驱动写入回执、会话绑定和设备确认全部接通并通过验收。');
     return;
   }
-  const missing = validatePlan(plan.value);
+  const missing = [...validatePlan(plan.value), ...cascadeDeviceCheck.value.issues];
   if (missing.length) {
     setNotice('warning', '暂时不能授权自动实验', missing[0]);
     return;
@@ -1061,7 +1308,7 @@ async function runBoundedExperiment() {
   }
   const roundLimit = plan.value.route === 'model' ? 1 : plan.value.maximumTrials;
   const activeBoundSummary = activeParameters.value.map((key) => `${key.toUpperCase()} (${plan.value.units.parameters[key]}) ${plan.value.bounds[key]?.min}–${plan.value.bounds[key]?.max}`).join(' · ');
-  const routeSummary = plan.value.route === 'model' ? '本机 PID 数学工具计算一个候选' : '每轮将参数和遥测指标摘要发送到已配置的 AI 服务';
+  const routeSummary = plan.value.route === 'model' ? '本机 PID 数学工具计算一个候选' : `每轮将参数和遥测指标摘要发送到 ${props.aiConfig.api_url}（模型 ${props.aiConfig.model}）`;
   const confirmationSummary = plan.value.confirmation.mode === 'acknowledgement' ? `应答包含“${plan.value.confirmation.acknowledgementText}”` : '活动参数通道回传与候选在容差内一致';
   const goalSummary = plan.value.goal.mode === 'track'
     ? `轨迹跟踪 RMS ≤ ${plan.value.goal.maximumTrackingError} ${plan.value.units.feedback}`
@@ -1071,9 +1318,24 @@ async function runBoundedExperiment() {
   const modelTarget = plan.value.route === 'model'
     ? `\n模型目标：ωc ${plan.value.goal.targetCrossoverRadPerSec} rad/s · 相位裕度 ${plan.value.goal.targetPhaseMarginDeg}°`
     : '';
+  const offeredExecutionScope = executionPlanSignature();
+  const offeredPlan = tuningPlanSignature(plan.value);
+  const offeredGeneration = globalChannelStore.getGeneration();
+  const offeredDeviceSession = JSON.stringify(globalChannelStore.getSessionContext());
   const consent = await requestApproval(`请检查自动试验授权范围\n\n项目 / 环路：${plan.value.project} / ${activeLoop.value?.name || plan.value.loopId}\n路线：${routeSummary}\n控制结构 / 方向：${plan.value.structure} / ${plan.value.controlDirection}\n基线：Kp ${currentParams.value?.kp} · Ki ${currentParams.value?.ki} · Kd ${currentParams.value?.kd}\n参数边界：${activeBoundSummary}\n目标：${goalSummary}${modelTarget}\n采样周期：${plan.value.sampleTimeSeconds} 秒 · 最大遥测延迟：${plan.value.maximumTelemetryAgeSeconds} 秒\n输出绝对上限：${plan.value.maximumOutputMagnitude} ${plan.value.units.output}\n每轮最大变化：${plan.value.maxParameterChangePercent}%\n观察窗口：${plan.value.evaluationWindowSeconds} 秒 · 最多 ${roundLimit} 轮\n停止条件：遥测过期、串口断开、输出越界、目标达成或用户停止\n设备确认：${confirmationSummary}\n命令模板：\n${plan.value.commandTemplate}\n\n程序会逐轮检查候选值。是否授权此范围？`);
   if (!consent) return;
-  authorizedPlanSignature.value = executionPlanSignature();
+  if (offeredExecutionScope !== executionPlanSignature() || offeredPlan !== tuningPlanSignature(plan.value)
+    || offeredGeneration !== globalChannelStore.getGeneration() || offeredDeviceSession !== JSON.stringify(globalChannelStore.getSessionContext())
+    || !props.connected || props.executionEnabled !== true || !telemetryFresh() || !plan.value.baseline.stableBaseConfirmed
+    || validatePlan(plan.value).length || plan.value.route === 'feedback' && feedbackEvidenceStatus.value.status !== 'ready') {
+    setNotice('warning', '授权范围已失效', '授权等待期间的配置、基线或设备会话已变化，或当前遥测不足。请重新检查后授权。');
+    return;
+  }
+  if (!cascadeDeviceCheck.value.ready) {
+    setNotice('warning', '授权范围已失效', cascadeDeviceCheck.value.issues[0]);
+    return;
+  }
+  authorizedPlanSignature.value = offeredExecutionScope;
   isWorking.value = true;
   stopRequested.value = false;
   session.value.status = 'collecting';
@@ -1147,6 +1409,10 @@ function checkExecutionSafety() {
     invalidateDeviceContext();
     return;
   }
+  if (!cascadeDeviceCheck.value.ready) {
+    requestSafetyStop('内环配置或设备评价已失效，外环流程停止。');
+    return;
+  }
   const reason = executionSafetyStopReason({ connected: props.connected, telemetryFresh: telemetryFresh(), output: channelValues.value[plan.value.channels.output]?.value, maximumOutputMagnitude: plan.value.maximumOutputMagnitude });
   if (!reason) return;
   requestSafetyStop(reason);
@@ -1154,6 +1420,9 @@ function checkExecutionSafety() {
 
 function invalidateDeviceContext() {
   observedChannelGeneration = globalChannelStore.getGeneration();
+  deviceGeneration.value = observedChannelGeneration;
+  clearVolatileDeviceEvidence();
+  requireCurrentStageRevalidation();
   session.value.lastConfirmed = null;
   plan.value.baseline.confirmed = false;
   plan.value.baseline.stableBaseConfirmed = false;
@@ -1166,6 +1435,7 @@ function invalidateDeviceContext() {
 function requestSafetyStop(reason: string) {
   if (stopRequested.value) return;
   stopRequested.value = true;
+  clearVolatileDeviceEvidence();
   plan.value.baseline.confirmed = false;
   plan.value.baseline.stableBaseConfirmed = false;
   session.value.lastConfirmed = null;
@@ -1180,7 +1450,7 @@ function requestSafetyStop(reason: string) {
   }
 }
 
-function readMetrics(afterTimestamp = 0): { metrics: TuningMetrics | null; passed: boolean; message: string } {
+function readMetrics(afterTimestamp = 0, throughTimestamp = Infinity): { metrics: TuningMetrics | null; passed: boolean; message: string } {
   const bindings = plan.value.channels;
   const selected = [bindings.setpoint, bindings.feedback, bindings.output];
   if (selected.some((channel) => !channel)) return { metrics: null, passed: false, message: '请先绑定目标值、实际反馈和控制输出。' };
@@ -1191,35 +1461,11 @@ function readMetrics(afterTimestamp = 0): { metrics: TuningMetrics | null; passe
       return { metrics: null, passed: false, message: `通道 ${channel} 的数据已超过最大延迟。` };
     }
   }
-  const snapshots = selected.map((channel) => globalChannelStore.snapshot(channel, afterTimestamp));
-  const aligned = alignSnapshots(snapshots[0], snapshots[1], snapshots[2], afterTimestamp);
+  const snapshots = selected.map((channel) => globalChannelStore.snapshot(channel, afterTimestamp, throughTimestamp));
+  const aligned = alignTelemetrySnapshots(snapshots[0], snapshots[1], snapshots[2],
+    { afterTimestamp, maximumGap: (plan.value.sampleTimeSeconds ?? 0) * 3 });
   if (aligned.setpoints.length < 10) return { metrics: null, passed: false, message: '等待至少 10 组对齐的目标值、反馈和输出采样。' };
   return evaluateResponse(aligned.setpoints, aligned.responses, aligned.outputs, plan.value.goal, plan.value.maximumOutputMagnitude ?? 0);
-}
-
-function alignSnapshots(setpoint: { timestamps: Float64Array; values: Float64Array; count: number }, feedback: { timestamps: Float64Array; values: Float64Array; count: number }, output: { timestamps: Float64Array; values: Float64Array; count: number }, afterTimestamp = 0) {
-  const result = { setpoints: [] as number[], responses: [] as number[], outputs: [] as number[] };
-  const map = (source: typeof setpoint, time: number) => {
-    let best = -1;
-    let gap = Infinity;
-    for (let i = 0; i < source.count; i += 1) {
-      const distance = Math.abs(source.timestamps[i] - time);
-      if (distance < gap) { gap = distance; best = i; }
-    }
-    return best >= 0 && gap <= (plan.value.sampleTimeSeconds ?? 0) * 3 ? source.values[best] : NaN;
-  };
-  for (let i = 0; i < feedback.count; i += 1) {
-    const time = feedback.timestamps[i];
-    if (time <= afterTimestamp) continue;
-    const sp = map(setpoint, time);
-    const out = map(output, time);
-    if (Number.isFinite(sp) && Number.isFinite(out) && Number.isFinite(feedback.values[i])) {
-      result.setpoints.push(sp);
-      result.responses.push(feedback.values[i]);
-      result.outputs.push(out);
-    }
-  }
-  return result;
 }
 
 function latestTelemetryTimestamp(): number {
@@ -1264,6 +1510,7 @@ function trialStatus(trialId: string): TuningTrial['status'] | undefined {
 }
 
 function useLastVerified() {
+  if (isWorking.value || aiBusy.value || modelBusy.value) return;
   if (!session.value.bestVerified) return;
   parameterForm.kp = String(session.value.bestVerified.kp);
   parameterForm.ki = String(session.value.bestVerified.ki);
@@ -1290,6 +1537,9 @@ function importPackage() {
       const importedPlan = hydratePlan(importCapabilityPlan(pkg));
       plan.value = { ...importedPlan, id: id() };
       session.value = { id: id(), plan: plan.value, status: 'draft', trials: [], bestVerified: null, lastConfirmed: null, startedAt: null, updatedAt: Date.now(), stopReason: null };
+      session.value.scenarioGroupId = session.value.id;
+      clearVolatileDeviceEvidence();
+      refreshGroupDrafts();
       parameterForm.kp = parameterForm.ki = parameterForm.kd = '';
       loadModelFormFromPlan();
       sessionPersistTimer && window.clearTimeout(sessionPersistTimer);
@@ -1328,6 +1578,8 @@ function newExperiment() {
   plan.value = next;
   session.value = { id: id(), plan: next, status: 'draft', trials: [], bestVerified: null, lastConfirmed: null, startedAt: null, updatedAt: Date.now(), stopReason: null };
   session.value.scenarioGroupId = session.value.id;
+  clearVolatileDeviceEvidence();
+  refreshGroupDrafts();
   parameterForm.kp = parameterForm.ki = parameterForm.kd = '';
   loadModelFormFromPlan();
   assistantPane.value = 'setup';
@@ -1410,17 +1662,26 @@ function id(): string {
           <div class="form-row"><label class="field"><span>当前控制环节</span><select :value="plan.suite?.stageId" @change="selectStage(($event.target as HTMLSelectElement).value)"><option v-for="stage in sceneStages" :key="stage.id" :value="stage.id">{{ stage.title }}</option></select></label><label class="field"><span>控制器</span><select :value="plan.structure" @change="handleStructureChange(($event.target as HTMLSelectElement).value as LoopStructure)"><option v-for="structure in selectedStage?.supportedStructures || ['P','PI','PD','PID']" :key="structure">{{ structure }}</option></select></label></div>
           <div class="route-choice" role="group" aria-label="调参方式"><button type="button" :class="{ selected: plan.route === 'feedback' }" :aria-pressed="plan.route === 'feedback'" @click="setRoute('feedback')"><strong>AI 自动反馈</strong><small>遥测 → 候选 → 确认 → 评价</small></button><button type="button" :class="{ selected: plan.route === 'model' }" :aria-pressed="plan.route === 'model'" @click="setRoute('model')"><strong>物理模型计算</strong><small>物理数据 / G(s) → PID 候选</small></button></div>
           <p class="field-note">{{ plan.route === 'feedback' ? '从稳定的当前参数开始。本地执行器限制每轮变化，设备确认后才继续。' : '可以离线计算。模型和工况由你确认，候选仍须设备验证。' }}</p>
+          <p v-if="plan.route === 'feedback' && feedbackEvidenceStatus.status === 'pending'" class="field-note" role="status">反馈依据：{{ feedbackEvidenceStatus.reason }}</p>
           <div class="provider-row"><span>{{ aiConfigured ? `AI 服务 · ${aiConfig.model}` : 'AI 服务尚未配置' }}</span><button type="button" class="text-button" @click="emit('open-ai-settings')">模型设置</button></div>
+          <section v-if="upstreamStages.length" class="model-section" aria-label="串级内环依据">
+            <h3>内环依据</h3>
+            <p class="field-note">前置环节：{{ upstreamStages.map(stage => stage.title).join(' → ') }}。外环模型须对应这些内环的当前配置；修改参数、模型、周期或顺序后需要重新核对。</p>
+            <p class="field-note">{{ cascadeConfiguration.ready ? '已绑定当前内环配置，可继续核对外环模型。' : '尚未绑定，或绑定的内环配置已变化。' }}</p>
+            <p v-for="issue in (availableDependencies.ready ? cascadeConfiguration.issues : availableDependencies.issues).slice(0,3)" :key="issue" class="field-error">{{ issue }}</p>
+            <button type="button" class="secondary-button" :disabled="!availableDependencies.ready" @click="bindUpstreamConfiguration">核对并绑定内环配置</button>
+            <p class="field-note">{{ cascadeDeviceCheck.ready ? '本次连接中的前置内环已通过配置的遥测评价。' : '外环反馈与设备写入还需要本次连接中的内环评价；历史记录不恢复执行依据。' }}</p>
+          </section>
           <section v-if="plan.route === 'model'" class="model-section" aria-labelledby="scene-model-title"><h3 id="scene-model-title">对象模型</h3><label class="field"><span>模型来源</span><select :value="modelSource" @change="setModelSource(($event.target as HTMLSelectElement).value as 'physical' | 'transfer' | 'ai')"><option v-if="plan.suite?.id !== 'custom'" value="physical">填写场景物理数据</option><option value="transfer">输入 s 域传递函数</option><option value="ai">描述对象，让 AI 草拟模型</option></select></label><p v-if="modelSource === 'physical'" class="field-note">{{ selectedSuite.physicalModel }}</p>
             <template v-if="modelSource === 'transfer'"><p class="field-note">按 s 的降幂顺序填写系数，以逗号或空格分隔。</p><label class="field"><span>G(s) 分子系数</span><input v-model="transferForm.numerator" placeholder="例如：2（格式说明）" @input="updateTransferModel('numerator',($event.target as HTMLInputElement).value)"></label><label class="field"><span>G(s) 分母系数</span><input v-model="transferForm.denominator" placeholder="例如：0.5, 1（0.5s + 1）" @input="updateTransferModel('denominator',($event.target as HTMLInputElement).value)"></label><label class="field"><span>纯延迟 τ · 秒</span><input v-model="transferForm.delay" type="number" min="0" step="any" placeholder="无延迟时明确填写 0" @input="updateTransferModel('delay',($event.target as HTMLInputElement).value)"></label></template>
             <template v-else-if="modelSource === 'ai'"><label class="field"><span>对象与工作点</span><textarea v-model="plan.description" rows="3" placeholder="说明输入、输出、执行器、传感器与工况。AI 会列出待测量的物理数据。"></textarea></label><button type="button" class="secondary-button" :disabled="!plan.description.trim() || !aiConfigured" @click="deriveWithAi">{{ modelBusy ? '正在推导模型…' : modelDraft ? '重新草拟模型与数据表' : '草拟模型与数据表' }}</button><div v-if="modelDraft" class="model-draft"><p>{{ modelDraft.explanation }}</p><code>分子 [{{ modelDraft.numerator.join(', ') }}]<br>分母 [{{ modelDraft.denominator.join(', ') }}]<br>延迟 {{ modelDraft.tau }} s</code></div></template>
             <div v-if="modelSource !== 'transfer' && modelFieldInputs.length" class="physical-inputs"><label v-for="field in modelFieldInputs" :key="field.id" class="field"><span>{{ field.label }} <small>{{ field.unit }}</small></span><input :value="plan.suite?.physicalInputs[field.id] ?? ''" type="number" step="any" placeholder="待测量 / 提供" @input="setPhysicalInput(field.id,($event.target as HTMLInputElement).value)"><small v-if="field.description">{{ field.description }}</small></label></div>
-            <div v-if="modelInputErrors.length" class="model-notes"><p v-for="error in modelInputErrors" :key="error">{{ error }}</p></div><p v-if="modelSource === 'physical' && physicalModelResult?.pendingInputs.length" class="field-note">待提供：{{ physicalModelResult.pendingInputs.join('、') }}</p><details v-if="plan.suite?.assumptions.length" class="model-assumptions"><summary>模型假设与适用条件</summary><ul><li v-for="assumption in plan.suite.assumptions" :key="assumption">{{ assumption }}</li></ul></details><label v-if="plan.suite" class="check-field"><input v-model="plan.suite.modelConfirmed" type="checkbox" :disabled="!plan.model"><span>我已核对输入输出、单位、物理数据和假设，确认模型用于当前工况。</span></label>
+            <div v-if="modelInputErrors.length" class="model-notes"><p v-for="error in modelInputErrors" :key="error">{{ error }}</p></div><p v-if="modelSource === 'physical' && physicalModelResult?.pendingInputs.length" class="field-note">待提供：{{ physicalModelResult.pendingInputs.join('、') }}</p><details v-if="plan.suite?.assumptions.length" class="model-assumptions"><summary>模型假设与适用条件</summary><ul><li v-for="assumption in plan.suite.assumptions" :key="assumption">{{ assumption }}</li></ul></details><label v-if="plan.suite" class="check-field"><input :checked="plan.suite.modelConfirmed" type="checkbox" :disabled="!plan.model || !availableDependencies.ready" @change="confirmSceneModel(($event.target as HTMLInputElement).checked)"><span>我已核对输入输出、单位、物理数据和假设，确认模型用于当前工况。</span></label>
             <div class="form-row"><label class="field"><span>剪切频率 · rad/s</span><input v-model.number="plan.goal.targetCrossoverRadPerSec" type="number" min="0" step="any" placeholder="按目标带宽提供"></label><label class="field"><span>相位裕度 · °</span><input v-model.number="plan.goal.targetPhaseMarginDeg" type="number" min="0" max="180" step="any" placeholder="按响应目标提供"></label></div>
           </section>
           <div class="form-row execution-context"><label class="field"><span>控制方向</span><select v-model="plan.controlDirection"><option :value="null">核对反馈方向</option><option value="direct">输出增加 → 反馈增加</option><option value="reverse">输出增加 → 反馈减少</option></select></label><label class="field"><span>固件采样周期 · 秒</span><input v-model.number="plan.sampleTimeSeconds" type="number" min="0" step="any" placeholder="需从固件确认"></label></div>
           <details class="settings-section" :open="channelSettingsOpen" @toggle="channelSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>绑定串口变量 <span>{{ plan.channels.feedback || '待绑定' }}</span></summary><div class="details-body"><p class="field-note">顶部选择解析协议，收到变量后绑定。设定值与反馈使用相同单位。</p><div v-for="item in latestSummary" :key="item.key" class="channel-binding"><label class="field"><span>{{ item.key }} <output>{{ format(item.reading?.value,4) }}</output></span><select :value="item.channel" :aria-label="`${item.key}通道`" @change="plan.channels[item.key === '目标' ? 'setpoint' : item.key === '实际反馈' ? 'feedback' : 'output'] = ($event.target as HTMLSelectElement).value"><option value="">选择已解析变量</option><option v-for="channel in liveChannelOptions" :key="channel" :value="channel">{{ channel }}</option></select></label><label class="field"><span>单位</span><input :value="plan.units[item.key === '目标' ? 'setpoint' : item.key === '实际反馈' ? 'feedback' : 'output']" :aria-label="`${item.key}单位`" @input="plan.units[item.key === '目标' ? 'setpoint' : item.key === '实际反馈' ? 'feedback' : 'output'] = ($event.target as HTMLInputElement).value" placeholder="需确认"></label></div><label class="field"><span>最大遥测延迟 · 秒</span><input v-model.number="plan.maximumTelemetryAgeSeconds" type="number" min="0" step="any" placeholder="按设备上报周期提供"></label><p class="field-note">{{ telemetryAge === null ? '当前绑定通道还没有数据' : `最近遥测 ${format(telemetryAge,1)} 秒前` }}</p></div></details>
-          <details class="settings-section" :open="parameterSettingsOpen" @toggle="parameterSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>当前参数与写入边界 <span>{{ plan.baseline.confirmed ? '用户已核对' : '执行前必填' }}</span></summary><div class="details-body"><p class="field-note">按固件实际公式填写参数单位；非活动项固定为 0。模型离线计算可先跳过。</p><div v-for="key in activeParameters" :key="key" class="parameter-setting"><h4>{{ key.toUpperCase() }}</h4><div class="parameter-values"><label class="field"><span>设备当前值</span><input v-model="parameterForm[key]" type="number" step="any" placeholder="待核对" @input="syncManualParams(key,($event.target as HTMLInputElement).value)"></label><label class="field"><span>下限</span><input :value="plan.bounds[key]?.min ?? ''" type="number" step="any" placeholder="待确认" @input="setBound(key,'min',($event.target as HTMLInputElement).value)"></label><label class="field"><span>上限</span><input :value="plan.bounds[key]?.max ?? ''" type="number" step="any" placeholder="待确认" @input="setBound(key,'max',($event.target as HTMLInputElement).value)"></label></div><div class="form-row"><label class="field"><span>参数单位 / 固件定义</span><input v-model.trim="plan.units.parameters[key]" :aria-label="`${key.toUpperCase()}单位`" placeholder="按固件公式填写"></label><label class="field"><span>设备回传变量</span><select v-model="plan.channels.parameters[key]"><option value="">未绑定</option><option v-for="channel in liveChannelOptions" :key="channel" :value="channel">{{ channel }}</option></select><small v-if="plan.channels.parameters[key]">当前 {{ format(parameterChannelValue(key)) }}</small></label></div></div><button type="button" class="text-button" :disabled="!activeParameters.every((key) => plan.channels.parameters[key])" @click="readParametersFromChannels">从本次遥测读取当前参数</button><label class="check-field"><input v-model="plan.baseline.confirmed" type="checkbox" :disabled="!plan.baseline.params"><span>我已核对设备当前值与边界。</span></label><label v-if="plan.mode === 'bounded-auto'" class="check-field"><input v-model="plan.baseline.stableBaseConfirmed" type="checkbox"><span>当前控制器在稳定的保守基线下运行，设备已有独立保护。</span></label></div></details>
+          <details class="settings-section" :open="parameterSettingsOpen" @toggle="parameterSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>当前参数与写入边界 <span>{{ plan.baseline.confirmed ? '用户已核对' : '执行前必填' }}</span></summary><div class="details-body"><p class="field-note">按固件实际公式填写参数单位；非活动项固定为 0。模型离线计算可先跳过。</p><div v-for="key in activeParameters" :key="key" class="parameter-setting"><h4>{{ key.toUpperCase() }}</h4><div class="parameter-values"><label class="field"><span>设备当前值</span><input v-model="parameterForm[key]" type="number" step="any" placeholder="待核对" @input="syncManualParams(key,($event.target as HTMLInputElement).value)"></label><label class="field"><span>下限</span><input :value="plan.bounds[key]?.min ?? ''" type="number" step="any" placeholder="待确认" @input="setBound(key,'min',($event.target as HTMLInputElement).value)"></label><label class="field"><span>上限</span><input :value="plan.bounds[key]?.max ?? ''" type="number" step="any" placeholder="待确认" @input="setBound(key,'max',($event.target as HTMLInputElement).value)"></label></div><div class="form-row"><label class="field"><span>参数单位 / 固件定义</span><input v-model.trim="plan.units.parameters[key]" :aria-label="`${key.toUpperCase()}单位`" placeholder="按固件公式填写"></label><label class="field"><span>设备回传变量</span><select v-model="plan.channels.parameters[key]"><option value="">未绑定</option><option v-for="channel in liveChannelOptions" :key="channel" :value="channel">{{ channel }}</option></select><small v-if="plan.channels.parameters[key]">当前 {{ format(parameterChannelValue(key)) }}</small></label></div></div><button type="button" class="text-button" :disabled="!activeParameters.every((key) => plan.channels.parameters[key])" @click="readParametersFromChannels">从本次遥测读取当前参数</button><label class="check-field"><input :checked="plan.baseline.confirmed" type="checkbox" :disabled="!plan.baseline.params || isWorking || aiBusy || modelBusy" @change="confirmCurrentBaseline(($event.target as HTMLInputElement).checked)"><span>我已核对设备当前值与边界。</span></label><label v-if="plan.mode === 'bounded-auto'" class="check-field"><input v-model="plan.baseline.stableBaseConfirmed" type="checkbox"><span>当前控制器在稳定的保守基线下运行，设备已有独立保护。</span></label></div></details>
           <details class="settings-section" :open="goalSettingsOpen" @toggle="goalSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>目标、预算与设备确认 <span>{{ plan.confirmation.mode === 'manual' ? '人工确认' : '设备确认' }}</span></summary><div class="details-body"><label class="field"><span>成功目标</span><select v-model="plan.goal.mode"><option value="settle">保持在目标误差内</option><option value="step-response">阶跃响应</option><option value="track">轨迹跟踪</option></select></label><div class="form-row"><label v-if="plan.goal.mode !== 'track'" class="field"><span>最大稳态误差</span><input v-model.number="plan.goal.maximumSteadyError" type="number" min="0" step="any" :placeholder="plan.units.feedback || '反馈变量单位'"></label><label v-if="plan.goal.mode === 'step-response'" class="field"><span>最大超调 · %</span><input v-model.number="plan.goal.maximumOvershootPct" type="number" min="0" step="any" placeholder="由目标设定"></label><label v-if="plan.goal.mode === 'track'" class="field"><span>最大 RMS 跟踪误差</span><input v-model.number="plan.goal.maximumTrackingError" type="number" min="0" step="any" :placeholder="plan.units.feedback || '反馈变量单位'"></label><label class="field"><span>最大输出绝对值</span><input v-model.number="plan.maximumOutputMagnitude" type="number" min="0" step="any" :placeholder="plan.units.output || '执行器单位'"></label><label class="field"><span>单轮最大变化 · %</span><input v-model.number="plan.maxParameterChangePercent" type="number" min="0" max="100" step="any" placeholder="自行确认幅度"></label><label class="field"><span>观察时长 · 秒</span><input v-model.number="plan.evaluationWindowSeconds" type="number" min="0" step="any" placeholder="覆盖对象响应"></label><label class="field"><span>最多试验轮数</span><input v-model.number="plan.maximumTrials" type="number" min="1" max="100" step="1" placeholder="有限试验预算"></label></div><label class="field"><span>参数生效确认</span><select :value="plan.confirmation.mode" @change="toggleConfirmationMode(($event.target as HTMLSelectElement).value as WriteConfirmationMode)"><option value="parameter-channels">参数变量回传</option><option value="acknowledgement">带本轮 ID 的设备应答</option><option value="manual">逐轮人工核对</option></select></label><label v-if="plan.confirmation.mode === 'acknowledgement'" class="field"><span>设备成功应答模板</span><input v-model="plan.confirmation.acknowledgementText" placeholder="例如：PID_APPLIED {request_id}"></label><div v-if="plan.confirmation.mode !== 'manual'" class="form-row"><label class="field"><span>确认超时 · 秒</span><input v-model.number="plan.confirmation.timeoutSeconds" type="number" min="0" step="any" placeholder="按设备响应提供"></label><label v-if="plan.confirmation.mode === 'parameter-channels'" class="field"><span>回传容差 · %</span><input v-model.number="plan.confirmation.parameterTolerance" type="number" min="0" step="any" placeholder="按数值精度提供"></label></div><label class="field"><span>参数写入命令模板</span><textarea v-model="plan.commandTemplate" rows="2" placeholder="按固件协议填写，例如 PID,{request_id},{id},{kp},{ki},{kd}"></textarea><small>变量：{id}、{order}、{kp}、{ki}、{kd}、{request_id}。应答确认需携带本轮 ID。</small></label><label v-if="plan.route === 'feedback'" class="field"><span>反馈执行方式</span><select v-model="plan.mode"><option value="bounded-auto" :disabled="plan.confirmation.mode === 'manual'">授权范围内自动迭代</option><option value="manual">只生成建议，逐轮人工执行</option></select></label></div></details>
           <details class="settings-section" :open="suiteSettingsOpen" @toggle="suiteSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>套组提示词与能力 <span>{{ selectedSuite.skills.length }} 项约束</span></summary><div class="details-body"><label class="field"><span>实验名称</span><input v-model="plan.name" placeholder="为本次实验命名"></label><label v-if="modelSource !== 'ai' || plan.route !== 'model'" class="field"><span>对象与工作点</span><textarea v-model="plan.description" rows="3" placeholder="说明执行器、传感器、单位、工况与已知限制。"></textarea></label><label class="field"><span>补充提示词约束</span><textarea v-model="plan.prompt" rows="3" placeholder="补充调参经验、任务要求与约束；提示词不会扩大写入权限。"></textarea></label><p class="field-note">基础约束与 skills 随请求发送；本地参数边界和停止规则始终生效。</p><ul class="capability-list"><li v-for="skill in plan.suite?.skills" :key="skill.id"><strong>{{ skill.title }}</strong><p>{{ skill.instructions }}</p></li></ul><p class="field-note">工具：本机 PID 解算、AI 有界反馈建议。套组是可分享的结构化配置。</p><details class="base-prompt"><summary>查看场景基础提示词</summary><p>{{ plan.suite?.prompt }}</p></details></div></details>
         </fieldset>
@@ -1428,7 +1689,7 @@ function id(): string {
           <p class="field-note">{{ connectionLabel }} · {{ !connected ? '离线计算' : props.demo ? '演示遥测' : '设备遥测' }}</p><p v-if="isWorking" class="working-message" role="status">{{ autoProgress || '正在处理当前轮次；配置暂时锁定' }}</p>
           <section v-if="currentProposal" class="proposal-review" aria-label="参数候选"><div class="result-heading"><h3>{{ currentProposal.evidence?.tool === 'pid-solver' ? '本机模型计算候选' : 'AI 反馈候选' }}</h3><span>{{ trialStateName(currentProposal.status) }}</span></div><p class="proposal-rationale">{{ proposalRationale }}</p><p class="field-note">{{ currentParams ? currentParamsLabel : '尚未配置设备基线；左列 0 仅为计算参考。' }}</p><div class="parameter-comparison"><div v-for="key in activeParameters" :key="key"><strong>{{ key.toUpperCase() }}</strong><code>{{ format(currentProposal.before[key]) }}</code><span>→</span><code>{{ format(currentProposal.candidate[key]) }}</code></div></div><pre v-if="currentProposal.command" class="command-preview"><code>{{ currentProposal.command }}</code></pre><p v-if="!isTrialForPlan(currentProposal,plan,globalChannelStore.getGeneration())" class="field-error">配置已变化，重新生成候选后才能发送。</p><div v-if="currentProposal.status === 'proposed' && !isWorking" class="proposal-actions"><button type="button" class="secondary-button" :disabled="!executionEnabled || planErrors.length > 0 || !isTrialForPlan(currentProposal,plan,globalChannelStore.getGeneration())" @click="sendManualTrial(currentProposal)">核对命令并发送</button><button type="button" class="text-button" @click="currentProposal.status = 'rejected'; pendingTrialId = null">忽略候选</button></div><p v-if="currentProposal.status === 'queued'" class="field-note">仅已排队，驱动写入与设备生效尚未确认。</p><template v-if="executionEnabled && currentProposal.status === 'sent' && plan.confirmation.mode === 'manual'"><label class="check-field"><input v-model="manualConfirmation" type="checkbox"><span>我已在设备上核对，这组参数已生效。</span></label><button type="button" class="secondary-button" :disabled="!manualConfirmation || !awaitingManualConfirmation || stopRequested" @click="confirmManualTrial">确认并观察遥测</button></template><p v-else-if="currentProposal.status === 'sent'" class="field-note">等待{{ confirmationLabel(plan.confirmation.mode) }}，超时暂停。</p><dl v-if="currentProposal.metrics" class="trial-metrics"><div><dt>{{ plan.goal.mode === 'track' ? 'RMS 跟踪误差' : '稳态误差' }}</dt><dd>{{ format(plan.goal.mode === 'track' ? currentProposal.metrics.rmsTrackingError : currentProposal.metrics.steadyError,4) }} {{ plan.units.feedback }}</dd></div><div><dt>最大输出</dt><dd>{{ format(currentProposal.metrics.maximumOutputMagnitude) }} {{ plan.units.output }}</dd></div><div v-if="currentProposal.metrics.overshootPercent !== null"><dt>实测超调</dt><dd>{{ format(currentProposal.metrics.overshootPercent,2) }}%</dd></div></dl></section>
           <div v-else class="result-empty"><h3>在波形旁审阅参数候选</h3><p>每轮记录计算依据、命令写入、设备确认和遥测评价。候选与设备结果分别标记。</p><button type="button" class="text-button" @click="assistantPane = 'setup'">返回场景与设置</button></div>
-          <details class="settings-section" :open="session.trials.length > 0"><summary>试验记录 <span>{{ session.trials.length }} 轮</span></summary><div class="details-body"><ol v-if="session.trials.length" class="trial-list"><li v-for="trial in session.trials.slice(0,30)" :key="trial.id"><div><time>{{ formatTimestamp(trial.createdAt) }}</time><span>{{ trialStateName(trial.status) }}</span></div><code>Kp {{ format(trial.candidate.kp) }} · Ki {{ format(trial.candidate.ki) }} · Kd {{ format(trial.candidate.kd) }}</code><p>{{ trial.metrics ? `${trial.metrics.sampleCount} 点设备遥测 · 误差 ${format(trial.metrics.steadyError,4)}` : trial.confirmation || '尚未设备确认 / 评价' }}</p></li></ol><p v-else class="field-note">还没有候选。配置后可先审阅一轮。</p><button v-if="session.bestVerified" type="button" class="text-button" @click="useLastVerified">载入最佳实测验证参数</button></div></details>
+          <details class="settings-section" :open="session.trials.length > 0"><summary>试验记录 <span>{{ session.trials.length }} 轮</span></summary><div class="details-body"><ol v-if="session.trials.length" class="trial-list"><li v-for="trial in session.trials.slice(0,30)" :key="trial.id"><div><time>{{ formatTimestamp(trial.createdAt) }}</time><span>{{ trialStateName(trial.status) }}</span></div><code>Kp {{ format(trial.candidate.kp) }} · Ki {{ format(trial.candidate.ki) }} · Kd {{ format(trial.candidate.kd) }}</code><p>{{ trial.metrics ? `${trial.metrics.sampleCount} 点设备遥测 · 误差 ${format(trial.metrics.steadyError,4)}` : trial.status === 'rejected' ? trial.note : trial.confirmation || '尚未设备确认 / 评价' }}</p></li></ol><p v-else class="field-note">还没有候选。配置后可先审阅一轮。</p><button v-if="session.bestVerified" type="button" class="text-button" :disabled="isWorking || aiBusy || modelBusy" @click="useLastVerified">载入最佳实测验证参数</button></div></details>
           <p v-if="session.stopReason" class="notice notice-warning">{{ session.stopReason }}</p><div v-if="planErrors.length" class="execution-check"><strong>发送与试验前待完成</strong><ul><li v-for="issue in openIssues" :key="issue">{{ issue }}</li></ul><button type="button" class="text-button" @click="assistantPane = 'setup'; channelSettingsOpen = parameterSettingsOpen = goalSettingsOpen = true">完善执行设置</button></div>
         </div>
       </template>
@@ -1444,7 +1705,7 @@ function statusName(status: string): string {
   return labels[status] || status;
 }
 function trialStateName(status: string): string {
-  const labels: Record<string,string> = { proposed:'待核对',queued:'仅已排队',sent:'驱动已写入 · 待确认',confirmed:'设备已确认',evaluated:'遥测已评价',rejected:'已忽略',failed:'未完成' };
+  const labels: Record<string,string> = { proposed:'待核对',queued:'仅已排队',sent:'驱动已写入 · 待确认',confirmed:'设备已确认',evaluated:'遥测已评价',rejected:'已作废',failed:'未完成' };
   return labels[status] || status;
 }
 </script>

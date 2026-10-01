@@ -1,4 +1,5 @@
-import type { PidStructure, TransferFunctionModel } from '../control/types';
+import type { ControllerParams, PidStructure, PlantModel, TransferFunctionModel } from '../control/types';
+import { cascadeSeriesProduct, composeContinuousInnerLoop } from '../control/cascadeModel';
 import { multiplyPolynomials, validatePlantModel } from '../control/transferFunction';
 
 export type TuningScenarioId = 'balance-car' | 'flight-control' | 'custom';
@@ -72,6 +73,16 @@ export interface ScenarioPlantResult {
   assumptions: string[];
   warnings: string[];
 }
+/**
+ * Caller-provided inner model and controller for the current stage group.
+ * The caller owns source identity, direction, units and configuration review;
+ * this input is not proof of measured firmware or hardware behavior.
+ */
+export interface ScenarioInnerLoopSource {
+  plant: PlantModel;
+  params: ControllerParams;
+  feedbackGain: number;
+}
 
 const structures: PidStructure[] = ['P', 'PI', 'PD', 'PID'];
 const stage = (id: string, title: string, structure: PidStructure, supportedStructures: PidStructure[] = structures): ScenarioStage => ({ id, title, structure, supportedStructures: [...supportedStructures] });
@@ -109,14 +120,16 @@ export const SCENARIO_SUITES: TuningScenarioSuite[] = [
   {
     id: 'flight-control', version: 1, title: '飞控调参', description: '围绕用户选定的一根轴，先角速度内环，再姿态外环。',
     prompt: `${sharedPrompt} 飞控按已选轴做单输入单输出近似，先验证坐标和角速度方向。只在用户已确认的地面安全试验条件下反馈调参；不要假设空中联调或三轴耦合已验证。`,
-    physicalModel: '单轴刚体：J·dω/dt = 标定力矩 - 阻尼·ω，执行器用一阶滞后近似；姿态外环依赖已验证角速度内环带宽。',
+    physicalModel: '单轴刚体：J·dω/dt = 标定力矩 - 阻尼·ω，执行器用一阶滞后近似；姿态外环使用同组角速度内环完整对象、控制器和反馈增益合成连续闭环，再串联明确单位比例的角速度积分。',
     physicalFields: [
       field('axis_inertia', '当前轴转动惯量', 'kg·m²', ['rate'], '滚转、俯仰或偏航的实际惯量，各轴不可混用。'),
       field('torque_gain', '当前轴力矩 / 命令增益', 'N·m/命令单位', ['rate'], '实测标定，包含电机混控及方向符号。', -Number.MAX_VALUE),
       field('axis_damping', '当前轴等效阻尼', 'N·m·s/rad', ['rate'], '可明确填 0 采用无阻尼刚体假设。'),
       field('actuator_time', '电机 / 执行器时间常数', 's', ['rate'], '明确采用瞬时执行器近似时可填 0。'),
-      field('inner_bandwidth', '已验证角速度内环带宽', 'rad/s', ['attitude'], '不能由尚未试验的 PID 候选代替实测闭环带宽。'),
-      field('delay', '当前环实测纯滞后', 's', ['rate', 'attitude'], '仅填写当前控制环的有效滞后。'),
+      field('inner_feedback_gain', '内环反馈增益', '反馈变量单位/内环输出单位', ['attitude'], '同组角速度内环的带符号常数反馈比例；明确单位反馈时填 1，不由软件猜测。', -Number.MAX_VALUE),
+      field('inner_derivative_filter_time', '内环微分滤波时间常数', 's', ['attitude'], '核对内环连续 PID 的 Tf；明确未使用微分滤波时填 0，不代表软件已确认固件实现。'),
+      field('angle_rate_unit_scale', '角速度积分到姿态单位比例', '姿态单位/(角速度单位·s)', ['attitude'], '带符号单位与坐标比例，例如 rad/s 积分到 rad 为 1，rad/s 到 deg 为 180/pi；由用户明确提供。', -Number.MAX_VALUE),
+      field('delay', '当前环实测纯滞后', 's', ['rate', 'attitude'], '角速度环为对象纯滞后；姿态环仅为闭合内环之外的级联环节延迟，不能替代或转移内环反馈延迟。'),
     ],
     topologies: [
       { id: 'rate', title: '单轴角速度环', description: '用当前选定轴的反馈与混控后的执行器命令。', stages: [stage('rate', '角速度环', 'PID', ['PI', 'PD', 'PID'])] },
@@ -172,7 +185,7 @@ export function getScenarioPhysicalFields(id: TuningScenarioId, stageId: string)
   return (getScenarioSuite(id)?.physicalFields ?? []).filter(item => !item.stageIds?.length || item.stageIds.includes(stageId));
 }
 
-export function deriveScenarioPlant(id: TuningScenarioId, topologyId: string, stageId: string, inputs: Record<string, number | null>): ScenarioPlantResult {
+export function deriveScenarioPlant(id: TuningScenarioId, topologyId: string, stageId: string, inputs: Record<string, number | null>, innerSource?: ScenarioInnerLoopSource): ScenarioPlantResult {
   const suite = getScenarioSuite(id);
   const topology = suite?.topologies.find(item => item.id === topologyId);
   const unavailable: ScenarioPlantResult = { status: 'unsupported', model: null, pendingInputs: [], assumptions: [], warnings: ['当前场景与控制阶段不匹配。'] };
@@ -207,9 +220,29 @@ export function deriveScenarioPlant(id: TuningScenarioId, topologyId: string, st
     denominator = multiplyPolynomials([inputs.axis_inertia!, inputs.axis_damping!], inputs.actuator_time! > 0 ? [inputs.actuator_time!, 1] : [1]);
     assumptions.push('当前选定轴的刚体动力学，忽略三轴耦合、弹性与气动非线性；标定包含混控后的轴力矩。');
   } else {
-    positive(['inner_bandwidth']);
-    numerator = [1]; denominator = [1 / inputs.inner_bandwidth!, 1, 0];
-    assumptions.push('已验证角速度内环近似为单位增益一阶闭环；外姿态是角速度积分。外环带宽应低于内环，逐环验收。');
+    assumptions.push(
+      '同组角速度内环采用用户核对的连续并联 1DOF PID：Kp+Ki/s+Kd·s/(Tf·s+1)，微分作用于误差；反馈比例为明确提供的常数。',
+      '姿态外环对象为 P·C/(1+H·P·C) 再串联用户明确提供的单位与坐标比例 / s；不由单个带宽推断内环阶数、稳态增益或滤波。',
+      '连续名义模型的特征多项式检查不证明离散固件实现、实机稳定、内环验收或飞行表现；这些证据由调用方和用户另行核对。',
+    );
+    if (inputs.inner_feedback_gain === 0) warnings.push('内环反馈增益必须为非零有限数值。');
+    if (inputs.angle_rate_unit_scale === 0) warnings.push('角速度积分到姿态单位比例必须为非零有限数值。');
+    if (warnings.length) return { status: 'unsupported', model: null, pendingInputs: [], assumptions, warnings };
+    if (!innerSource) return { status: 'needs-input', model: null, pendingInputs: ['同组已核对的角速度内环对象与控制器来源'], assumptions, warnings: [] };
+    if (innerSource.params?.tf === undefined || innerSource.params.tf === null) return { status: 'needs-input', model: null, pendingInputs: ['来源控制器的明确微分滤波时间常数 Tf'], assumptions, warnings: [] };
+    if (innerSource.feedbackGain !== inputs.inner_feedback_gain || innerSource.params.tf !== inputs.inner_derivative_filter_time) {
+      return { status: 'unsupported', model: null, pendingInputs: [], assumptions, warnings: ['内环来源的反馈增益或微分滤波时间常数与当前姿态模型输入不一致，请重新核对来源。'] };
+    }
+    try {
+      const innerClosed = composeContinuousInnerLoop(innerSource.plant, innerSource.params, innerSource.feedbackGain);
+      const model = cascadeSeriesProduct(innerClosed, { family: 'transfer_function', numerator: [inputs.angle_rate_unit_scale!], denominator: [1, 0], tau: inputs.delay! });
+      return { status: 'ready', model, pendingInputs: [], assumptions, warnings: [] };
+    } catch (error) {
+      return { status: 'unsupported', model: null, pendingInputs: [], assumptions, warnings: [
+        error instanceof Error ? error.message : '角速度内环连续闭环合成失败。',
+        '不能以带宽猜测或把内环反馈延迟移到外环；可改为提供已核对且包含当前内环的外环等效 s 域传递函数。',
+      ] };
+    }
   }
   const model: TransferFunctionModel = { family: 'transfer_function', numerator, denominator, tau: inputs.delay! };
   const errors = validatePlantModel(model);

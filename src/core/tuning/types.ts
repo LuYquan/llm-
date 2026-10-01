@@ -1,6 +1,7 @@
 import type { LoopStructure, PidValues } from '../project/types';
 import type { PidStructure, PlantModel } from '../control/types';
 import type { TuningScenarioContext } from './scenarios';
+import type { CascadeDependencySnapshot } from './cascadeDependencies';
 
 export type TuningRoute = 'model' | 'feedback';
 export type TuningMode = 'manual' | 'bounded-auto';
@@ -80,6 +81,8 @@ export interface TuningPlan {
   model: PlantModel | null;
   /** Declarative scenario context; it grants no device or code execution authority. */
   suite?: TuningScenarioContext;
+  /** Reviewed upstream configuration identity; never grants device authority. */
+  cascadeBinding?: CascadeDependencySnapshot;
 }
 
 export interface TuningMetrics {
