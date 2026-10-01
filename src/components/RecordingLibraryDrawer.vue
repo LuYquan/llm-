@@ -256,6 +256,7 @@ function formatAnalysisTime(value: number): string {
             </div>
             <div class="recording-card-meta">
               <span>{{ formatBytes(item.manifest.rxBytes) }} · {{ item.manifest.rxChunks.toLocaleString() }} 块</span>
+              <span v-if="(item.manifest.rejectedRxChunks ?? 0) > 0">排除旧数据 {{ item.manifest.rejectedRxChunks }} 块 · {{ formatBytes(item.manifest.rejectedRxBytes ?? 0) }}</span>
               <span>{{ item.manifest.port === 'mock' ? '模拟数据' : item.manifest.baudRate ? `${item.manifest.baudRate.toLocaleString()} baud` : item.manifest.timeSource }}</span>
             </div>
             <p v-if="item.manifest.error" class="recording-card-error">{{ item.manifest.error }}</p>

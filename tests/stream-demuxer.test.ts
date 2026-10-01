@@ -317,7 +317,7 @@ export async function runStreamDemuxerTests() {
     );
   });
 
-  await test('Fixture 06: 超长行防护 (>64KiB 截断清空与秒级自恢复)', () => {
+  await test('Fixture 06: 超长行防护 (>64KiB 丢弃至真实换行后恢复)', () => {
     const chunksJson = JSON.parse(
       fs.readFileSync(path.join(fixturesDir, '06_overlong_line_protection.chunks.json'), 'utf-8')
     );
@@ -340,9 +340,9 @@ export async function runStreamDemuxerTests() {
     assert.equal(lines1.length, 0, '超长无换行数据不应产生有效行');
     assert.equal(demuxer.dirtyByteCount(), 1, '超过 64KiB 应计入 1 次 dirtyByteCount');
 
-    // 阶段 2：紧随其后到达正常行
+    // 阶段 2：真实换行结束超长行，再到达独立正常行
     const lines2 = demuxer.processBytes(chunk1);
-    assert.equal(lines2.length, 1, '缓冲区清空后正常数据应成功提取');
+    assert.equal(lines2.length, 1, '超长行完成重新同步后应成功提取独立正常行');
     assert.equal(lines2[0], '10.0,20.0,30.0');
 
     const samples: SamplePoint[] = [];

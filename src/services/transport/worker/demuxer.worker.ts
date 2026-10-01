@@ -4,7 +4,7 @@
  */
 
 import { StreamDemuxer } from './stream-demuxer';
-import type { WorkerInMessage, WorkerOutMessage } from './types';
+import type { WorkerInMessage, WorkerOutMessage, ReceiveContext } from './types';
 import type { ParsedBatch } from '../types';
 import { createProtocolEngine } from '../../../core/protocol/ProtocolEngine';
 import type { ProtocolConfig } from '../../../core/protocol/types';
@@ -23,6 +23,7 @@ let pendingLogs: ParsedBatch['logLines'] = [];
 let droppedBytesCount = 0;
 let pendingProtocolErrors = 0;
 let lastDemuxErrorCount = 0;
+let receiveContext: ReceiveContext | undefined;
 
 let batchIntervalMs = 16; // ~60Hz 批次推送
 let forwardRawData = false;
@@ -41,6 +42,7 @@ function flushBatch(): void {
   }
 
   const batch: ParsedBatch = {
+    ...(receiveContext ? { session_id: receiveContext.session_id, channel_epoch: receiveContext.epoch } : {}),
     samples: pendingSamples,
     frames: pendingFrames.length > 0 ? pendingFrames : undefined,
     logLines: pendingLogs,
@@ -86,8 +88,16 @@ self.onmessage = (event: MessageEvent<WorkerInMessage>) => {
 
   switch (msg.type) {
     case 'CHUNK': {
-      const { data, timestampUs } = msg;
+      const { data, timestampUs, rxOrigin } = msg;
       if (!data || data.length === 0) return;
+
+      if (rxOrigin && (!receiveContext || receiveContext.session_id !== rxOrigin.session_id || receiveContext.epoch !== rxOrigin.epoch)) {
+        flushBatch();
+        demuxer.reset();
+        binaryEngine.reset();
+        lastDemuxErrorCount = 0;
+        receiveContext = { session_id: rxOrigin.session_id, epoch: rxOrigin.epoch };
+      }
 
       if (forwardRawData) {
         const rawMsg: WorkerOutMessage = {
@@ -116,7 +126,7 @@ self.onmessage = (event: MessageEvent<WorkerInMessage>) => {
         return;
       }
 
-      const lines = demuxer.processBytes(data);
+      const lines = demuxer.processBytesWithOrigin(data, rxOrigin);
       if (lines.length === 0) {
         return;
       }
@@ -126,7 +136,7 @@ self.onmessage = (event: MessageEvent<WorkerInMessage>) => {
         const line = lines[i];
         // 增量步进微秒时间戳以保持单调递增
         const lineTs = baseTs + i * 1000;
-        const result = demuxer.demuxLine(line, lineTs, 'Rx');
+        const result = demuxer.demuxLine(line.text, lineTs, 'Rx');
 
         if (result.type === 'sample') {
           const channels = demuxer.channelNames();
@@ -152,6 +162,7 @@ self.onmessage = (event: MessageEvent<WorkerInMessage>) => {
           pendingLogs.push({
             t: result.log.timestamp_us / 1_000_000,
             text: result.log.text,
+            ...(line.rx_origin ? { rx_origin: line.rx_origin } : {}),
           });
 
           if (pendingLogs.length > MAX_LOGS_BUFFER) {
@@ -204,6 +215,7 @@ self.onmessage = (event: MessageEvent<WorkerInMessage>) => {
       droppedBytesCount = 0;
       pendingProtocolErrors = 0;
       lastDemuxErrorCount = 0;
+      receiveContext = undefined;
       break;
     }
 
@@ -240,6 +252,7 @@ self.onmessage = (event: MessageEvent<WorkerInMessage>) => {
           droppedBytesCount = 0;
           pendingProtocolErrors = 0;
           lastDemuxErrorCount = 0;
+          receiveContext = msg.receiveContext ? { ...msg.receiveContext } : undefined;
         } catch (error) {
           if (msg.requestId !== undefined) {
             const detail = error instanceof Error ? error.message : String(error);

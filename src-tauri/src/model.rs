@@ -23,6 +23,32 @@ pub enum WriteStatus {
     Superseded,
 }
 
+/// The API boundary that ordered RX bytes and a TX dispatch. This is host-side
+/// evidence, not a UART arrival timestamp or proof that a device applied a value.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RxSource {
+    SerialRead,
+    WebSerialRead,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RxOrigin {
+    pub source: RxSource,
+    pub session_id: String,
+    pub epoch: u64,
+    pub first_rx_sequence: u64,
+    pub last_rx_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RxDispatch {
+    pub source: RxSource,
+    pub session_id: String,
+    pub epoch: u64,
+    pub rx_sequence: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriteReceipt {
     pub request_id: String,
@@ -30,6 +56,8 @@ pub struct WriteReceipt {
     pub epoch: u64,
     pub byte_count: usize,
     pub status: WriteStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_dispatch: Option<RxDispatch>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +70,8 @@ pub struct WriteResultEvent {
     pub requested_bytes: usize,
     pub written_bytes: usize,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_dispatch: Option<RxDispatch>,
 }
 
 impl WriteResultEvent {
@@ -60,6 +90,7 @@ impl WriteResultEvent {
             requested_bytes: request.bytes.len(),
             written_bytes,
             reason,
+            rx_dispatch: None,
         }
     }
 }
@@ -208,6 +239,8 @@ pub struct LogLine {
     pub level: LogLevel,
     pub text: String,
     pub raw_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_origin: Option<RxOrigin>,
 }
 
 /// 阶跃性能四大工程指标 (PRD 2.4.2 PR-001)
@@ -483,12 +516,45 @@ mod tests {
             level: LogLevel::Data,
             text: "10.0,9.2,30.1".to_string(),
             raw_hex: Some("31 30 2E 30".to_string()),
+            rx_origin: None,
         };
         let json = serde_json::to_string(&ll).unwrap();
         assert!(json.contains("Data"));
         assert!(json.contains("31 30 2E 30"));
         let deserialized: LogLine = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, ll);
+    }
+
+    #[test]
+    fn receive_and_dispatch_identity_roundtrip_without_upgrading_legacy_events() {
+        let origin = RxOrigin {
+            source: RxSource::SerialRead, session_id: "session-test".into(), epoch: 3,
+            first_rx_sequence: 7, last_rx_sequence: 9,
+        };
+        let line = LogLine { timestamp_us: 1_000, direction: LogDirection::Rx,
+            level: LogLevel::Info, text: "PID_APPLIED trial-id".into(), raw_hex: None,
+            rx_origin: Some(origin) };
+        let encoded = serde_json::to_value(&line).unwrap();
+        assert_eq!(encoded["rx_origin"]["source"], "serial-read");
+        assert_eq!(encoded["rx_origin"]["first_rx_sequence"], 7);
+        assert_eq!(serde_json::from_value::<LogLine>(encoded).unwrap(), line);
+        let legacy: LogLine = serde_json::from_value(serde_json::json!({
+            "timestamp_us": 1_000, "direction": "Rx", "level": "Info",
+            "text": "PID_APPLIED trial-id", "raw_hex": null
+        })).unwrap();
+        assert!(legacy.rx_origin.is_none());
+        let request = WriteRequest { request_id: "write-test".into(), session_id: "session-test".into(),
+            epoch: 3, source: "test".into(), bytes: vec![1, 2] };
+        let queued = WriteReceipt { request_id: request.request_id.clone(), session_id: request.session_id.clone(),
+            epoch: 3, byte_count: 2, status: WriteStatus::Queued, rx_dispatch: None };
+        assert!(serde_json::to_value(queued).unwrap().get("rx_dispatch").is_none());
+        let mut result = WriteResultEvent::for_request(&request, WriteStatus::Written, 2, None);
+        result.rx_dispatch = Some(RxDispatch { source: RxSource::SerialRead,
+            session_id: request.session_id, epoch: 3, rx_sequence: 6 });
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["rx_dispatch"]["source"], "serial-read");
+        assert_eq!(encoded["rx_dispatch"]["rx_sequence"], 6);
+        assert_eq!(serde_json::from_value::<WriteResultEvent>(encoded).unwrap(), result);
     }
 
     #[test]

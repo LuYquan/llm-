@@ -231,6 +231,7 @@ mod tests {
                 },
                 text: format!("10.00,{:.2},30.00", 9.0 + (i as f64) * 0.01),
                 raw_hex: Some(format!("31 30 2E 30 30 {:02X}", i % 256)),
+                rx_origin: None,
             };
             writer.write_line(&log);
         }
@@ -271,6 +272,7 @@ mod tests {
                 level: LogLevel::Info,
                 text: format!("Log line number {}", i),
                 raw_hex: None,
+                rx_origin: None,
             };
             writer.write_line(&log);
         }

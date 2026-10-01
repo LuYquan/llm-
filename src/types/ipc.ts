@@ -36,6 +36,23 @@ export interface WaveformBatch {
 export type LogDirection = 'Rx' | 'Tx';
 export type LogLevel = 'Info' | 'Warn' | 'Error' | 'Data';
 
+/** Host read API order only; this does not establish physical UART arrival time. */
+export interface RxOrigin {
+  source: 'serial-read' | 'web-serial-read';
+  session_id: string;
+  epoch: number;
+  first_rx_sequence: number;
+  last_rx_sequence: number;
+}
+
+/** Receiver watermark captured at the first actual host write call. */
+export interface RxDispatch {
+  source: RxOrigin['source'];
+  session_id: string;
+  epoch: number;
+  rx_sequence: number;
+}
+
 /**
  * 格式化日志行数据结构 (PRD 2.4.2 PR-001)
  */
@@ -45,6 +62,7 @@ export interface LogLine {
   level: LogLevel;
   text: string;
   raw_hex?: string | null;
+  rx_origin?: RxOrigin;
 }
 
 /**

@@ -18,7 +18,7 @@ import type {
 } from './types';
 import type { WaveformBatch } from '../../types/ipc';
 import { TransportError } from './types';
-import type { WorkerInMessage, WorkerOutMessage } from './worker/types';
+import type { WorkerInMessage, WorkerOutMessage, RxOrigin, ReceiveContext } from './worker/types';
 import { StreamDemuxer } from './worker/stream-demuxer';
 import { createProtocolEngine } from '../../core/protocol/ProtocolEngine';
 import type { ProtocolConfig } from '../../core/protocol/types';
@@ -27,7 +27,7 @@ import { validateProtocolConfig } from '../../core/protocol/types';
 let webWriteSequence = 0;
 let webSessionSequence = 0;
 
-function makeWebWriteReceipt(byteCount: number, sessionId: string | null, epoch: number): WriteReceipt {
+function makeWebWriteReceipt(byteCount: number, sessionId: string | null, epoch: number, rxDispatch?: WriteReceipt['rx_dispatch']): WriteReceipt {
   webWriteSequence += 1;
   return {
     request_id: `web-tx-${webWriteSequence}`,
@@ -35,6 +35,7 @@ function makeWebWriteReceipt(byteCount: number, sessionId: string | null, epoch:
     epoch,
     byte_count: byteCount,
     status: 'written',
+    ...(rxDispatch ? { rx_dispatch: rxDispatch } : {}),
   };
 }
 
@@ -65,7 +66,7 @@ interface WebSerialPort {
 interface OutboundTask {
   chunk: Uint8Array;
   isEmergency?: boolean;
-  resolve: () => void;
+  resolve: (receipt?: WriteReceipt) => void;
   reject: (err: any) => void;
 }
 
@@ -86,6 +87,8 @@ export class WebSerialTransport implements ISerialTransport {
   private connectedPortId: string | null = null;
   private sessionId: string | null = null;
   private sessionEpoch = 0;
+  private receiveEpoch = 0;
+  private rxSequence = 0;
   private activePort: WebSerialPort | null = null;
   private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
@@ -116,6 +119,7 @@ export class WebSerialTransport implements ISerialTransport {
   private pendingProtocolErrors = 0;
   private lastFallbackDemuxErrors = 0;
   private connectTimeMs = 0;
+  private fallbackReceiveContext: ReceiveContext | undefined;
 
   // 内部端口映射池：ID -> SerialPort
   private portMap = new Map<string, WebSerialPort>();
@@ -375,6 +379,8 @@ export class WebSerialTransport implements ISerialTransport {
       this.connectedPortId = portId;
       this.sessionId = `web-session-${Date.now()}-${++webSessionSequence}`;
       this.sessionEpoch = 1;
+      this.receiveEpoch = 1;
+      this.rxSequence = 0;
       this.isOpen = true;
       this.acquisitionEnabled = true;
       this.isClosing = false;
@@ -417,6 +423,8 @@ export class WebSerialTransport implements ISerialTransport {
       this.connectedPortId = portId;
       this.sessionId = `web-session-${Date.now()}-${++webSessionSequence}`;
       this.sessionEpoch = 1;
+      this.receiveEpoch = 1;
+      this.rxSequence = 0;
       this.isOpen = true;
       this.acquisitionEnabled = true;
       this.isClosing = false;
@@ -454,14 +462,15 @@ export class WebSerialTransport implements ISerialTransport {
   private initWorker(): void {
     if (typeof Worker !== 'undefined') {
       try {
-        this.worker = new Worker(
+        const worker = new Worker(
           new URL('./worker/demuxer.worker.ts', import.meta.url),
           { type: 'module' }
         );
+        this.worker = worker;
 
         this.worker.onmessage = (event: MessageEvent<WorkerOutMessage>) => {
           const msg = event.data;
-          if (!msg) return;
+          if (!msg || this.worker !== worker) return;
 
           if (msg.type === 'BATCH') {
             for (const listener of this.batchListeners) {
@@ -490,6 +499,7 @@ export class WebSerialTransport implements ISerialTransport {
           type: 'CONFIGURE',
           batchIntervalMs: 16,
           protocolConfig: JSON.parse(JSON.stringify(this.protocolConfig)) as ProtocolConfig,
+          ...(this.sessionId ? { receiveContext: { session_id: this.sessionId, epoch: this.receiveEpoch } } : {}),
         } satisfies WorkerInMessage);
       } catch (workerInitErr) {
         console.warn(
@@ -511,6 +521,7 @@ export class WebSerialTransport implements ISerialTransport {
       this.droppedBytesCount = 0;
       this.pendingProtocolErrors = 0;
       this.lastFallbackDemuxErrors = 0;
+      this.fallbackReceiveContext = this.sessionId ? { session_id: this.sessionId, epoch: this.receiveEpoch } : undefined;
       if (this.fallbackBatchTimer) clearInterval(this.fallbackBatchTimer);
       this.fallbackBatchTimer = setInterval(() => {
         this.flushFallbackBatch();
@@ -521,8 +532,8 @@ export class WebSerialTransport implements ISerialTransport {
   /**
    * 主线程流分流兜底处理
    */
-  private processChunkOnMainThread(chunk: Uint8Array): void {
-    const baseTs = Math.round(
+  private processChunkOnMainThread(chunk: Uint8Array, rxOrigin?: RxOrigin, timestampUs?: number): void {
+    const baseTs = timestampUs ?? Math.round(
       ((typeof performance !== 'undefined' ? performance.now() : Date.now()) -
         this.connectTimeMs) *
         1000
@@ -546,7 +557,7 @@ export class WebSerialTransport implements ISerialTransport {
     }
 
     if (!this.fallbackDemuxer) return;
-    const lines = this.fallbackDemuxer.processBytes(chunk);
+    const lines = this.fallbackDemuxer.processBytesWithOrigin(chunk, rxOrigin);
     if (lines.length === 0) {
       this.flushFallbackBatch();
       return;
@@ -554,7 +565,7 @@ export class WebSerialTransport implements ISerialTransport {
 
     for (let i = 0; i < lines.length; i++) {
       const lineTs = baseTs + i * 1000;
-      const result = this.fallbackDemuxer.demuxLine(lines[i], lineTs, 'Rx');
+      const result = this.fallbackDemuxer.demuxLine(lines[i].text, lineTs, 'Rx');
 
       if (result.type === 'sample') {
         const channels = this.fallbackDemuxer.channelNames();
@@ -578,6 +589,7 @@ export class WebSerialTransport implements ISerialTransport {
         this.pendingLogs.push({
           t: result.log.timestamp_us / 1_000_000,
           text: result.log.text,
+          ...(lines[i].rx_origin ? { rx_origin: lines[i].rx_origin } : {}),
         });
         if (this.pendingLogs.length > 5000) {
           const overflow = this.pendingLogs.length - 5000;
@@ -616,6 +628,7 @@ export class WebSerialTransport implements ISerialTransport {
     }
 
     const batch: ParsedBatch = {
+      ...(this.fallbackReceiveContext ? { session_id: this.fallbackReceiveContext.session_id, channel_epoch: this.fallbackReceiveContext.epoch } : {}),
       samples: this.pendingSamples,
       frames: this.pendingFrames.length > 0 ? this.pendingFrames : undefined,
       logLines: this.pendingLogs,
@@ -644,6 +657,18 @@ export class WebSerialTransport implements ISerialTransport {
       waiter.reject(error);
     }
     this.protocolWaiters.clear();
+  }
+
+  private nextReadOrigin(): RxOrigin | undefined {
+    this.rxSequence += 1;
+    if (!this.sessionId || !Number.isSafeInteger(this.rxSequence)) return undefined;
+    return {
+      source: 'web-serial-read',
+      session_id: this.sessionId,
+      epoch: this.receiveEpoch,
+      first_rx_sequence: this.rxSequence,
+      last_rx_sequence: this.rxSequence,
+    };
   }
 
   /**
@@ -678,6 +703,12 @@ export class WebSerialTransport implements ISerialTransport {
             break;
           }
           if (value && value.length > 0) {
+            // Allocate before observers can synchronously dispatch a write. This
+            // records read() return order, not a device/UART arrival timestamp.
+            const rxOrigin = this.nextReadOrigin();
+            const timestampUs = Math.round(
+              ((typeof performance !== 'undefined' ? performance.now() : Date.now()) - this.connectTimeMs) * 1000
+            );
             // 派发给 rawData 观察者
             if (this.rawDataListeners.size > 0) {
               for (const listener of this.rawDataListeners) {
@@ -694,11 +725,8 @@ export class WebSerialTransport implements ISerialTransport {
               const msg: WorkerInMessage = {
                 type: 'CHUNK',
                 data: value,
-                timestampUs: Math.round(
-                  ((typeof performance !== 'undefined' ? performance.now() : Date.now()) -
-                    this.connectTimeMs) *
-                    1000
-                ),
+                timestampUs,
+                ...(rxOrigin ? { rxOrigin } : {}),
               };
               // 安全转移 ArrayBuffer 达到零拷贝性能
               const transferBuffer =
@@ -714,7 +742,7 @@ export class WebSerialTransport implements ISerialTransport {
               }
             } else {
               // 主线程兼容分流兜底
-              this.processChunkOnMainThread(value);
+              this.processChunkOnMainThread(value, rxOrigin, timestampUs);
             }
           }
         }
@@ -891,6 +919,9 @@ export class WebSerialTransport implements ISerialTransport {
     this.connectedPortId = null;
     this.sessionId = null;
     this.sessionEpoch = 0;
+    this.receiveEpoch = 0;
+    this.rxSequence = 0;
+    this.fallbackReceiveContext = undefined;
     this.setStatus(finalStatus);
   }
 
@@ -912,6 +943,11 @@ export class WebSerialTransport implements ISerialTransport {
     config = JSON.parse(JSON.stringify(config)) as ProtocolConfig;
     if (this.worker) {
       const requestId = ++this.configureRequestId;
+      const nextEpoch = this.sessionId ? Math.max(this.receiveEpoch, this.sessionEpoch) + 1 : 0;
+      // postMessage and the read loop share one JS thread. Advance the input
+      // identity before posting CONFIGURE so FIFO CHUNKs after it use the new
+      // epoch even while the CONFIGURED reply is still pending.
+      this.receiveEpoch = nextEpoch;
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => {
           this.protocolWaiters.delete(requestId);
@@ -919,7 +955,9 @@ export class WebSerialTransport implements ISerialTransport {
         }, 5000);
         this.protocolWaiters.set(requestId, { resolve, reject, timer });
         try {
-          this.worker?.postMessage({ type: 'CONFIGURE', protocolConfig: config, requestId });
+          this.worker?.postMessage({ type: 'CONFIGURE', protocolConfig: config, requestId,
+            ...(this.sessionId ? { receiveContext: { session_id: this.sessionId, epoch: nextEpoch } } : {}),
+          } satisfies WorkerInMessage);
         } catch (error) {
           clearTimeout(timer);
           this.protocolWaiters.delete(requestId);
@@ -927,7 +965,7 @@ export class WebSerialTransport implements ISerialTransport {
         }
       });
       this.protocolConfig = config;
-      if (this.sessionId) this.sessionEpoch += 1;
+      if (this.sessionId) this.sessionEpoch = nextEpoch;
       return;
     }
 
@@ -940,7 +978,11 @@ export class WebSerialTransport implements ISerialTransport {
     this.droppedBytesCount = 0;
     this.pendingProtocolErrors = 0;
     this.lastFallbackDemuxErrors = 0;
-    if (this.sessionId) this.sessionEpoch += 1;
+    if (this.sessionId) {
+      this.sessionEpoch = Math.max(this.receiveEpoch, this.sessionEpoch) + 1;
+      this.receiveEpoch = this.sessionEpoch;
+    }
+    this.fallbackReceiveContext = this.sessionId ? { session_id: this.sessionId, epoch: this.receiveEpoch } : undefined;
   }
 
   async write(data: Uint8Array): Promise<WriteReceipt> {
@@ -953,6 +995,9 @@ export class WebSerialTransport implements ISerialTransport {
       const err = new TransportError('串口未连接，无法发送数据', 'NotConnected');
       this.notifyError(err);
       throw err;
+    }
+    if (this.receiveEpoch !== this.sessionEpoch) {
+      throw new TransportError('协议切换尚未确认，暂停普通发送', 'Unknown');
     }
 
     if (this.connectedPortId === 'mock' || this.connectedPortId === 'VIRTUAL_COM') {
@@ -991,11 +1036,13 @@ export class WebSerialTransport implements ISerialTransport {
       throw err;
     }
 
-    await new Promise<void>((resolve, reject) => {
-      this.normalWriteQueue.push({ chunk: data, resolve, reject });
+    return new Promise<WriteReceipt>((resolve, reject) => {
+      this.normalWriteQueue.push({ chunk: data, resolve: receipt => {
+        if (receipt) resolve(receipt);
+        else reject(new TransportError('缺少 Web Serial 写入回执', 'Unknown'));
+      }, reject });
       this.drainWriteQueue().catch(() => {});
     });
-    return makeWebWriteReceipt(data.length, this.sessionId, this.sessionEpoch);
   }
 
   /**
@@ -1028,7 +1075,7 @@ export class WebSerialTransport implements ISerialTransport {
     }
 
     return new Promise<void>((resolve, reject) => {
-      this.emergencyWriteQueue.push({ chunk: frame, isEmergency: true, resolve, reject });
+      this.emergencyWriteQueue.push({ chunk: frame, isEmergency: true, resolve: () => resolve(), reject });
       this.drainWriteQueue().catch(() => {});
     });
   }
@@ -1060,8 +1107,23 @@ export class WebSerialTransport implements ISerialTransport {
             : this.normalWriteQueue.shift()!;
 
         try {
+          if (!task.isEmergency && this.receiveEpoch !== this.sessionEpoch) {
+            throw new TransportError('协议切换尚未确认，待发普通命令已拒绝', 'Unknown');
+          }
+          // Freeze at actual WritableStream dispatch, not enqueue time or the
+          // later Promise resolution. An early device reply can then remain
+          // eligible while a pre-dispatch parsed batch cannot become newer.
+          const sessionId = this.sessionId;
+          const epoch = this.sessionEpoch;
+          const rxDispatch = sessionId ? {
+            source: 'web-serial-read' as const,
+            session_id: sessionId,
+            epoch,
+            rx_sequence: this.rxSequence,
+          } : undefined;
+          const receipt = task.isEmergency ? undefined : makeWebWriteReceipt(task.chunk.length, sessionId, epoch, rxDispatch);
           await this.writer.write(task.chunk);
-          task.resolve();
+          task.resolve(receipt);
         } catch (err: any) {
           const transErr = this.mapToTransportError(err);
           task.reject(transErr);
@@ -1113,8 +1175,14 @@ export class WebSerialTransport implements ISerialTransport {
    */
   onWaveformBatch(cb: (batch: WaveformBatch) => void): Unsubscribe {
     return this.onBatch((parsed) => {
-      const sessionId = this.sessionId;
-      if (this.currentStatus !== 'connected' || !sessionId) return;
+      const sessionId = parsed.session_id ?? this.sessionId;
+      const epoch = parsed.channel_epoch ?? this.sessionEpoch;
+      if (this.currentStatus !== 'connected' || !sessionId || !this.sessionId) return;
+      // CONFIGURE flushes the old parser before acknowledging the new one.
+      // Keep that batch observable to log consumers, but never let its old
+      // samples roll ChannelStore back after the input epoch has advanced.
+      const currentReceiveEpoch = this.receiveEpoch || this.sessionEpoch;
+      if (sessionId !== this.sessionId || epoch !== currentReceiveEpoch) return;
 
       if (parsed.frames && parsed.frames.length > 0) {
         // Parser output order is frame identity. Several frames may share the
@@ -1134,7 +1202,7 @@ export class WebSerialTransport implements ISerialTransport {
         });
         cb({
           session_id: sessionId,
-          channel_epoch: this.sessionEpoch,
+          channel_epoch: epoch,
           channel_names: channelNames,
           points: [],
           timestamps,
@@ -1164,7 +1232,7 @@ export class WebSerialTransport implements ISerialTransport {
 
       cb({
         session_id: sessionId,
-        channel_epoch: this.sessionEpoch,
+        channel_epoch: epoch,
         channel_names: channelNames,
         points: [],
         timestamps,

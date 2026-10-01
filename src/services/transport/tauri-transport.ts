@@ -508,6 +508,7 @@ export class TauriTransport implements ISerialTransport {
         logLines: lines.map((l) => ({
           t: l.timestamp_us / 1_000_000,
           text: l.text,
+          rx_origin: l.rx_origin,
         })),
         droppedBytes: 0,
       };

@@ -2,12 +2,14 @@
 import { ref, computed, watch, nextTick } from 'vue';
 import EventCapsule from './EventCapsule.vue';
 import type { FirmwareAnomaly } from '../core/copilot/types';
+import type { RxOrigin } from '../types/ipc';
 
 export interface LogLine {
   id: number;
   time: string;
-  /** Wall-clock timestamp used to reject acknowledgements from before a write. */
+  /** Display/dispatch wall clock; never used as proof of raw receive order. */
   at?: number;
+  rx_origin?: RxOrigin;
   tag: string;
   level: 'info' | 'warn' | 'error';
   text: string;

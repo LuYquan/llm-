@@ -11,13 +11,13 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
 
-use self::data_source::{process_serial_bytes, DataSource, MockDataSource, SerialDataSource};
+use self::data_source::{DataSource, MockDataSource, ReceivedTextDecoder, SerialDataSource};
 use self::demuxer::{DemuxOutput, StreamDemuxer};
 use self::ring_buffer::{LogRingBuffer, TimeSeriesRingBuffer};
 use self::step::StepDetector;
 use crate::config::ChannelMapping;
 use crate::model::{
-    LogDirection, LogLevel, LogLine, RawChunk, SerialSettings, SerialStatusEvent, WaveformBatch,
+    LogDirection, LogLevel, LogLine, SerialSettings, SerialStatusEvent, WaveformBatch,
     WriteReceipt, WriteRequest, WriteResultEvent, WriteStatus,
 };
 use crate::protocol::{BinaryProtocolParser, ProtocolConfig, RawDataMode};
@@ -201,6 +201,7 @@ impl PipelineManager {
             sd.set_session_id(new_session_id.clone());
         }
 
+        let session_start = Instant::now();
         let mut data_source: Box<dyn DataSource> = if mode_str == "serial" {
             let port = port_name
                 .filter(|p| !p.trim().is_empty())
@@ -215,12 +216,21 @@ impl PipelineManager {
             );
             let settings = serial_settings.unwrap_or_default();
             settings.validate()?;
-            let serial = SerialDataSource::open(&port, baud, settings, app.clone())?;
+            let serial = SerialDataSource::open(
+                &port,
+                baud,
+                settings,
+                app.clone(),
+                new_session_id.clone(),
+                self.channel_epoch.clone(),
+                session_start,
+            )?;
             *self.last_connected_port.write().await = Some(port.clone());
             *self.last_connected_baud.write().await = Some(baud);
             Box::new(serial)
         } else {
             let mut mock = MockDataSource::with_time(0.0);
+            mock.set_read_context(new_session_id.clone(), self.channel_epoch.clone(), session_start);
             if mode_str.contains("teleplot") {
                 mock.set_format(data_source::MockFormat::Teleplot);
             }
@@ -265,7 +275,7 @@ impl PipelineManager {
             let mut mode = self.mode.write().await;
             *mode = mode_str.clone();
             let mut start_time = self.start_instant.write().await;
-            *start_time = Some(Instant::now());
+            *start_time = Some(session_start);
             let mut last_rt = self.last_rate_time.write().await;
             *last_rt = Instant::now();
             self.last_rate_samples.store(
@@ -306,11 +316,11 @@ impl PipelineManager {
 
         // 任务 1: 数据采集与智能分流任务 (StreamDemuxer) + 阶跃实时检测 + 高优先级急停与普通发送
         tokio::spawn(async move {
-            let mut pipeline_start = Instant::now();
-            let mut parser_buffer = Vec::with_capacity(2048);
+            let mut pipeline_start = session_start;
+            let mut text_decoder = ReceivedTextDecoder::new();
             let parser_error_count = std::sync::atomic::AtomicU64::new(0);
-            let mut rx_sequence = 0u64;
             let mut active_protocol = protocol_config_ingest.read().await.clone();
+            let mut active_epoch = channel_epoch_ingest.load(Ordering::Acquire);
             let mut binary_parser = BinaryProtocolParser::new(active_protocol.clone())
                 .unwrap_or_else(|_| {
                     BinaryProtocolParser::new(ProtocolConfig::default())
@@ -328,19 +338,21 @@ impl PipelineManager {
                 if reset_signal_ingest.swap(false, Ordering::SeqCst) {
                     data_source.reset();
                     pipeline_start = Instant::now();
-                    parser_buffer.clear();
+                    text_decoder.clear();
                     parser_error_count.store(0, Ordering::Relaxed);
                     let mut sd = step_detector_ingest.write().await;
                     sd.reset();
                 }
 
                 let selected_protocol = protocol_config_ingest.read().await.clone();
-                if selected_protocol != active_protocol {
+                let selected_epoch = channel_epoch_ingest.load(Ordering::Acquire);
+                if selected_protocol != active_protocol || selected_epoch != active_epoch {
                     // Protocol applications are epoch boundaries. Drop any partial old frame
                     // before reading bytes under the new interpretation.
                     let _ = binary_parser.set_config(selected_protocol.clone());
                     active_protocol = selected_protocol;
-                    parser_buffer.clear();
+                    active_epoch = selected_epoch;
+                    text_decoder.clear();
                     demuxer_ingest.write().await.reset();
                 }
 
@@ -403,6 +415,7 @@ impl PipelineManager {
                                 level: LogLevel::Warn,
                                 text: format!("[SOFTWARE STOP] 已取消 {} 个尚未开始的普通发送请求", canceled),
                                 raw_hex: None,
+                                rx_origin: None,
                             };
                             archive_ingest.write_line(&line);
                             terminal_buffer_ingest.write().await.push(line.clone());
@@ -441,22 +454,19 @@ impl PipelineManager {
                     _ = tokio::time::sleep(Duration::from_millis(10)), if !is_acquiring_ingest.load(Ordering::Acquire) => {}
                     read_res = data_source.read_chunk(), if is_acquiring_ingest.load(Ordering::Acquire) => {
                         match read_res {
-                            Ok(Some(bytes)) => {
-                                let timestamp_us = pipeline_start.elapsed().as_micros() as u64;
-                                rx_sequence = rx_sequence.saturating_add(1);
-                                let chunk_epoch = channel_epoch_ingest.load(Ordering::Acquire);
-                                let raw_chunk = RawChunk {
-                                    session_id: session_id_for_ingest.clone(),
-                                    epoch: chunk_epoch,
-                                    rx_sequence,
-                                    received_at_us: timestamp_us,
-                                    bytes,
-                                };
+                            Ok(Some(raw_chunk)) => {
+                                let timestamp_us = raw_chunk.received_at_us;
                                 if current_session_id_ingest.read().await.as_str() != raw_chunk.session_id.as_str() {
                                     break;
                                 }
                                 total_rx_bytes_ingest.fetch_add(raw_chunk.bytes.len() as u64, Ordering::Relaxed);
                                 recording_ingest.write_chunk(raw_chunk.clone());
+                                // A read already in progress, or queued before a protocol
+                                // switch, keeps its original epoch. Do not upgrade old
+                                // bytes to a new parser/ACK context when consuming them.
+                                if raw_chunk.epoch != active_epoch || raw_chunk.epoch != channel_epoch_ingest.load(Ordering::Acquire) {
+                                    continue;
+                                }
                                 // Preserve immutable bytes before either text or binary decoding.
                                 if !matches!(active_protocol, ProtocolConfig::Firewater) {
                                     let output = binary_parser.feed(&raw_chunk.bytes);
@@ -467,6 +477,7 @@ impl PipelineManager {
                                             level: LogLevel::Warn,
                                             text: format!("[PROTOCOL] {} 个解析错误，丢弃 {} 字节", output.error_count, output.dropped_bytes),
                                             raw_hex: None,
+                                            rx_origin: None,
                                         };
                                         terminal_buffer_ingest.write().await.push(diagnostic.clone());
                                         log_buffer_ingest.write().await.push(diagnostic.clone());
@@ -482,6 +493,7 @@ impl PipelineManager {
                                             level: LogLevel::Data,
                                             text: format!("RawData RX: {} bytes", raw_chunk.bytes.len()),
                                             raw_hex: Some(raw_hex),
+                                            rx_origin: None,
                                         });
                                     }
                                     // A parse already in progress when the user applied another
@@ -504,8 +516,10 @@ impl PipelineManager {
                                     }
                                     continue;
                                 }
-                                let lines = process_serial_bytes(&raw_chunk.bytes, &mut parser_buffer, &parser_error_count);
-                                for line in lines {
+                                let lines = text_decoder.feed(&raw_chunk, !is_mock_ingest, &parser_error_count);
+                                for decoded_line in lines {
+                                let line = decoded_line.text;
+                                if raw_chunk.epoch != channel_epoch_ingest.load(Ordering::Acquire) { break; }
 
                                 let output = {
                                     let mut demux = demuxer_ingest.write().await;
@@ -534,6 +548,7 @@ impl PipelineManager {
                                             level: LogLevel::Data,
                                             text: line.clone(),
                                             raw_hex,
+                                            rx_origin: decoded_line.rx_origin.clone(),
                                         };
                                         archive_ingest.write_line(&data_log);
                                         terminal_buffer_ingest.write().await.push(data_log);
@@ -559,7 +574,8 @@ impl PipelineManager {
                                             let _ = app_ingest.emit("step-snapshot", &snapshot);
                                         }
                                     }
-                                    DemuxOutput::Log(log_line) => {
+                                    DemuxOutput::Log(mut log_line) => {
+                                        log_line.rx_origin = decoded_line.rx_origin;
                                         archive_ingest.write_line(&log_line);
                                         terminal_buffer_ingest.write().await.push(log_line.clone());
                                         log_buffer_ingest.write().await.push(log_line);
@@ -1070,6 +1086,7 @@ impl PipelineManager {
             direction: LogDirection::Tx,
             text: format!("[QUEUED {}] {log_text}", receipt.request_id),
             raw_hex,
+            rx_origin: None,
         };
 
         self.archive.write_line(&log_line);
@@ -1100,6 +1117,7 @@ impl PipelineManager {
             direction: LogDirection::Tx,
             text: format!("[QUEUED {}] {hex_str}", receipt.request_id),
             raw_hex: Some(hex_str),
+            rx_origin: None,
         };
 
         self.archive.write_line(&log_line);
@@ -1147,6 +1165,7 @@ impl PipelineManager {
             epoch,
             byte_count: request.bytes.len(),
             status: WriteStatus::Queued,
+            rx_dispatch: None,
         };
         tx.try_send(request)
             .map_err(|e| format!("发送队列已满或已关闭: {e}"))?;
@@ -1329,6 +1348,7 @@ impl PipelineManager {
                                 direction: LogDirection::Tx,
                                 text: format!("[QUEUED] {}", log_text),
                                 raw_hex: raw_hex.clone(),
+                                rx_origin: None,
                             });
                         }
                     }

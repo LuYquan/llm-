@@ -3,7 +3,12 @@
  * 100% 对齐 Rust 后端 (src-tauri/src/pipeline/) 与 docs/protocol/stream-format.md
  */
 
-import type { DemuxOutput, LogDirection, LogLevel, LogLine, SamplePoint } from './types';
+import type { DemuxOutput, LogDirection, LogLevel, LogLine, SamplePoint, RxOrigin } from './types';
+
+export interface ReceivedTextLine {
+  text: string;
+  rx_origin?: RxOrigin;
+}
 
 export const FLOAT_REGEX = /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?$/;
 
@@ -217,6 +222,8 @@ export class TeleplotAligner {
 export class StreamDemuxer {
   private teleplotAligner: TeleplotAligner;
   private lineBuffer: Uint8Array = new Uint8Array(0);
+  private lineBufferOrigin: RxOrigin | undefined;
+  private discardingOversizedLine = false;
   private utf8Decoder = new TextDecoder('utf-8', { fatal: true });
   private demuxErrorCount = 0;
   private byteDirtyCount = 0;
@@ -232,9 +239,33 @@ export class StreamDemuxer {
    * 100% 对齐 Rust process_serial_bytes
    */
   processBytes(readBytes: Uint8Array): string[] {
+    return this.processBytesWithOrigin(readBytes).map(line => line.text);
+  }
+
+  /** Preserve the first chunk of a split line, rather than its later completion. */
+  processBytesWithOrigin(readBytes: Uint8Array, rxOrigin?: RxOrigin): ReceivedTextLine[] {
     if (readBytes.length === 0) {
       return [];
     }
+
+    // Clearing an oversized partial buffer does not terminate the logical
+    // line. Its later tail must stay discarded until an actual delimiter;
+    // otherwise a post-write tail could masquerade as a fresh ACK line.
+    if (this.discardingOversizedLine) {
+      const delimiter = readBytes.indexOf(0x0a);
+      if (delimiter === -1) return [];
+      this.discardingOversizedLine = false;
+      readBytes = readBytes.subarray(delimiter + 1);
+      if (readBytes.length === 0) return [];
+    }
+
+    // A partial line from an unknown source stays unknown. A later known chunk
+    // cannot upgrade it to trusted receive-order evidence.
+    if (this.lineBuffer.length === 0) this.lineBufferOrigin = rxOrigin ? { ...rxOrigin } : undefined;
+    else if (!rxOrigin || (this.lineBufferOrigin && (
+      this.lineBufferOrigin.source !== rxOrigin.source || this.lineBufferOrigin.session_id !== rxOrigin.session_id ||
+      this.lineBufferOrigin.epoch !== rxOrigin.epoch
+    ))) this.lineBufferOrigin = undefined;
 
     // 合并新切片至内部缓冲区
     const merged = new Uint8Array(this.lineBuffer.length + readBytes.length);
@@ -242,12 +273,13 @@ export class StreamDemuxer {
     merged.set(readBytes, this.lineBuffer.length);
     this.lineBuffer = merged;
 
-    const lines: string[] = [];
+    const lines: ReceivedTextLine[] = [];
     let newlineIdx = this.lineBuffer.indexOf(0x0a); // '\n'
 
     while (newlineIdx !== -1) {
       if (newlineIdx + 1 > 65_536) {
         this.lineBuffer = this.lineBuffer.subarray(newlineIdx + 1);
+        this.lineBufferOrigin = rxOrigin ? { ...rxOrigin } : undefined;
         this.byteDirtyCount++;
         newlineIdx = this.lineBuffer.indexOf(0x0a);
         continue;
@@ -255,13 +287,21 @@ export class StreamDemuxer {
       // 提取截至 \n 的字节 (..=pos)
       const lineBytes = this.lineBuffer.subarray(0, newlineIdx + 1);
       this.lineBuffer = this.lineBuffer.subarray(newlineIdx + 1);
+      const firstOrigin = this.lineBufferOrigin;
+      this.lineBufferOrigin = rxOrigin ? { ...rxOrigin } : undefined;
 
       try {
         const decoded = this.utf8Decoder.decode(lineBytes);
         // 去除末尾 \r 与 \n
         const trimmed = decoded.replace(/[\r\n]+$/, '');
         if (trimmed.length > 0) {
-          lines.push(trimmed);
+          const sameScope = firstOrigin && rxOrigin &&
+            firstOrigin.source === rxOrigin.source && firstOrigin.session_id === rxOrigin.session_id &&
+            firstOrigin.epoch === rxOrigin.epoch;
+          lines.push({ text: trimmed, ...(sameScope ? { rx_origin: {
+            ...firstOrigin,
+            last_rx_sequence: rxOrigin.last_rx_sequence,
+          } } : {}) });
         }
       } catch {
         // 遇到非 UTF-8 乱码或非法字节，静默丢弃单行并累加 byte_dirty_count
@@ -275,6 +315,8 @@ export class StreamDemuxer {
     if (this.lineBuffer.length > 65_536) {
       this.byteDirtyCount++;
       this.lineBuffer = new Uint8Array(0);
+      this.lineBufferOrigin = undefined;
+      this.discardingOversizedLine = true;
     }
 
     return lines;
@@ -403,6 +445,8 @@ export class StreamDemuxer {
   reset(): void {
     this.teleplotAligner.reset();
     this.lineBuffer = new Uint8Array(0);
+    this.lineBufferOrigin = undefined;
+    this.discardingOversizedLine = false;
     this.demuxErrorCount = 0;
     this.byteDirtyCount = 0;
     this.channelNamesList = ['setpoint', 'actual', 'output'];

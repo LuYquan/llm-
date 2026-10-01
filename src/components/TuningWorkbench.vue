@@ -23,9 +23,10 @@ import { confirmedTrialContextFailure, executionSafetyStopReason, manualCandidat
 import { materializeTuningCommand, validateTuningCommandPayload, type TuningCommandPayload } from '../core/tuning/commandContract';
 import { validateTuningProtocolCapabilities } from '../core/tuning/protocolCapabilities';
 import type { ProtocolConfig } from '../core/protocol/types';
+import type { RxDispatch, RxOrigin } from '../types/ipc';
 
-type LogLine = { id: number; time: string; at?: number; tag: string; level: string; text: string };
-type WriteResult = { id: string; requestId?: string; sessionId?: string; epoch?: number; status: 'queued' | 'written' | 'failed'; at: number; error?: string } | null;
+type LogLine = { id: number; time: string; at?: number; tag: string; level: string; text: string; rx_origin?: RxOrigin };
+type WriteResult = { id: string; requestId?: string; sessionId?: string; epoch?: number; rxDispatch?: RxDispatch; status: 'queued' | 'written' | 'failed'; at: number; error?: string } | null;
 
 const props = defineProps<{
   connected: boolean;
@@ -497,6 +498,7 @@ watch(() => props.writeResult, (result) => {
   if (result.requestId) trial.writeRequestId = result.requestId;
   trial.writeSessionId = result.sessionId;
   trial.writeEpoch = result.epoch;
+  trial.writeRxDispatch = result.rxDispatch;
   if (stopRequested.value) {
     trial.status = 'failed';
     trial.confirmation = `停止后收到驱动回执：${result.status}；设备状态需重新核对。`;
@@ -1110,6 +1112,7 @@ async function sendTrial(trial: TuningTrial, auto = false): Promise<boolean> {
   trial.writeRequestId = undefined;
   trial.writeSessionId = undefined;
   trial.writeEpoch = undefined;
+  trial.writeRxDispatch = undefined;
   trial.writeCompletedAt = undefined;
   trial.writeChannelGeneration = globalChannelStore.getGeneration();
   trial.writeParameterRevisions = Object.fromEntries(activeParameters.value.map(key => [key,
@@ -1172,6 +1175,7 @@ function detectedAcknowledgement(trial: TuningTrial): LogLine | undefined {
     startedAt: trial.writeStartedAt ?? Infinity, protocolRequestId,
     writeStatus: trial.status === 'sent' ? 'written' : 'failed', sessionId: trial.writeSessionId, epoch: trial.writeEpoch,
     currentSessionId: context.sessionId, currentEpoch: context.epoch,
+    rxDispatch: trial.writeRxDispatch,
   }));
 }
 

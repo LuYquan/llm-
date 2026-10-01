@@ -263,16 +263,18 @@ assert.equal(matchesParameterReadback({ kp: 2, ki: 0.5, kd: 0 }, { kp: 2.08, ki:
 assert.equal(matchesParameterReadback({ kp: 2, ki: 0.5, kd: 0 }, { kp: 2.2, ki: 0.5 }, 5, 'PI'), false);
 
 const writeCorrelation = { requestId: 'tx-17', protocolRequestId: 'trial-1', startedAt: 1000, completedAt: 1100, channelGeneration: 4, startRevision: 10, startLogId: 20,
-  writeStatus: 'written' as const, sessionId: 'device-1', epoch: 0, currentSessionId: 'device-1', currentEpoch: 0 };
+  writeStatus: 'written' as const, sessionId: 'device-1', epoch: 0, currentSessionId: 'device-1', currentEpoch: 0,
+  rxDispatch: { source: 'web-serial-read' as const, session_id: 'device-1', epoch: 0, rx_sequence: 10 } };
+const ackOrigin = { source: 'web-serial-read' as const, session_id: 'device-1', epoch: 0, first_rx_sequence: 11, last_rx_sequence: 11 };
 assert.equal(isWriteResultForTrial({ trialId: 'trial-1', requestId: 'tx-17', status: 'written' }, 'trial-1'), true);
 assert.equal(isWriteResultForTrial({ trialId: 'trial-1', requestId: 'tx-16', status: 'written' }, 'trial-1', writeCorrelation.requestId), false, 'a previous request cannot advance the current trial');
 assert.equal(isWriteResultForTrial({ trialId: 'trial-1', status: 'written' }, 'trial-1'), false, 'a result without a request id is not correlated');
 assert.equal(isFreshChannelValue({ value: 2.3, receivedAt: 1100, generation: 4, revision: 11 }, writeCorrelation), true);
 assert.equal(isFreshChannelValue({ value: 2.3, receivedAt: 1099, generation: 4, revision: 11 }, writeCorrelation), true, 'a current readback can precede the frontend receipt callback');
 assert.equal(isFreshChannelValue({ value: 2.3, receivedAt: 1200, generation: 3, revision: 11 }, writeCorrelation), false, 'a value from a cleared/reconnected display generation is stale');
-assert.equal(isAcknowledgementForWrite({ id: 21, tag: '[RX]', level: 'info', text: 'PID_APPLIED trial-1', at: 1110 }, 'PID_APPLIED trial-1', writeCorrelation), true);
-assert.equal(isAcknowledgementForWrite({ id: 19, tag: '[RX]', level: 'info', text: 'PID_APPLIED trial-1', at: 1110 }, 'PID_APPLIED trial-1', writeCorrelation), false);
-assert.equal(isAcknowledgementForWrite({ id: 22, tag: '[RX]', level: 'info', text: 'PID_APPLIED trial-1', at: 1090 }, 'PID_APPLIED trial-1', writeCorrelation), true, 'a unique current ACK can precede the frontend receipt callback');
+assert.equal(isAcknowledgementForWrite({ id: 21, tag: '[RX]', level: 'info', text: 'PID_APPLIED trial-1', at: 1110, rx_origin: ackOrigin }, 'PID_APPLIED trial-1', writeCorrelation), true);
+assert.equal(isAcknowledgementForWrite({ id: 19, tag: '[RX]', level: 'info', text: 'PID_APPLIED trial-1', at: 1110, rx_origin: ackOrigin }, 'PID_APPLIED trial-1', writeCorrelation), false);
+assert.equal(isAcknowledgementForWrite({ id: 22, tag: '[RX]', level: 'info', text: 'PID_APPLIED trial-1', at: 1090, rx_origin: ackOrigin }, 'PID_APPLIED trial-1', writeCorrelation), true, 'a unique current ACK can precede the frontend receipt callback');
 
 const packageValue = packagePlan(plan, '速度环项目套件') as Record<string, any>;
 assert.deepEqual(validateCapabilityPackage(packageValue), []);

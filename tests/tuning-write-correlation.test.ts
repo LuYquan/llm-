@@ -6,11 +6,28 @@ import type { AcknowledgementCorrelation, ParameterReadbackCorrelation } from '.
 
 const identity = { writeStatus: 'written' as const, sessionId: 'device-current', epoch: 3,
   currentSessionId: 'device-current', currentEpoch: 3 };
-const ackContext: AcknowledgementCorrelation = { ...identity, startedAt: 1000, startLogId: 20, protocolRequestId: 'trial-current' };
-const ack = { id: 21, tag: '[RX]', level: 'info', text: 'PID_APPLIED trial-current', at: 1001 };
+const rxDispatch = { source: 'web-serial-read' as const, session_id: 'device-current', epoch: 3, rx_sequence: 8 };
+const origin = { source: 'web-serial-read' as const, session_id: 'device-current', epoch: 3, first_rx_sequence: 9, last_rx_sequence: 9 };
+const ackContext: AcknowledgementCorrelation = { ...identity, startedAt: 1000, startLogId: 20, protocolRequestId: 'trial-current', rxDispatch };
+const ack = { id: 21, tag: '[RX]', level: 'info', text: 'PID_APPLIED trial-current', at: 1001, rx_origin: origin };
 
 assert.equal(isAcknowledgementForWrite(ack, 'PID_APPLIED trial-current', ackContext), true,
   'current unique ACK received before a later frontend receipt callback remains usable once written is known');
+assert.equal(isAcknowledgementForWrite({ ...ack, rx_origin: undefined }, ack.text, ackContext), false, 'unknown receive provenance fails closed');
+assert.equal(isAcknowledgementForWrite(ack, ack.text, { ...ackContext, rxDispatch: undefined }), false, 'queued/legacy receipt cannot invent dispatch provenance');
+assert.equal(isAcknowledgementForWrite({ ...ack, at: 3000, rx_origin: { ...origin, first_rx_sequence: 7, last_rx_sequence: 7 } }, ack.text, ackContext), false,
+  'a delayed same-ID prewrite ACK cannot become current through a new UI timestamp/log ID');
+assert.equal(isAcknowledgementForWrite({ ...ack, rx_origin: { ...origin, first_rx_sequence: 8, last_rx_sequence: 10 } }, ack.text, ackContext), false,
+  'a line starting before dispatch and completed after dispatch is rejected by its first chunk');
+for (const bad of [{ first_rx_sequence: 0 }, { first_rx_sequence: NaN }, { first_rx_sequence: 1.5 }, { last_rx_sequence: 8 },
+  { epoch: 4 }, { session_id: 'device-old' }, { source: 'serial-read' as const }]) {
+  assert.equal(isAcknowledgementForWrite({ ...ack, rx_origin: { ...origin, ...bad } }, ack.text, ackContext), false, 'invalid/cross-context raw identity is rejected');
+}
+for (const bad of [{ rx_sequence: -1 }, { rx_sequence: NaN }, { rx_sequence: 1.5 }, { epoch: 4 }, { session_id: 'device-old' }]) {
+  assert.equal(isAcknowledgementForWrite(ack, ack.text, { ...ackContext, rxDispatch: { ...rxDispatch, ...bad } }), false, 'invalid dispatch provenance is rejected');
+}
+assert.equal(isAcknowledgementForWrite({ ...ack, rx_origin: { ...origin, source: 'serial-read', first_rx_sequence: 1, last_rx_sequence: 2 } }, ack.text,
+  { ...ackContext, rxDispatch: { ...rxDispatch, source: 'serial-read', rx_sequence: 0 } }), true, 'matching native API order has the same contract');
 assert.equal(isAcknowledgementForWrite({ ...ack, id: 20 }, 'PID_APPLIED trial-current', ackContext), false,
   'a matching ACK already present at the dispatch watermark cannot confirm this attempt');
 assert.equal(isAcknowledgementForWrite({ ...ack, at: 999 }, 'PID_APPLIED trial-current', ackContext), false,

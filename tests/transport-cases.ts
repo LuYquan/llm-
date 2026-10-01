@@ -418,6 +418,7 @@ export async function runTransportTests() {
         direction: 'Rx' as const,
         level: 'Info' as const,
         text: 'PID controller init OK',
+        rx_origin: { source: 'serial-read' as const, session_id: 'native-test', epoch: 2, first_rx_sequence: 7, last_rx_sequence: 8 },
       },
     ];
 
@@ -428,6 +429,8 @@ export async function runTransportTests() {
     assert.equal((receivedBatch as ParsedBatch).logLines.length, 1);
     assert.equal((receivedBatch as ParsedBatch).logLines[0].text, 'PID controller init OK');
     assert.equal((receivedBatch as ParsedBatch).logLines[0].t, 1.5);
+    assert.deepEqual((receivedBatch as ParsedBatch).logLines[0].rx_origin, mockLogs[0].rx_origin,
+      'generic native log subscribers retain the actual cross-chunk receive identity');
   });
 
   await test('TauriTransport.handleSerialStatus 正确驱动状态流转', async () => {

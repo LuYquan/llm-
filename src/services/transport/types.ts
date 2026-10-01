@@ -1,5 +1,5 @@
 import type { ChannelFrame, ProtocolConfig } from '../../core/protocol/types';
-import type { WaveformBatch } from '../../types/ipc';
+import type { RxDispatch, RxOrigin, WaveformBatch } from '../../types/ipc';
 
 /**
  * 通用串口传输抽象层接口契约 (PRD 4.1 / Phase 1: TransportAdapter)
@@ -31,6 +31,8 @@ export interface WriteReceipt {
   epoch?: number;
   byte_count: number;
   status: 'queued' | 'written';
+  /** Absent until an actual host write call has occurred. */
+  rx_dispatch?: RxDispatch;
 }
 
 export interface WriteResultEvent {
@@ -42,6 +44,7 @@ export interface WriteResultEvent {
   requested_bytes: number;
   written_bytes: number;
   reason?: string | null;
+  rx_dispatch?: RxDispatch;
 }
 
 export interface SerialSettings {
@@ -78,10 +81,13 @@ export interface TransportCapabilities {
 
 /** 解析后的批量数据（主数据通道） */
 export interface ParsedBatch {
+  /** Original parser context; delayed batches must not receive current identity. */
+  session_id?: string;
+  channel_epoch?: number;
   samples: { channel: string; t: number; v: number }[];
   /** Ordered protocol frames. Equal host arrival timestamps do not identify the same frame. */
   frames?: ChannelFrame[];
-  logLines: { t: number; text: string }[];
+  logLines: { t: number; text: string; rx_origin?: RxOrigin }[];
   droppedBytes?: number;   // 缓冲溢出统计
   protocolErrors?: number; // 本批次新增的协议/文本解析错误，不含历史累计值
 }

@@ -50,6 +50,9 @@ export interface RecordingStatus {
   directory: string | null;
   rxBytes: number;
   rxChunks: number;
+  /** Raw blocks excluded because their identity predates this recording. */
+  rejectedRxBytes?: number;
+  rejectedRxChunks?: number;
   error: string | null;
 }
 
@@ -69,6 +72,8 @@ export interface RecordingSummary {
     endedUnixMs: number | null;
     rxBytes: number;
     rxChunks: number;
+    rejectedRxBytes?: number;
+    rejectedRxChunks?: number;
     unindexedBytes: number;
     segments: { file: string; bytes: number }[];
     error: string | null;
@@ -462,6 +467,7 @@ export function useSerialSession() {
                 direction: 'Rx',
                 level: 'Info',
                 text: l.text,
+                rx_origin: l.rx_origin,
               }))
             );
           }

@@ -282,6 +282,7 @@ impl TextParser {
             level,
             text: text.trim().to_string(),
             raw_hex: None,
+            rx_origin: None,
         }
     }
 

@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>实际 App · ACK 接收因果验收</title></head>
+<body><div id="app"></div><section id="fixture-bar" aria-label="ACK 因果合成夹具">
+  <strong>合成字节设备 · 无硬件 / 无在线 AI</strong>
+  <label>测试分支 <select id="fixture-case"><option value="delayed-prewrite-ack">发送前已解析 ACK，发送后才派发</option><option value="split-prewrite-ack">发送前 ACK 前缀，发送后补完</option><option value="postwrite-early-ack">发送后精准 ACK，written 延迟 1 秒</option></select></label>
+  <button id="prepare-case">准备分支并重载</button><button id="release-ack">放行实际 Worker 缓存 ACK</button><button id="capture-proof">记录实际 App 证据</button>
+  <details><summary>机器证据</summary><output id="fixture-proof" aria-label="ACK 因果夹具机器证据"></output></details>
+</section><script type="module" src="./ack-causality-harness.ts"></script></body></html>

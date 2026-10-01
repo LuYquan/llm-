@@ -31,8 +31,8 @@ const cases: FixtureCase[] = [
   { id: 'ordinary-ready-gate', title: '普通写入未结束：不能确认基线或请求 AI / 启动', expectedWrites: 0, success: false },
   { id: 'ordinary-revision-invalidation', title: '普通命令提交：已就绪基线窗口与保护确认失效', expectedWrites: 0, success: false },
 ];
-type FixtureLog = { id: number; time: string; at: number; tag: string; level: string; text: string };
-type FixtureReceipt = { id: string; requestId: string; sessionId: string; epoch: number; status: 'written' | 'failed'; at: number; error?: string } | null;
+type FixtureLog = { id: number; time: string; at: number; tag: string; level: string; text: string; rx_origin?: import('../../src/types/ipc').RxOrigin };
+type FixtureReceipt = { id: string; requestId: string; sessionId: string; epoch: number; rxDispatch?: import('../../src/types/ipc').RxDispatch; status: 'written' | 'failed'; at: number; error?: string } | null;
 type EventRecord = { at: number; event: string; detail?: unknown };
 type CaseResult = { id: CaseId; title: string; passed: boolean; reason: string; writes: number; aiRequests: number; session: TuningSession | null; events: EventRecord[]; hardwareAcceptance: 'not-run'; nativeAcceptance: 'not-run' };
 
@@ -47,6 +47,7 @@ let component: App | null = null;
 let streamTimer: ReturnType<typeof setInterval> | null = null;
 let frameIndex = 0;
 let serial = 0;
+let syntheticRxSequence = 0;
 let activeRun = 0;
 let timers: ReturnType<typeof setTimeout>[] = [];
 let currentCase: FixtureCase = cases[0];
@@ -74,11 +75,15 @@ function later(callback: () => void, delay: number) {
   timers.push(setTimeout(() => { if (run === activeRun) callback(); }, delay));
 }
 function ingest(bytes: Uint8Array) {
+  // This component fixture has one complete-line synthetic chunk per feed;
+  // it does not exercise actual Web/native dispatch. The 5198 fixture does.
+  const rxSequence = ++syntheticRxSequence;
   const output = parser.feed(bytes, Math.round(frameIndex * 10_000));
   globalChannelStore.pushProtocolOutput(output);
   for (const log of output.logs) {
     const at = Date.now();
-    props.logs.push({ id: ++serial, time: new Date(at).toLocaleTimeString('zh-CN'), at, tag: '[RX]', level: log.level.toLowerCase(), text: log.text });
+    props.logs.push({ id: ++serial, time: new Date(at).toLocaleTimeString('zh-CN'), at, tag: '[RX]', level: log.level.toLowerCase(), text: log.text,
+      rx_origin: { source: 'web-serial-read', session_id: `fixture-session-${activeRun}`, epoch: activeRun, first_rx_sequence: rxSequence, last_rx_sequence: rxSequence } });
     record('parsed-rx-log', { logId: serial, text: log.text });
   }
 }
@@ -98,6 +103,7 @@ function sendReadback(params: { kp: number; ki: number }) {
   record('parameter-ingested', { ...params, kpRevision: globalChannelStore.getChannelRevision('fixture_kp'), kiRevision: globalChannelStore.getChannelRevision('fixture_ki') });
 }
 function syntheticWrite(request: { trialId: string; command: string; payload: TuningCommandPayload }) {
+  const rxDispatch = { source: 'web-serial-read' as const, session_id: `fixture-session-${activeRun}`, epoch: activeRun, rx_sequence: syntheticRxSequence };
   // Pending tuning bytes affect quiescence, but do not revoke the experiment's
   // execution permission or pretend an ordinary command changed its revision.
   props.ordinaryWritesReady = false;
@@ -121,6 +127,7 @@ function syntheticWrite(request: { trialId: string; command: string; payload: Tu
   later(() => {
     const failed = currentCase.id === 'failed-write';
     props.writeResult = { id: request.trialId, requestId: `fixture-driver-${count}`, sessionId: `fixture-session-${activeRun}`, epoch: activeRun,
+      rxDispatch,
       status: failed ? 'failed' : 'written', at: Date.now(), ...(failed ? { error: 'Synthetic driver write failed' } : {}) };
     // A late successful receipt cannot unlock a prior software safety stop.
     props.ordinaryWritesReady = !failed && props.executionEnabled;
@@ -153,7 +160,7 @@ async function prepare(fixture: FixtureCase) {
   if (streamTimer) clearInterval(streamTimer);
   timers.forEach(clearTimeout); timers = [];
   component?.unmount(); component = null;
-  activeRun += 1; frameIndex = 0; serial = 0; currentCase = fixture; events = []; writes = []; responseError = 2;
+  activeRun += 1; frameIndex = 0; serial = 0; syntheticRxSequence = 0; currentCase = fixture; events = []; writes = []; responseError = 2;
   globalChannelStore.clear();
   globalChannelStore.setSessionContext(`fixture-session-${activeRun}`, activeRun);
   globalProjectModel.addLoop({ id: 'fixture-stage', name: '合成 PI 控制环', order: 0, structure: 'PI', plant_family: 'first_order',

@@ -6,6 +6,7 @@
  * These predicates keep the UI state machine conservative. They do not claim
  * that a driver write means the device applied the parameters.
  */
+import type { RxDispatch, RxOrigin } from '../../types/ipc';
 
 export interface WriteCorrelation {
   requestId: string;
@@ -45,7 +46,7 @@ export type ParameterReadbackCorrelation = WrittenConfirmationContext &
   Pick<WriteCorrelation, 'startedAt' | 'channelGeneration'> & { startRevision: number };
 
 export type AcknowledgementCorrelation = WrittenConfirmationContext &
-  Pick<WriteCorrelation, 'startedAt' | 'startLogId'> & { protocolRequestId: string };
+  Pick<WriteCorrelation, 'startedAt' | 'startLogId'> & { protocolRequestId: string; rxDispatch?: RxDispatch };
 
 export interface CorrelatedLogLine {
   id: number;
@@ -53,6 +54,7 @@ export interface CorrelatedLogLine {
   tag?: string;
   level?: string;
   at?: number;
+  rx_origin?: RxOrigin;
 }
 
 /** Only a result carrying a request id can advance a trial out of proposed. */
@@ -96,9 +98,11 @@ export function isFreshChannelValue(
 }
 
 /**
- * Match this attempt's unique protocol id after its RX watermark, and require
- * written receipt/session identity separately. A real ACK may reach the frontend
- * before the driver receipt callback; their arrival order is not device causality.
+ * Match the unique protocol id only when the line's first raw chunk was read
+ * after the actual host write dispatch watermark. Worker/IPC callback time and
+ * log IDs are additional conservative filters, never raw order evidence. An ACK
+ * may precede the written callback. No metadata means no automatic confirmation.
+ * Host API order cannot prove UART/OS-buffer or device-side causality.
  */
 export function isAcknowledgementForWrite(
   log: CorrelatedLogLine,
@@ -107,10 +111,21 @@ export function isAcknowledgementForWrite(
 ): boolean {
   const expected = expectedText.trim();
   const protocolRequestId = correlation.protocolRequestId?.trim();
+  const origin = log.rx_origin;
+  const dispatch = correlation.rxDispatch;
   if (!isWrittenInCurrentSession(correlation) || !protocolRequestId || !expected.includes(protocolRequestId)
     || !Number.isSafeInteger(correlation.startLogId) || correlation.startLogId < 0
     || !Number.isSafeInteger(log.id) || log.id <= correlation.startLogId
     || !Number.isFinite(correlation.startedAt)) return false;
+  if (!origin || !dispatch
+    || !['serial-read', 'web-serial-read'].includes(origin.source)
+    || origin.source !== dispatch.source
+    || origin.session_id !== correlation.sessionId || dispatch.session_id !== correlation.sessionId
+    || origin.epoch !== correlation.epoch || dispatch.epoch !== correlation.epoch
+    || !Number.isSafeInteger(origin.first_rx_sequence) || origin.first_rx_sequence < 1
+    || !Number.isSafeInteger(origin.last_rx_sequence) || origin.last_rx_sequence < origin.first_rx_sequence
+    || !Number.isSafeInteger(dispatch.rx_sequence) || dispatch.rx_sequence < 0
+    || origin.first_rx_sequence <= dispatch.rx_sequence) return false;
   if (log.at !== undefined && (!Number.isFinite(log.at) || log.at < correlation.startedAt)) return false;
   return /RX|接收/i.test(`${log.tag ?? ''} ${log.level ?? ''}`) && log.text.trim() === expected;
 }

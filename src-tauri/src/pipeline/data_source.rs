@@ -1,5 +1,6 @@
 use crate::model::{
-    SerialFlowControl, SerialParity, SerialSettings, WriteRequest, WriteResultEvent, WriteStatus,
+    RawChunk, RxDispatch, RxOrigin, RxSource, SerialFlowControl, SerialParity, SerialSettings,
+    WriteRequest, WriteResultEvent, WriteStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -7,15 +8,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
+
+const SERIAL_READ_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// 统一底层硬件 I/O 抽象 trait (PRD 4.1)
 pub trait DataSource: Send + 'static {
     /// 异步读取一个未解码、未裁剪的原始字节块。
     fn read_chunk(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Option<RawChunk>, String>> + Send + '_>>;
 
     /// 向底层数据源发送字节流 (Step 4.1 & 7.1)
     fn write_bytes(&mut self, _request: WriteRequest) -> Result<(), String> {
@@ -69,13 +72,212 @@ fn write_all_and_flush<W: std::io::Write>(
     (result, written)
 }
 
+/// Serialize the read API boundary with the first write API call. A reader may
+/// hold this lock for the existing 50 ms serial timeout; a waiting writer blocks
+/// new reads from overtaking it. The lock never covers flush or later partial
+/// writes. Bytes still unread in an OS/UART buffer have no physical arrival proof.
+struct SerialIoBoundary {
+    rx_sequence: std::sync::Mutex<u64>,
+    writers_waiting: AtomicU64,
+    writers_idle: std::sync::Condvar,
+    session_id: String,
+    channel_epoch: Arc<AtomicU64>,
+    session_start: Instant,
+}
+
+impl SerialIoBoundary {
+    fn new(session_id: String, channel_epoch: Arc<AtomicU64>, session_start: Instant) -> Self {
+        Self {
+            rx_sequence: std::sync::Mutex::new(0),
+            writers_waiting: AtomicU64::new(0),
+            writers_idle: std::sync::Condvar::new(),
+            session_id,
+            channel_epoch,
+            session_start,
+        }
+    }
+
+    fn read<R: std::io::Read>(
+        &self,
+        reader: &mut R,
+        buffer: &mut [u8],
+    ) -> std::io::Result<Option<RawChunk>> {
+        // The caller checks is_running between reads. Waiting here also gives a
+        // pending emergency write priority after at most one in-flight read.
+        let mut sequence = self.rx_sequence.lock().unwrap_or_else(|e| e.into_inner());
+        while self.writers_waiting.load(Ordering::Acquire) > 0 {
+            sequence = self
+                .writers_idle
+                .wait(sequence)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        let read_epoch = self.channel_epoch.load(Ordering::Acquire);
+        let count = reader.read(buffer)?;
+        if count == 0 {
+            return Ok(None);
+        }
+        *sequence = sequence
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("serial receive sequence exhausted"))?;
+        Ok(Some(RawChunk {
+            session_id: self.session_id.clone(),
+            epoch: read_epoch,
+            rx_sequence: *sequence,
+            received_at_us: self.session_start.elapsed().as_micros() as u64,
+            bytes: buffer[..count].to_vec(),
+        }))
+    }
+
+    fn write_first<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        request: &WriteRequest,
+    ) -> (std::io::Result<usize>, RxDispatch) {
+        self.writers_waiting.fetch_add(1, Ordering::AcqRel);
+        let sequence = self.rx_sequence.lock().unwrap_or_else(|e| e.into_inner());
+        let dispatch = RxDispatch {
+            source: RxSource::SerialRead,
+            session_id: self.session_id.clone(),
+            epoch: self.channel_epoch.load(Ordering::Acquire),
+            rx_sequence: *sequence,
+        };
+        let result = writer.write(&request.bytes);
+        self.writers_waiting.fetch_sub(1, Ordering::AcqRel);
+        drop(sequence);
+        self.writers_idle.notify_all();
+        (result, dispatch)
+    }
+
+    fn write_all_and_flush<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        request: &WriteRequest,
+    ) -> (std::io::Result<()>, usize, RxDispatch) {
+        let (first_result, dispatch) = self.write_first(writer, request);
+        let first_count = match first_result {
+            Ok(0) if !request.bytes.is_empty() => {
+                return (
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "串口写入返回 0 字节",
+                    )),
+                    0,
+                    dispatch,
+                );
+            }
+            Ok(count) => count,
+            Err(error) => return (Err(error), 0, dispatch),
+        };
+        let (result, remaining_count) = write_all_and_flush(writer, &request.bytes[first_count..]);
+        (result, first_count + remaining_count, dispatch)
+    }
+}
+
+pub struct ReceivedTextLine {
+    pub text: String,
+    pub rx_origin: Option<RxOrigin>,
+}
+
+/// One unfinished text line keeps its first chunk identity. Later chunks must
+/// not turn an old prefix into post-dispatch evidence by relabeling the suffix.
+pub struct ReceivedTextDecoder {
+    buffer: Vec<u8>,
+    origin: Option<RxOrigin>,
+    discarding_oversized_line: bool,
+}
+
+impl Default for ReceivedTextDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReceivedTextDecoder {
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::with_capacity(2048),
+            origin: None,
+            discarding_oversized_line: false,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+        self.origin = None;
+        self.discarding_oversized_line = false;
+    }
+
+    pub fn feed(
+        &mut self,
+        chunk: &RawChunk,
+        physical: bool,
+        dirty: &AtomicU64,
+    ) -> Vec<ReceivedTextLine> {
+        let current_origin = physical.then(|| RxOrigin {
+            source: RxSource::SerialRead,
+            session_id: chunk.session_id.clone(),
+            epoch: chunk.epoch,
+            first_rx_sequence: chunk.rx_sequence,
+            last_rx_sequence: chunk.rx_sequence,
+        });
+        if self.origin.as_ref().is_some_and(|previous| {
+            previous.session_id != chunk.session_id || previous.epoch != chunk.epoch
+        }) {
+            self.clear();
+        }
+        let mut lines = Vec::new();
+        for part in chunk.bytes.split_inclusive(|byte| *byte == b'\n') {
+            let complete = part.last() == Some(&b'\n');
+            if self.discarding_oversized_line {
+                if complete {
+                    self.discarding_oversized_line = false;
+                }
+                continue;
+            }
+            if self.buffer.is_empty() {
+                self.origin = current_origin.clone();
+            }
+            if let Some(origin) = self.origin.as_mut() {
+                origin.last_rx_sequence = chunk.rx_sequence;
+            }
+            self.buffer.extend_from_slice(part);
+            if self.buffer.len() > 65_536 {
+                dirty.fetch_add(1, Ordering::Relaxed);
+                self.buffer.clear();
+                self.origin = None;
+                self.discarding_oversized_line = !complete;
+                continue;
+            }
+            if complete {
+                match std::str::from_utf8(&self.buffer) {
+                    Ok(text) => {
+                        let text = text.trim_end_matches(['\r', '\n']);
+                        if !text.is_empty() {
+                            lines.push(ReceivedTextLine {
+                                text: text.to_string(),
+                                rx_origin: self.origin.take(),
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        dirty.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                self.buffer.clear();
+                self.origin = None;
+            }
+        }
+        lines
+    }
+}
+
 /// 物理串口数据源 (Step 2.3 & 2.4)
 pub struct SerialDataSource {
     port_name: String,
     baud_rate: u32,
     is_connected: Arc<AtomicBool>,
     is_running: Arc<AtomicBool>,
-    raw_rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+    raw_rx: tokio::sync::mpsc::Receiver<Result<RawChunk, String>>,
     queue: Arc<(std::sync::Mutex<SerialWriteQueue>, std::sync::Condvar)>,
     result_app: AppHandle,
 }
@@ -126,6 +328,9 @@ impl SerialDataSource {
         baud_rate: u32,
         settings: SerialSettings,
         app: AppHandle,
+        session_id: String,
+        channel_epoch: Arc<AtomicU64>,
+        session_start: Instant,
     ) -> Result<Self, String> {
         settings.validate()?;
         let normalized = crate::serial::normalize_port_name(port_name);
@@ -153,7 +358,7 @@ impl SerialDataSource {
             .parity(parity)
             .stop_bits(stop_bits)
             .flow_control(flow_control)
-            .timeout(Duration::from_millis(50))
+            .timeout(SERIAL_READ_TIMEOUT)
             .open()
             .map_err(|e| {
                 let err_str = e.to_string();
@@ -185,7 +390,8 @@ impl SerialDataSource {
             std::sync::Condvar::new(),
         ));
 
-        let (raw_tx, raw_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(1000);
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::channel::<Result<RawChunk, String>>(1000);
+        let io_boundary = Arc::new(SerialIoBoundary::new(session_id, channel_epoch, session_start));
         let is_running = Arc::new(AtomicBool::new(true));
         let is_connected = Arc::new(AtomicBool::new(true));
         let port_name_cloned = port_name.to_string();
@@ -198,6 +404,7 @@ impl SerialDataSource {
         let port_name_write = port_name.to_string();
         let queue_write = queue.clone();
         let app_write = app.clone();
+        let io_boundary_write = io_boundary.clone();
 
         std::thread::Builder::new()
             .name(format!("serial-writer-{}", port_name))
@@ -230,9 +437,9 @@ impl SerialDataSource {
                             SerialWriteTask::Emergency(request)
                             | SerialWriteTask::Normal(request) => request,
                         };
-                        let bytes = request.bytes.clone();
-                        let (write_result, written) = write_all_and_flush(&mut write_port, &bytes);
-                        let result = match write_result {
+                        let (write_result, written, dispatch) =
+                            io_boundary_write.write_all_and_flush(&mut write_port, &request);
+                        let mut result = match write_result {
                             Ok(()) => WriteResultEvent::for_request(
                                 &request,
                                 WriteStatus::Written,
@@ -249,6 +456,7 @@ impl SerialDataSource {
                                 )
                             }
                         };
+                        result.rx_dispatch = Some(dispatch);
                         let _ = app_write.emit("serial://write-result", result);
                     }
                 }
@@ -261,13 +469,13 @@ impl SerialDataSource {
                 let mut port = port;
                 let mut read_buf = [0u8; 1024];
                 while is_running_thread.load(Ordering::Relaxed) {
-                    match port.read(&mut read_buf) {
-                        Ok(0) => {
+                    match io_boundary.read(&mut port, &mut read_buf) {
+                        Ok(None) => {
                             std::thread::sleep(Duration::from_millis(2));
                         }
-                        Ok(n) => {
+                        Ok(Some(chunk)) => {
                             // 先完整交付驱动读到的字节；文本分行在管线解析副本上进行。
-                            if raw_tx.blocking_send(Ok(read_buf[..n].to_vec())).is_err() {
+                            if raw_tx.blocking_send(Ok(chunk)).is_err() {
                                 return;
                             }
                         }
@@ -321,7 +529,7 @@ impl SerialDataSource {
 impl DataSource for SerialDataSource {
     fn read_chunk(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<RawChunk>, String>> + Send + '_>> {
         Box::pin(async move {
             if !self.is_connected.load(Ordering::Relaxed)
                 || !self.is_running.load(Ordering::Relaxed)
@@ -329,7 +537,7 @@ impl DataSource for SerialDataSource {
                 return Ok(None);
             }
             match self.raw_rx.recv().await {
-                Some(Ok(bytes)) => Ok(Some(bytes)),
+                Some(Ok(chunk)) => Ok(Some(chunk)),
                 Some(Err(e)) => Err(e),
                 None => Ok(None),
             }
@@ -422,6 +630,10 @@ pub enum MockFormat {
 /// 3. 支持混入偶发日志 (如 `[INFO] System Boot OK\n`, `[WARN] Battery Low\n`)；
 /// 4. 支持触发 $10 \to 20$ 阶跃与调参响应。
 pub struct MockDataSource {
+    session_id: String,
+    channel_epoch: Arc<AtomicU64>,
+    session_start: Instant,
+    rx_sequence: u64,
     dt: f64,
     t: f64,
     step_index: u64,
@@ -447,6 +659,10 @@ pub struct MockDataSource {
 impl MockDataSource {
     pub fn new() -> Self {
         Self {
+            session_id: String::new(),
+            channel_epoch: Arc::new(AtomicU64::new(0)),
+            session_start: Instant::now(),
+            rx_sequence: 0,
             dt: 0.01, // 100Hz => 10ms
             t: 0.0,
             step_index: 0,
@@ -465,6 +681,17 @@ impl MockDataSource {
             zeta: 0.35,   // 欠阻尼，典型阶跃超调 ~25%-30%
             is_active: true,
         }
+    }
+
+    pub fn set_read_context(
+        &mut self,
+        session_id: String,
+        epoch: Arc<AtomicU64>,
+        session_start: Instant,
+    ) {
+        self.session_id = session_id;
+        self.channel_epoch = epoch;
+        self.session_start = session_start;
     }
 
     /// 从指定仿真时刻开始初始化 (用于暂停后继续仿真避免时间跳跃)
@@ -620,7 +847,7 @@ impl Default for MockDataSource {
 impl DataSource for MockDataSource {
     fn read_chunk(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, String>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<RawChunk>, String>> + Send + '_>> {
         Box::pin(async move {
             if !self.is_active {
                 return Ok(None);
@@ -649,7 +876,16 @@ impl DataSource for MockDataSource {
                 }
             }
 
-            Ok(self.pending_lines.pop_front().map(String::into_bytes))
+            Ok(self.pending_lines.pop_front().map(|line| {
+                self.rx_sequence = self.rx_sequence.saturating_add(1);
+                RawChunk {
+                    session_id: self.session_id.clone(),
+                    epoch: self.channel_epoch.load(Ordering::Acquire),
+                    rx_sequence: self.rx_sequence,
+                    received_at_us: self.session_start.elapsed().as_micros() as u64,
+                    bytes: line.into_bytes(),
+                }
+            }))
         })
     }
 
@@ -729,6 +965,257 @@ impl DataSource for MockDataSource {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn receive_chunk(sequence: u64, epoch: u64, bytes: &[u8]) -> RawChunk {
+        RawChunk {
+            session_id: "receive-test".into(),
+            epoch,
+            rx_sequence: sequence,
+            received_at_us: sequence * 1_000,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn write_request(bytes: &[u8]) -> WriteRequest {
+        WriteRequest {
+            request_id: "receive-test-tx-1".into(),
+            session_id: "receive-test".into(),
+            epoch: 1,
+            source: "test".into(),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn receive_text_keeps_first_chunk_sequence_and_context() {
+        let dirty = AtomicU64::new(0);
+        let mut decoder = ReceivedTextDecoder::new();
+        assert!(decoder
+            .feed(&receive_chunk(11, 3, b"PID_AP"), true, &dirty)
+            .is_empty());
+        let lines = decoder.feed(
+            &receive_chunk(14, 3, b"PLIED request\r\nsecond\n"),
+            true,
+            &dirty,
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "PID_APPLIED request");
+        assert_eq!(
+            lines[0].rx_origin,
+            Some(RxOrigin {
+                source: RxSource::SerialRead,
+                session_id: "receive-test".into(),
+                epoch: 3,
+                first_rx_sequence: 11,
+                last_rx_sequence: 14
+            })
+        );
+        assert_eq!(lines[1].rx_origin.as_ref().unwrap().first_rx_sequence, 14);
+        assert_eq!(dirty.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn receive_text_does_not_upgrade_old_epoch_or_reset_prefix() {
+        let dirty = AtomicU64::new(0);
+        let mut decoder = ReceivedTextDecoder::new();
+        decoder.feed(&receive_chunk(1, 1, b"OLD_"), true, &dirty);
+        let lines = decoder.feed(&receive_chunk(2, 2, b"PID_APPLIED new\n"), true, &dirty);
+        assert_eq!(lines[0].text, "PID_APPLIED new");
+        assert_eq!(lines[0].rx_origin.as_ref().unwrap().epoch, 2);
+        assert_eq!(lines[0].rx_origin.as_ref().unwrap().first_rx_sequence, 2);
+        decoder.feed(&receive_chunk(3, 2, b"OLD_"), true, &dirty);
+        decoder.clear();
+        let lines = decoder.feed(
+            &receive_chunk(4, 2, b"PID_APPLIED after-reset\n"),
+            true,
+            &dirty,
+        );
+        assert_eq!(lines[0].text, "PID_APPLIED after-reset");
+        assert_eq!(lines[0].rx_origin.as_ref().unwrap().first_rx_sequence, 4);
+        let simulated = decoder.feed(
+            &receive_chunk(5, 2, b"PID_APPLIED simulated\n"),
+            false,
+            &dirty,
+        );
+        assert!(
+            simulated[0].rx_origin.is_none(),
+            "mock output is not real read-boundary evidence"
+        );
+    }
+
+    #[test]
+    fn receive_text_overflow_cannot_reclassify_a_tail_as_fresh_ack() {
+        let dirty = AtomicU64::new(0);
+        let mut decoder = ReceivedTextDecoder::new();
+        assert!(decoder
+            .feed(&receive_chunk(1, 1, &vec![b'X'; 65_537]), true, &dirty)
+            .is_empty());
+        let lines = decoder.feed(
+            &receive_chunk(2, 1, b"PID_APPLIED old-tail\nPID_APPLIED new\n"),
+            true,
+            &dirty,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "PID_APPLIED new");
+        assert_eq!(lines[0].rx_origin.as_ref().unwrap().first_rx_sequence, 2);
+        assert_eq!(dirty.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn serial_read_boundary_orders_backlogged_rx_before_first_write() {
+        use std::sync::{mpsc, Mutex};
+        struct ControlledReader {
+            trace: Arc<Mutex<Vec<&'static str>>>,
+            ready: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            calls: usize,
+        }
+        impl std::io::Read for ControlledReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                self.trace
+                    .lock()
+                    .unwrap()
+                    .push(if self.calls == 1 { "read-1" } else { "read-2" });
+                self.ready.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(2)).unwrap();
+                buffer[..4].copy_from_slice(b"ACK\n");
+                Ok(4)
+            }
+        }
+        struct TraceWriter(Arc<Mutex<Vec<&'static str>>>);
+        impl Write for TraceWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().push("write");
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // Production reads already have this 50 ms timeout. The added boundary
+        // can wait for one in-flight read, not repeatedly let new reads overtake
+        // a waiting writer. Scheduling/driver stalls are not a latency guarantee.
+        assert_eq!(SERIAL_READ_TIMEOUT, Duration::from_millis(50));
+        let epoch = Arc::new(AtomicU64::new(1));
+        let boundary = Arc::new(SerialIoBoundary::new(
+            "receive-test".into(),
+            epoch.clone(),
+            Instant::now(),
+        ));
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (chunks_tx, chunks_rx) = mpsc::channel();
+        let reader_boundary = boundary.clone();
+        let reader_trace = trace.clone();
+        let reader_thread = std::thread::spawn(move || {
+            let mut reader = ControlledReader {
+                trace: reader_trace,
+                ready: ready_tx,
+                release: release_rx,
+                calls: 0,
+            };
+            let mut buffer = [0u8; 16];
+            for _ in 0..2 {
+                chunks_tx
+                    .send(
+                        reader_boundary
+                            .read(&mut reader, &mut buffer)
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        epoch.store(2, Ordering::Release);
+        let writer_boundary = boundary.clone();
+        let writer_trace = trace.clone();
+        let writer_thread = std::thread::spawn(move || {
+            writer_boundary
+                .write_all_and_flush(&mut TraceWriter(writer_trace), &write_request(b"PID\n"))
+        });
+        let pending_deadline = Instant::now() + Duration::from_secs(2);
+        while boundary.writers_waiting.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < pending_deadline);
+            std::thread::yield_now();
+        }
+        release_tx.send(()).unwrap();
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        release_tx.send(()).unwrap();
+        let (result, written, dispatch) = writer_thread.join().unwrap();
+        result.unwrap();
+        reader_thread.join().unwrap();
+        // Deliberately consume the raw queue only after the write has finished.
+        let old = chunks_rx.recv().unwrap();
+        let fresh = chunks_rx.recv().unwrap();
+        assert_eq!((old.rx_sequence, old.epoch), (1, 1));
+        assert_eq!((fresh.rx_sequence, fresh.epoch), (2, 2));
+        assert_eq!((dispatch.rx_sequence, dispatch.epoch), (1, 2));
+        assert_eq!(written, 4);
+        assert_eq!(*trace.lock().unwrap(), vec!["read-1", "write", "read-2"]);
+    }
+
+    #[test]
+    fn serial_dispatch_releases_boundary_before_partial_write_and_flush() {
+        struct ReentrantWriter<'a> {
+            boundary: &'a SerialIoBoundary,
+            calls: usize,
+        }
+        impl Write for ReentrantWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    assert!(self.boundary.rx_sequence.try_lock().is_err());
+                } else {
+                    assert!(self.boundary.rx_sequence.try_lock().is_ok());
+                }
+                Ok(bytes.len().min(2))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                assert!(self.boundary.rx_sequence.try_lock().is_ok());
+                assert_eq!(self.boundary.writers_waiting.load(Ordering::Acquire), 0);
+                Ok(())
+            }
+        }
+        let boundary = SerialIoBoundary::new(
+            "receive-test".into(),
+            Arc::new(AtomicU64::new(1)),
+            Instant::now(),
+        );
+        let (result, written, dispatch) = boundary.write_all_and_flush(
+            &mut ReentrantWriter {
+                boundary: &boundary,
+                calls: 0,
+            },
+            &write_request(b"PID-VALUES\n"),
+        );
+        result.unwrap();
+        assert_eq!(written, 11);
+        assert_eq!(dispatch.rx_sequence, 0);
+    }
+
+    #[test]
+    fn serial_dispatch_preserves_partial_failure_identity() {
+        let boundary = SerialIoBoundary::new(
+            "receive-test".into(),
+            Arc::new(AtomicU64::new(4)),
+            Instant::now(),
+        );
+        let mut writer = PartialWriter {
+            output: Vec::new(),
+            max_chunk: 2,
+            fail_after: Some(3),
+        };
+        let (result, written, dispatch) =
+            boundary.write_all_and_flush(&mut writer, &write_request(b"ABCDE"));
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(written, 3);
+        assert_eq!((dispatch.epoch, dispatch.rx_sequence), (4, 0));
+        assert_eq!(boundary.writers_waiting.load(Ordering::Acquire), 0);
+        assert!(boundary.rx_sequence.try_lock().is_ok());
+    }
 
     struct PartialWriter {
         output: Vec<u8>,

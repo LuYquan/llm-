@@ -18,6 +18,9 @@ await runStreamDemuxerTests();
 const { runWebSerialTests } = await import('./webserial.test.ts');
 await runWebSerialTests();
 
+const { runWebReceiveOrderTests } = await import('./web-receive-order.test.ts');
+await runWebReceiveOrderTests();
+
 const { runBrowserRecordingTests } = await import('./browser-recording.test.ts');
 await runBrowserRecordingTests();
 

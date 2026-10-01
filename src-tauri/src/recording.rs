@@ -29,6 +29,12 @@ pub struct RecordingStatus {
     pub directory: Option<String>,
     pub rx_bytes: u64,
     pub rx_chunks: u64,
+    /// Raw blocks outside this recording's fixed session/epoch are excluded,
+    /// counted separately, and never relabeled as accepted RX evidence.
+    #[serde(default)]
+    pub rejected_rx_bytes: u64,
+    #[serde(default)]
+    pub rejected_rx_chunks: u64,
     pub error: Option<String>,
 }
 
@@ -56,6 +62,10 @@ pub struct RecordingManifest {
     pub ended_unix_ms: Option<u128>,
     pub rx_bytes: u64,
     pub rx_chunks: u64,
+    #[serde(default)]
+    pub rejected_rx_bytes: u64,
+    #[serde(default)]
+    pub rejected_rx_chunks: u64,
     #[serde(default)]
     pub unindexed_bytes: u64,
     pub segments: Vec<RecordingSegment>,
@@ -208,6 +218,8 @@ impl RecordingService {
             ended_unix_ms: None,
             rx_bytes: 0,
             rx_chunks: 0,
+            rejected_rx_bytes: 0,
+            rejected_rx_chunks: 0,
             unindexed_bytes: 0,
             segments: Vec::new(),
             error: None,
@@ -248,6 +260,8 @@ impl RecordingService {
             directory: Some(directory.to_string_lossy().to_string()),
             rx_bytes: 0,
             rx_chunks: 0,
+            rejected_rx_bytes: 0,
+            rejected_rx_chunks: 0,
             error: None,
         };
         let mut state = self
@@ -904,6 +918,8 @@ impl RecordingWriter {
             state.status.directory = Some(self.directory.to_string_lossy().to_string());
             state.status.rx_bytes = self.manifest.rx_bytes;
             state.status.rx_chunks = self.manifest.rx_chunks;
+            state.status.rejected_rx_bytes = self.manifest.rejected_rx_bytes;
+            state.status.rejected_rx_chunks = self.manifest.rejected_rx_chunks;
             state.status.error = self
                 .manifest
                 .error
@@ -918,6 +934,34 @@ impl RecordingWriter {
     }
 
     fn write_chunk(&mut self, chunk: &RawChunk) -> Result<(), String> {
+        // The manifest and replay format describe one immutable session/epoch.
+        // A paused reader may deliver already-stamped old chunks after a new
+        // recording starts. Reject them at the writer boundary, before either
+        // raw bytes or index rows are written; never relabel them as current.
+        if chunk.session_id != self.manifest.session_id || chunk.epoch != self.manifest.epoch {
+            self.manifest.rejected_rx_bytes = self
+                .manifest
+                .rejected_rx_bytes
+                .saturating_add(chunk.bytes.len() as u64);
+            self.manifest.rejected_rx_chunks = self.manifest.rejected_rx_chunks.saturating_add(1);
+            if self.manifest.rejected_rx_chunks == 1 {
+                let message = serde_json::json!({
+                    "recordingSessionId": self.manifest.session_id,
+                    "recordingEpoch": self.manifest.epoch,
+                    "receivedSessionId": chunk.session_id,
+                    "receivedEpoch": chunk.epoch,
+                    "rxSequence": chunk.rx_sequence,
+                    "reason": "raw chunk outside the fixed recording session/epoch; bytes excluded, identity unchanged; rejected totals are recorded in the manifest"
+                }).to_string();
+                self.write_event("rx_chunk_rejected_boundary", Some(&message))?;
+            }
+            self.update_shared_status();
+            self.chunks_since_manifest = self.chunks_since_manifest.saturating_add(1);
+            if self.chunks_since_manifest >= MANIFEST_UPDATE_CHUNKS {
+                self.flush_and_update_manifest()?;
+            }
+            return Ok(());
+        }
         if self.segment_bytes > 0
             && self.segment_bytes.saturating_add(chunk.bytes.len() as u64) > SEGMENT_LIMIT_BYTES
         {
@@ -979,6 +1023,8 @@ impl RecordingWriter {
         if let Ok(mut state) = self.shared_state.lock() {
             state.status.rx_bytes = self.manifest.rx_bytes;
             state.status.rx_chunks = self.manifest.rx_chunks;
+            state.status.rejected_rx_bytes = self.manifest.rejected_rx_bytes;
+            state.status.rejected_rx_chunks = self.manifest.rejected_rx_chunks;
         }
     }
 
@@ -1148,6 +1194,168 @@ static TEST_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 mod tests {
     use super::*;
 
+    fn boundary_fixture_root(name: &str) -> PathBuf {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let parent = workspace.join("output/ack-causality-20261001/recording-fixtures");
+        fs::create_dir_all(&parent).unwrap();
+        let directory = parent.join(format!(
+            "{name}-{}-{}-{}",
+            std::process::id(),
+            unix_ms(),
+            TEST_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Each fixture is newly created and retained for inspection. No runtime
+        // data is opened and no previous fixture or recording is overwritten.
+        fs::create_dir(&directory).unwrap();
+        directory
+    }
+
+    fn boundary_chunk(session: &str, epoch: u64, sequence: u64, bytes: &[u8]) -> RawChunk {
+        RawChunk {
+            session_id: session.into(),
+            epoch,
+            rx_sequence: sequence,
+            received_at_us: sequence * 1_000,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn recording_boundary_excludes_queued_old_epoch_and_foreign_session() {
+        let root = boundary_fixture_root("queued-old-epoch");
+        let service = RecordingService::with_root_dir(root.clone());
+        // These immutable chunks were already read while acquisition was paused.
+        // Recording starts only after the protocol moved to the next epoch.
+        let old_epoch = boundary_chunk("boundary-test", 7, 41, b"old-epoch\n");
+        let foreign_session = boundary_chunk("previous-session", 8, 42, b"old-session\n");
+        let fresh_one = boundary_chunk("boundary-test", 8, 43, b"10,20,30\n");
+        let fresh_two = boundary_chunk("boundary-test", 8, 44, &[0x00, 0xff, 0x80]);
+        service
+            .start("boundary-test".into(), 8, RecordingMetadata::default())
+            .unwrap();
+        for chunk in [&old_epoch, &foreign_session, &fresh_one, &fresh_two] {
+            service.write_chunk(chunk.clone());
+        }
+        // The event reply is a queue barrier, proving all preceding chunks have
+        // reached the real writer before inspecting its live status.
+        assert!(service
+            .append_event("fixture_queue_drained".into(), None)
+            .unwrap());
+        let live = service.status().unwrap();
+        assert!(live.is_recording);
+        assert!(live.error.is_none());
+        assert_eq!(live.rx_chunks, 2);
+        assert_eq!(live.rejected_rx_chunks, 2);
+        let excluded_bytes = (old_epoch.bytes.len() + foreign_session.bytes.len()) as u64;
+        assert_eq!(live.rejected_rx_bytes, excluded_bytes);
+        let stopped = service.stop().unwrap();
+        assert_eq!(stopped.rejected_rx_chunks, 2);
+        assert_eq!(stopped.rejected_rx_bytes, excluded_bytes);
+        let summaries = service.list().unwrap();
+        let summary = &summaries[0];
+        assert_eq!(summary.manifest.status, "complete");
+        assert_eq!(summary.manifest.epoch, 8);
+        assert_eq!(summary.manifest.rejected_rx_chunks, 2);
+        assert_eq!(summary.manifest.rejected_rx_bytes, excluded_bytes);
+        assert_eq!(summary.manifest.unindexed_bytes, 0);
+        assert_eq!(
+            summary.manifest.rx_bytes,
+            (fresh_one.bytes.len() + fresh_two.bytes.len()) as u64
+        );
+        let directory = Path::new(&summary.directory);
+        let expected_bytes = [fresh_one.bytes.clone(), fresh_two.bytes.clone()].concat();
+        assert_eq!(
+            fs::read(directory.join("rx-000000.bin")).unwrap(),
+            expected_bytes
+        );
+        let indices: Vec<ChunkIndexOwned> = fs::read_to_string(directory.join("chunks.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(indices.len(), 2);
+        assert!(indices
+            .iter()
+            .all(|index| index.session_id == "boundary-test" && index.epoch == 8));
+        assert_eq!((indices[0].rx_sequence, indices[1].rx_sequence), (43, 44));
+        assert!(fs::read_to_string(directory.join("events.jsonl"))
+            .unwrap()
+            .contains("rx_chunk_rejected_boundary"));
+        let page = service
+            .read_page("boundary-test", &summary.directory, None, Some(1024))
+            .unwrap();
+        assert!(page.eof);
+        assert_eq!(page.epoch, 8);
+        assert_eq!(page.chunks.len(), 2);
+        assert_eq!(page.chunks[0].bytes, fresh_one.bytes);
+        assert_eq!(page.chunks[1].bytes, fresh_two.bytes);
+        assert_eq!(page.chunks[0].rx_sequence, 43);
+        assert!(
+            page.sequence_gap,
+            "excluded history must not renumber accepted raw chunks"
+        );
+        assert_eq!((old_epoch.epoch, old_epoch.rx_sequence), (7, 41));
+        let status_json = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(status_json["rejectedRxChunks"], 2);
+        assert_eq!(status_json["rejectedRxBytes"], excluded_bytes);
+        let mut legacy_manifest = serde_json::to_value(&summary.manifest).unwrap();
+        legacy_manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("rejectedRxChunks");
+        legacy_manifest
+            .as_object_mut()
+            .unwrap()
+            .remove("rejectedRxBytes");
+        let legacy: RecordingManifest = serde_json::from_value(legacy_manifest).unwrap();
+        assert_eq!(
+            (legacy.rejected_rx_chunks, legacy.rejected_rx_bytes),
+            (0, 0)
+        );
+        println!("isolated recording fixture: {}", directory.display());
+    }
+
+    #[test]
+    fn recording_boundary_keeps_chunks_matching_recording_even_if_parser_epoch_changed() {
+        let root = boundary_fixture_root("matching-recording-epoch");
+        let service = RecordingService::with_root_dir(root);
+        service
+            .start("boundary-test".into(), 7, RecordingMetadata::default())
+            .unwrap();
+        let parser_epoch_after_switch = 8;
+        let matching_recording = boundary_chunk("boundary-test", 7, 9, b"recording-epoch-seven\n");
+        assert_ne!(matching_recording.epoch, parser_epoch_after_switch);
+        // The pipeline offers raw evidence to the recorder before independently
+        // deciding whether its current parser may interpret that epoch.
+        service.write_chunk(matching_recording.clone());
+        service.write_chunk(boundary_chunk(
+            "boundary-test",
+            8,
+            10,
+            b"parser-epoch-eight\n",
+        ));
+        let stopped = service.stop().unwrap();
+        assert_eq!(stopped.rx_chunks, 1);
+        assert_eq!(stopped.rx_bytes, matching_recording.bytes.len() as u64);
+        assert_eq!(stopped.rejected_rx_chunks, 1);
+        let summaries = service.list().unwrap();
+        let summary = &summaries[0];
+        assert_eq!(summary.manifest.status, "complete");
+        assert_eq!(summary.manifest.epoch, 7);
+        let page = service
+            .read_page("boundary-test", &summary.directory, None, Some(1024))
+            .unwrap();
+        assert_eq!(page.epoch, 7);
+        assert_eq!(page.chunks.len(), 1);
+        assert_eq!(page.chunks[0].bytes, matching_recording.bytes);
+        assert_eq!(page.chunks[0].rx_sequence, 9);
+        assert_eq!(
+            fs::read(Path::new(&summary.directory).join("rx-000000.bin")).unwrap(),
+            matching_recording.bytes
+        );
+        println!("isolated recording fixture: {}", summary.directory);
+    }
+
     #[test]
     fn records_exact_bytes_with_chunk_index_and_manifest() {
         let root = std::env::temp_dir().join(format!(
@@ -1172,6 +1380,8 @@ mod tests {
             ended_unix_ms: None,
             rx_bytes: 0,
             rx_chunks: 0,
+            rejected_rx_bytes: 0,
+            rejected_rx_chunks: 0,
             unindexed_bytes: 0,
             segments: vec![],
             error: None,
@@ -1245,6 +1455,8 @@ mod tests {
             ended_unix_ms: None,
             rx_bytes: 0,
             rx_chunks: 0,
+            rejected_rx_bytes: 0,
+            rejected_rx_chunks: 0,
             unindexed_bytes: 0,
             segments: vec![],
             error: None,

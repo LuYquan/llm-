@@ -13,7 +13,7 @@
 | **03** | `03_csv_and_log_mixed.raw` | `03_csv_and_log_mixed.expected.json` | CSV 与日志混合 | 数值波形行与 `[INFO]` / `[WARN]` / `[ERROR]` 前缀日志、普通英文逗号非数值文本交错分流 |
 | **04** | `04_chunk_boundary_half_line.raw` | `04_chunk_boundary_half_line.expected.json` | 半行截断（跨 chunk 拼接） | 模拟 UART 底层按任意字节片到达（见 `.chunks.json`），在逗号、前缀、键名处截断时的跨帧无损拼接 |
 | **05** | `05_invalid_utf8_and_corrupt.raw` | `05_invalid_utf8_and_corrupt.expected.json` | 非法 UTF-8 与异常字符 | 非法 UTF-8 字节（`0xFF 0xFE...`）、破损 CSV（`10.0,??#$%,30.0`）、非法 Teleplot（缺少冒号）、NaN/Inf 数值防护、尾随逗号容错 |
-| **06** | `06_overlong_line_protection.raw` (`.chunks.json`) | `06_overlong_line_protection.expected.json` | 超长行防护 | 文本解析累积超过 64 KiB 后清空解析副本并计数，原始字节独立保留，后续正常行可恢复 |
+| **06** | `06_overlong_line_protection.raw` (`.chunks.json`) | `06_overlong_line_protection.expected.json` | 超长行防护 | 文本解析累积超过 64 KiB 后清空解析副本并计数，继续丢弃该行至真实换行；原始字节独立保留，下一独立正常行可恢复 |
 | **07** | `07_line_endings_mixed.raw` | `07_line_endings_mixed.expected.json` | 换行符混用 | Windows `\r\n` (CRLF) 与 Linux `\n` (LF) 混用，尾随 `\r` 彻底剥离，不污染字段与日志内容 |
 
 ---

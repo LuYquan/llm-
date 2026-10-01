@@ -633,6 +633,7 @@ mod tests {
             level: LogLevel::Info,
             text: "Line 1".to_string(),
             raw_hex: None,
+            rx_origin: None,
         });
         lrb.push(LogLine {
             timestamp_us: 2000,
@@ -640,6 +641,7 @@ mod tests {
             level: LogLevel::Warn,
             text: "Line 2".to_string(),
             raw_hex: None,
+            rx_origin: None,
         });
         lrb.push(LogLine {
             timestamp_us: 3000,
@@ -647,6 +649,7 @@ mod tests {
             level: LogLevel::Info,
             text: "Line 3".to_string(),
             raw_hex: None,
+            rx_origin: None,
         });
 
         assert_eq!(lrb.len(), 3);
@@ -659,6 +662,7 @@ mod tests {
             level: LogLevel::Error,
             text: "Line 4".to_string(),
             raw_hex: None,
+            rx_origin: None,
         });
 
         assert_eq!(lrb.len(), 3);

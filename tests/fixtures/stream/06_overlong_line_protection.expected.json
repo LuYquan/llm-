@@ -8,13 +8,13 @@
       "step": 0,
       "name": "注入 65537 字节无换行连续流 (模拟异常输入)",
       "input_length": 65537,
-      "expected_action": "buffer_overflow_cleared",
+      "expected_action": "buffer_overflow_discard_until_newline",
       "byte_dirty_increment": 1
     },
     {
       "step": 1,
-      "name": "注入正常 CSV 行 (10.0,20.0,30.0\n)",
-      "input": "10.0,20.0,30.0\n",
+      "name": "先结束超长垃圾行，再注入独立 CSV 行 (\n10.0,20.0,30.0\n)",
+      "input": "\n10.0,20.0,30.0\n",
       "expected_action": "parsed_as_sample",
       "expected_values": [10.0, 20.0, 30.0]
     }

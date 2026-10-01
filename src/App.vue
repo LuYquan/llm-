@@ -41,7 +41,7 @@ import {
 import { RecordingReplayController } from './services/recording/replay-controller';
 import type { SerialSettings, Unsubscribe, WriteReceipt, WriteResultEvent } from './services/transport/types';
 import type { ProtocolConfig } from './core/protocol/types';
-import type { StepSnapshot } from './types/ipc';
+import type { RxDispatch, RxOrigin, StepSnapshot } from './types/ipc';
 import {
   buildWorkspaceDocument,
   previewWorkspaceDocument,
@@ -84,6 +84,7 @@ const tuningWriteResult = ref<{
   requestId?: string;
   sessionId?: string;
   epoch?: number;
+  rxDispatch?: RxDispatch;
   status: 'queued' | 'written' | 'failed';
   at: number;
   error?: string;
@@ -286,7 +287,7 @@ function formatTime(d: Date): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${ms}`;
 }
 
-function appendLog(level: 'info' | 'warn' | 'error', tag: string, text: string) {
+function appendLog(level: 'info' | 'warn' | 'error', tag: string, text: string, rxOrigin?: RxOrigin) {
   const at = Date.now();
   logs.value.push({
     id: ++logIdCounter,
@@ -295,6 +296,7 @@ function appendLog(level: 'info' | 'warn' | 'error', tag: string, text: string) 
     tag,
     level,
     text,
+    rx_origin: rxOrigin,
   });
   if (logs.value.length > 1500) {
     logs.value.shift();
@@ -348,6 +350,7 @@ function rememberWriteResult(result: WriteResultEvent) {
       ...tuningWriteResult.value,
       sessionId: result.session_id,
       epoch: result.epoch,
+      rxDispatch: result.rx_dispatch,
       status: result.status === 'written' ? 'written' : 'failed',
       error: result.status === 'written' ? undefined : result.reason || `写入状态：${result.status}`,
       at: Date.now(),
@@ -681,7 +684,11 @@ async function checkStatus() {
       const recording = await session.getRecordingStatus();
       if (recording) {
         const previousRecordingError = recordingStatus.value.error;
+        const previousRejectedChunks = recordingStatus.value.rejectedRxChunks ?? 0;
         recordingStatus.value = recording;
+        if ((recording.rejectedRxChunks ?? 0) > previousRejectedChunks) {
+          appendLog('warn', '[RECORD]', `本次记录已排除 ${recording.rejectedRxChunks} 块会话或协议代次不匹配的积压数据（${recording.rejectedRxBytes ?? 0} 字节）；这些字节没有重贴到当前记录。`);
+        }
         if (recording.error && recording.error !== previousRecordingError) {
           appendLog('error', '[RECORD]', `原始记录状态异常: ${recording.error}`);
         }
@@ -1162,8 +1169,9 @@ async function handleTuningSend(request: { trialId: string; command: string; pay
     tuningWriteResult.value = {
       id: request.trialId,
       requestId: result.request_id,
-      sessionId: result.session_id,
-      epoch: result.epoch,
+      sessionId: completed?.session_id ?? result.session_id,
+      epoch: completed?.epoch ?? result.epoch,
+      rxDispatch: completed?.rx_dispatch ?? result.rx_dispatch,
       status,
       at: Date.now(),
       error: completed && completed.status !== 'written'
@@ -1443,7 +1451,7 @@ async function handleProtocolChange(protocol: ProtocolConfig) {
     activeDockDrawer.value = null;
     return true;
   } catch (err: any) {
-    appendLog('error', '[PROTOCOL]', `协议应用失败，当前配置保持不变: ${err?.message || err}`);
+    appendLog('error', '[PROTOCOL]', `协议应用未获确认；请重新应用协议或重连后再发送：${err?.message || err}`);
     return false;
   } finally {
     isApplyingProtocol.value = false;
@@ -1498,7 +1506,7 @@ onMounted(async () => {
       const text = line.raw_hex && line.text.startsWith('RawData RX:')
         ? `${line.text} · ${line.raw_hex}`
         : line.text;
-      appendLog(level, tag, text);
+      appendLog(level, tag, text, line.rx_origin);
     }
   });
 

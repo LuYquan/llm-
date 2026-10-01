@@ -3,6 +3,7 @@ import type { PidStructure, PlantModel } from '../control/types';
 import type { TuningScenarioContext } from './scenarios';
 import type { CascadeDependencySnapshot } from './cascadeDependencies';
 import type { TuningCommandFormat, TuningCommandPayload } from './commandContract';
+import type { RxDispatch } from '../../types/ipc';
 
 export type TuningRoute = 'model' | 'feedback';
 export type TuningMode = 'manual' | 'bounded-auto';
@@ -131,6 +132,8 @@ export interface TuningTrial {
   protocolRequestId?: string;
   writeSessionId?: string;
   writeEpoch?: number;
+  /** Actual driver dispatch watermark, never the queued/enqueue boundary. */
+  writeRxDispatch?: RxDispatch;
   writeStartedAt?: number;
   writeCompletedAt?: number;
   writeChannelGeneration?: number;
