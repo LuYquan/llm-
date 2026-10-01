@@ -1,228 +1,186 @@
-# 《LLM串口》下位机对接与通信协议指南 (Firmware Integration Guide)
+# 下位机接入与场景反馈指南
 
-> **适用固件平台**：STM32、ESP32、Arduino、RP2040、TI C2000、GD32 等各类嵌入式 MCU / DSP  
-> **适用版本**：v0.1.0+
+核对日期：2026-10-01。适用于当前 `0.1.1-beta.1` 的实时串口路径。本文依据源码说明字节格式与配置步骤；没有实测吞吐、特定 MCU 兼容性、设备参数生效或硬件停机验收。各平台仍需核对 UART、电平、驱动、固件和设备保护。
 
----
+## 先接收数据，再配置控制
 
-## 1. 通信协议概述
+1. 先确认设备端口、波特率、数据位、校验位和停止位。在「连接」抽屉选择解析协议，点击「应用到实时解析」。选中协议卡片只改变草稿。
+2. 首次接入先观察原始收发和解析统计。收到字节而有效样本为 0，可能是协议、数值类型、帧长或换行不符，不能直接判定设备没有发送。
+3. 核对每个通道的列顺序、含义、数值范围与单位，再添加波形或数值控件。接收协议不会声明单位，也不会推断数值代表角度、转速或 PWM。
+4. 打开「AI 辅助 → 场景调参」，选择场景、当前环和路线。模型计算可离线使用；AI 反馈需要当前连接的真实遥测及已核对的设备基线。
 
-《LLM串口》采用**统一自适应流分流引擎 (Stream Demuxer)**。在单一物理串口连接下，下位机既可以高频上报用于绘制曲线的数值数据，也可以直接输出用于调试的纯文本日志（如 `printf`），上位机将自动识别并分别送入波形画布和日志控制台。
+协议应用会清空旧解析残留和实时曲线。设备写入命令另行配置；选择解析协议、导入场景套组或计算候选都不会自动建立安全的固件控制协议。
 
-### 1.1 核心通信规则
-1. **帧结束符**：每一行数据必须以换行符 `\n` (`0x0A`) 结尾（亦兼容 `\r\n`，系统会自动剔除 `\r`）；
-2. **字符编码**：建议采用标准 **UTF-8** 编码；
-3. **文本最大长度**：文本解析单行最多累积 65,536 字节（64 KiB），超出会丢弃该解析行并计数；已接收原始字节不因文本解析限制而改写；
-4. **推荐频率与通道数**：
-   - 推荐数据发送频率：**20Hz ~ 200Hz**（常规 PID 调试建议 50Hz 或 100Hz）；
-   - 最大测试稳定吞吐：**1000Hz (单行 3 通道 @ 115200/921600)**；
-   - 推荐通道数：**1 ~ 8 个通道**。
+## 实时接收路径
 
----
+| 配置 | Tauri 桌面端 | Web Serial 路径 | 通道身份 |
+| --- | --- | --- | --- |
+| FireWater | Rust `StreamDemuxer` 逐行分流 | Worker `StreamDemuxer`；Worker 不可用时使用本地回退路径 | CSV 按列；Teleplot 按报文变量名 |
+| JustFloat | Rust `BinaryProtocolParser` | Worker / 本地 `ProtocolEngine` 的 `JustFloatParser` | `ch0`、`ch1`… |
 
-## 2. 上行数据流格式规范 (MCU -> 上位机)
+界面的协议配置经 `session.configureProtocol` 传入桌面端 `set_protocol_config` 或 Web Worker `CONFIGURE`。Web 还要求运行环境支持 Web Serial 并授予端口访问权。这里的两端源码接线不等于已经验收所有浏览器、操作系统或硬件平台。
 
-上位机支持两种上报数据格式：**CSV 纯数值格式** 与 **Teleplot 键值格式**。
+### FireWater：UTF-8 文本遥测与日志
 
-### 2.1 格式一：CSV 纯数值格式（推荐，带宽占用最低）
+每条文本以 LF (`0A`) 结束，支持 CRLF (`0D 0A`)。数值使用英文小数点；支持有限整数、小数、负数与科学计数法。空字段、尾随逗号、`NaN`、`Infinity` 都不是有效的实时 CSV 数值帧。文本解析单行上限为 65,536 字节，异常行会被丢弃并计数；原始接收与记录另有独立路径。
 
-每行发送一组逗号分隔的浮点数或整数，末尾加 `\n`。
+**CSV 按列接入。** 例如以下报文仅为解析夹具，不是设备目标值或安全控制参数：
 
-#### 语法规则
 ```text
-数值1,数值2,数值3,... \n
-```
-- 各字段间使用英文逗号 `,` 分隔；
-- 字段内容必须为有效数字（支持负数、小数、科学计数法，如 `-12.5`、`1.02e-2`）；
-- 严禁包含空字段（如 `1.0,,3.0`）或尾随逗号（如 `1.0,2.0,`）；
-- 若没有显式指定通道名，上位机将默认依次命名为 `ch0, ch1, ch2...`。
-
-#### 自定义通道表头（可选）
-下位机可以在上电初始化完成时，通过发送以 `#` 开头的行来显式声明通道名称：
-```text
-#target,actual,output\n
-```
-上位机收到该行后，会自动将后续的 CSV 列分别命名为 `target`、`actual`、`output`。
-
-#### 数据示例
-```text
-#target,actual,output
-100.0,0.0,0.0
-100.0,15.2,85.0
-100.0,45.8,70.5
-100.0,88.1,30.2
-100.0,105.3,10.0
+1.0,2.0,3.0\n
 ```
 
----
+当前实时 FireWater 的前三列 ID 固定为 `setpoint`、`actual`、`output`；更多列扩为 `ch3`、`ch4`…。这些默认 ID 不证明固件真的按“目标、反馈、输出”发送。请自行记录列顺序，按实际物理量绑定。实时 CSV 路由需要英文逗号；单变量上报可用下方 Teleplot。
 
-### 2.2 格式二：Teleplot 键值对格式（语义清晰，异步多变量）
+`#target,actual,output` **是日志，不是通道表头**。当前实时分流器不会用它重命名后续 CSV。不要依靠这行声明变量名。
 
-每个变量独立为一行，以大于号 `>` 开头，变量名与数值间用英文冒号 `:` 分隔。
+**Teleplot 显式命名。** 每行使用 `>name:value`：
 
-#### 语法规则
 ```text
->变量名:数值\n
-```
-- `变量名`：英文字母、数字或下划线组合；
-- `数值`：有效的数字字符串。
-
-#### 多变量时序对齐机制
-下位机在同一控制周期内可以先后发送多个 Teleplot 行：
-```text
->target:100.0
->actual:85.4
->pwm:60.0
-```
-上位机内部具有 10ms 时间对齐窗口，会自动将同一个控制周期内连续收到的不同变量打包合并为一个时间采样点。
-
----
-
-### 2.3 格式三：调试文本日志 (与波形自动分流)
-
-任何**非纯数值 CSV**且**不以 `>` 开头**的文本行，都会被自动识别为系统日志并送入【日志抽屉】：
-```text
-[INFO] System initialized successfully.
-Motor driver ready, supply voltage: 24.1V
-Current Mode: SPEED_CONTROL
-[WARN] Temperature is rising: 58.2 C
+>target:1.0\n
+>actual:2.0\n
+>output:3.0\n
 ```
 
-> **注意**：如果普通文本日志中含有逗号（如 `Boot completed, 4 sensors found`），只要第一个逗号前的单词不是纯数字，系统均能智能识别为文本日志，不会引发波形解析报错。
+它们注册为 `target`、`actual`、`output`。建议使用简短、稳定的变量 ID，并在设备接入表中另记物理含义和单位。名称本身不能完成单位换算。
 
----
+Teleplot 的默认 10 ms 窗口使用主机接收时间聚合不同变量；再次收到已有变量名或相邻接收间隔超出窗口时，输出前一组，显式刷新也可输出末组。缺失变量保留缺失状态。这个窗口不识别固件控制周期，也不证明多变量在设备上同步采样。初次接入宜选择 CSV 或 Teleplot 中的一种数值布局，避免在同一会话混用两套数值列身份；普通日志可以与文本遥测共用串口。
 
-## 3. 下行参数写入与控制协议 (上位机 -> MCU)
+明确日志前缀包括 `[INFO]`、`[WARN]`、`[ERROR]`、`#`、`//` 和 `INFO:` 等。例如：
 
-当在上位机执行“AI 核准下发”、“滑块调参”或“动作按键”时，上位机将通过串口向 MCU 发送控制指令。
-
-### 3.1 默认 PID 参数写入模板
-AI 调参面板默认采用如下 ASCII 文本格式下发参数：
 ```text
-PID,{loop},{kp},{ki},{kd}\n
+[INFO] Sensor initialized.\n
+[WARN] Measurement out of range.\n
 ```
-**实际发送报文示例**：
+
+普通文字也可进入日志；以数字开头而包含损坏字段的 CSV 会作为解析错误丢弃。不要把缺少换行或被识别为坏数值帧的报文当成可靠的应答日志。
+
+### JustFloat：小端 float32 帧
+
+在「连接」中选择 JustFloat，核对通道数并应用。留空表示按尾标记识别通道数；已知固定布局时应填写实际通道数，范围为 1–64。
+
+每帧是 N 个 **IEEE-754 float32 小端** 数值，紧跟固定尾标记 `00 00 80 7F`。没有文本换行，不携带变量名、单位、固件时间戳或请求 ID。
+
+三个解析夹具值 `1.0, 2.0, 3.0` 的完整字节为：
+
 ```text
-PID,speed,1.250,0.080,0.320\n
+00 00 80 3F  00 00 00 40  00 00 40 40  00 00 80 7F
+|    ch0   | |    ch1   | |    ch2   | |    tail   |
 ```
-- `{loop}`：当前被调回路名称（如 `speed`、`position`、`angle`）；
-- `{kp}`、`{ki}`、`{kd}`：经过 SafetyGuard 安全限幅校验后的浮点数字符串（默认保留 3 位小数）。
 
-### 3.2 自定义指令模板与占位符
-在【设置】或【控件配置】中，用户可以自由修改下发模板以适配自身现有固件协议。支持以下占位符：
+固件应保证浮点格式与字节序相符，不能直接假定任意 CPU 的 `float` 内存布局都适用。完整帧可被串口读取拆成多个 chunk，也可与后续帧一起读取；当前解析保留帧顺序，同一 chunk 中的多帧可能有相同的主机时间戳。有限数值、完整负载和尾标记均需核对；非有限值或残缺数据不会变成有效遥测。
 
-| 占位符 | 说明 | 示例 |
-|---|---|---|
-| `{val}` | 单一数值（用于滑块或输入框） | `SET:SPEED={val}\n` $\to$ `SET:SPEED=120.5\n` |
-| `{loop}` | 目标回路名称 | `CMD:{loop}:KP={kp}\n` |
-| `{kp}` | 比例增益 $K_p$ | `1.250` |
-| `{ki}` | 积分增益 $K_i$ | `0.080` |
-| `{kd}` | 微分增益 $K_d$ | `0.320` |
+**不要直接把 ASCII 日志或 `PID_APPLIED ...` 插入 JustFloat 字节流。** 当前这条实时路径使用二进制解析器，没有额外的文本日志分流通道；插入文本可能破坏负载。文本 ACK 使用已核对的 FireWater 文本路径；JustFloat 的参数确认可用同一二进制布局中的参数回读通道，或逐轮人工核对。
 
-### 3.3 HEX 十六进制协议
-对于按键与滑块控件，亦支持配置为十六进制 HEX 编码：
-- 配置示例：`AA 01 {val} 55`
-- 上位机自动将 `{val}` 按照选定的二进制格式（如 `u16le`、`f32le`）转换为 HEX 字节串后下发。
+RawData 与 CustomFrame 也可在连接面板配置。RawData 默认仅显示原始字节；数值解码和自定义帧需要实际数值类型、通道数、帧头/尾及校验信息。这两条实时路径也不提供文本 ACK 分流。不能把一个 JustFloat 示例套用到任意工业帧。
 
----
+### 时间、通道名和单位
 
-## 4. 下位机参考代码示例
+实时时间轴来自主机接收时刻的相对时间：桌面端使用管线计时，Web 使用主机性能计时。它不是 MCU 的采样时钟；传输缓冲、批量读取和调度会影响时间间隔。固件采样周期必须单独提供，不能仅由主机曲线推断。
 
-### 4.1 STM32 HAL 库极简接入示例 (DMA 发送)
+接入时至少记录下表，由用户或固件负责人填写：
+
+| 解析 ID / 列号 | 实际变量 | 原始数值单位 | 显示换算 | 在当前环的角色 |
+| --- | --- | --- | --- | --- |
+| 按实际接收填写 | 例如某传感器原始量 | 由固件定义 | 未使用时明确写无 | 目标 / 反馈 / 输出 / 参数回读 / 其他 |
+
+右侧通道显示别名不改变固件报文。当前调参和日志摘要选择仍显示原始通道 ID；按接入表辨认变量。调参执行要求当前连接中精确的真实通道 ID（canonical ID），不接受显示别名或尚未出现的通道。目标、反馈、输出以及当前确认/基线模式使用的活动参数回读必须各有独立的真实通道；重复绑定被拒绝，不能用多个别名绕过。
+
+数值控件的单位、通道显示缩放/偏置与调参计划单位也需要分别核对。调参不会自动换算目标与反馈单位；显示缩放不能证明原始缓冲已经换算。不要把换算后的单位直接套给未换算的原始数值。
+
+## 从离线模型到真实反馈
+
+无设备时打开「AI 辅助 → 场景调参」，选择套组和「物理模型计算」。提供场景物理数据或 s 域传递函数、方向、采样周期与频域目标，核对模型后可计算候选。不要为完成表单编造设备值；计划中的采样周期仍需在实机执行前与固件核对。此阶段无需设备通道或 AI 服务，但候选属于未下发、未实机验证的模型计算结果。
+
+转入实际设备反馈前，需要在当前环配置：
+
+- 不同的目标、反馈与控制输出通道，目标与反馈相同的实际数值单位，以及可接受的遥测延迟。
+- 固件当前参数、参数公式/单位、有效边界和控制方向。核对 PID 是连续/离散、并联/增量式、积分与微分是否已包含采样周期、滤波和抗饱和；软件不会自动把一种固件公式转换成另一种。
+- 当前环的写入命令、设备确认方式、观察窗口、目标、输出上限及有限轮数。
+- 设备实际支持的停止命令和独立保护。演示源不能验证设备控制。
+
+场景「AI 自动反馈」与「日志解读」使用同一 AI 服务设置，模型/地址/凭据需由用户配置。请求前审阅外发范围；调参发送当前计划与有界遥测评价，日志解读发送所选日志、协议和所选通道统计。统计摘要不能替代原始波形，也不能自行补出未知单位。
+
+## 下行命令：两套模板分别配置
+
+当前场景计划的参数命令初始为空，没有通用默认 PID 写命令。下列只是**需要固件实现后才可使用的协议形式示例**，不是可直接授权执行的设备模板：
+
+```text
+PID,{request_id},{id},{kp},{ki},{kd}
+```
+
+场景模板支持：
+
+| 占位符 | 当前含义 |
+| --- | --- |
+| `{id}` | 当前控制环 ID，不是显示标题或串口 ID |
+| `{order}` | 当前环的零起始顺序；若没有项目环则取场景阶段顺序 |
+| `{kp}`、`{ki}`、`{kd}` | 本地校验后的候选数值，按 JavaScript 数值字符串输出，不固定为三位小数 |
+| `{request_id}` | 发送前创建的本轮协议请求 ID，由固件原样回传以关联应答 |
+
+`{loop}` 不是当前场景渲染器支持的占位符。固件应容纳实际 ID 与数值精度，并完整校验字段、数值范围、环身份和设备运行状态后再决定是否应用。不要使用忽略尾随内容或缺少范围检查的简略 `sscanf` 例子直接控制执行器。
+
+场景参数发送使用用户所选的文本格式：是否解析转义，以及行尾 `none` / `LF` / `CR` / `CRLF`。未显式设置的既有草稿默认继承“解析转义 + CRLF”。自动行尾不会再次追加到已有 CR/LF 结尾的命令。候选应审阅可见转义、UTF-8 最终 HEX 字节和字节数；下发使用同一份已审核 payload，不能在驱动侧再按另一种格式编码。应以固件接收规则选择格式，不能把可见 `\n` 与字面反斜杠混淆。
+
+**控件数值模板是另一套配置。** 数值控件主要使用 `{val}` / `{value}`；文本格式还支持相应 printf 数值格式。HEX 控件按用户选择的 `hex_val_format` 注入字节，例如 `AA 01 {val} 55` 搭配 `u16le`；该选择不能自动决定设备协议或安全范围。不要把控件 `{val}` 模板放入场景参数模板，也不要假定控件支持场景的 `{request_id}`。
+
+普通终端文本使用 UTF-8，HEX 按指定字节发送，HEX 不追加文本编码或换行。控件、终端和场景命令都受本地发送与停止状态约束；模板格式通过不表示设备已执行。
+
+## 写入、确认、评价与停止
+
+这三个阶段分别保留证据：驱动写入完成、设备参数已确认、本轮遥测评价完成。仅排队、收到通用 `OK` 或看到旧值，都不能跳过确认。
+
+**带 ID 的文本 ACK。** 文本 ACK 仅适用于 FireWater。若选择设备应答模式，参数命令与成功应答模板都必须包含 `{request_id}`。例如固件已经实现上述示例命令时，可配置：
+
+```text
+PID_APPLIED {request_id}
+```
+
+固件仅在核对并实际应用成功后，发送带收到的原始协议 ID 的 RX 文本行，并带 LF/CRLF。派发命令前，助手冻结已接收日志 ID 的水位；ACK 必须是该水位之后的新 RX 日志，去除首尾空白后的完整行必须与成功应答模板展开后的文本完全相等。额外前后文本、否定应答或相似的较长 ID 都不匹配。确认还独立要求本轮驱动 `written` 回执及相同的 session/epoch，进入确认时核对通道 generation。旧 ID、派发前日志或只有通用 `OK` 不作为这轮自动确认。传输层 `writeRequestId` 在驱动侧用于关联写入回执，与命令中的 `protocolRequestId` 不同，固件无需猜测驱动 ID。
+
+**参数通道回读。** 为当前结构的活动参数绑定独立的真实回读通道，设置容差和超时。派发前冻结各通道的 ingestion revision 水位；接收值的序号必须严格大于该水位、属于同一 generation，并满足派发起点后的接收时效检查。确认还独立要求本轮驱动 `written` 完成证据及相同的 session/epoch，再按容差比较候选。已入库旧值即使订阅回调延后到达，也不能凭“新回调”通过。重新连接、协议切换和数据陈旧会使旧证据不可用。
+
+ACK 或一次性参数回读可能先进入前端，驱动 `written` 回执随后才到达。只要新接收证据越过本轮派发水位、身份匹配，并最终获得有效 `written` 证据，这种顺序可以确认；固件不必为了等待上位机回执而重复发送。两种回调的主机时间戳和到达先后不能证明设备因果顺序。固件仍应在实际应用之后回传实际参数；回读只证明数值相符，不证明物理响应达标。JustFloat、RawData 和 CustomFrame 不使用文本 ACK；需要自动确认时应配置可解析的参数通道回读。
+
+**人工核对。** 缺少可关联 ACK 或回读时，可以逐轮人工核对；有界自动迭代不能使用人工确认模式。确认超时或无法判定设备生效时，应保留未知状态并先核对设备，不能自动假定成功后继续试参。
+
+软件停止锁定普通发送、清除待发队列，并可排队已配置的设备停止命令；已经进入驱动写入的命令不能因此撤回。停止命令仍需固件支持及实际接收，软件显示停止不能证明执行器停机。通信超时、输出限幅、急停和恢复策略需在设备端按实际对象设计，不使用本指南中的固定默认时间或安全 PID。
+
+若在参数命令已经派发、设备确认尚未完成时停止，本轮写入可能已到达设备。助手撤销当前参数确认、保守稳定基线确认及本次设备评价依据，旧参数和历史窗口只能参考。恢复操作前须重新核对设备当前值；停止后的迟到回执不能自动恢复当前态或继续下发。
+
+## 固件发送示例与带宽核算
+
+以下函数只示范编码。`uart_tx_enqueue_copy` 必须由设备工程实现为复制数据的有界发送队列；失败时由调用方处理，不能保留栈缓冲地址异步发送。格式化和排队放在适合的任务中，不以此示例承诺中断实时性。
 
 ```c
-#include "main.h"
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <string.h>
+#include <math.h>
 
-extern UART_HandleTypeDef huart1;
-static char tx_buffer[128];
+extern bool uart_tx_enqueue_copy(const uint8_t *data, size_t length);
 
-/**
- * @brief 在控制定时器中断中周期调用 (例如 10ms / 100Hz)
- */
-void Report_PID_Data(float target, float actual, float output) {
-    // 采用极简 CSV 格式上报
-    int len = snprintf(tx_buffer, sizeof(tx_buffer), "%.2f,%.2f,%.2f\n", target, actual, output);
-    if (len > 0) {
-        // 使用 DMA 或中断非阻塞发送，避免阻塞控制闭环
-        HAL_UART_Transmit_DMA(&huart1, (uint8_t *)tx_buffer, len);
-    }
+bool report_csv(float v0, float v1, float v2) {
+    if (!isfinite(v0) || !isfinite(v1) || !isfinite(v2)) return false;
+    char line[128];
+    int n = snprintf(line, sizeof(line), "%.9g,%.9g,%.9g\n",
+                     (double)v0, (double)v1, (double)v2);
+    if (n <= 0 || (size_t)n >= sizeof(line)) return false;
+    return uart_tx_enqueue_copy((const uint8_t *)line, (size_t)n);
 }
 ```
 
-### 4.2 STM32 下位机参数解析与接收示例 (`sscanf` 极简版)
+需命名时按相同原则发送 `>name:value\n`；需 JustFloat 时显式编码每个 IEEE-754 float32 为小端四字节，再追加四字节尾标记，不在二进制帧中插入上述文本。
 
-```c
-/**
- * @brief 串口接收到以 '\n' 结尾的一行指令后调用
- */
-void Process_Command(char *cmd_line) {
-    char loop_name[16];
-    float kp = 0.0f, ki = 0.0f, kd = 0.0f;
+带宽按实际串口设置计算。例如 8N1 的每个数据字节占 10 bit，理论载荷上限约为波特率 / 10 字节每秒；再计算“完整帧字节数 × 上报频率”，预留缓冲与其他报文余量。这个计算不是实测稳定吞吐。当前没有本指南所列设备的 1000 Hz、长期采集或拔插吞吐验收；请选择可解释的起始上报频率并实际观察原始字节、有效帧、错误和丢弃统计。
 
-    // 解析格式：PID,{loop},{kp},{ki},{kd}
-    if (sscanf(cmd_line, "PID,%15[^,],%f,%f,%f", loop_name, &kp, &ki, &kd) == 4) {
-        if (strcmp(loop_name, "speed") == 0) {
-            Set_Speed_PID(kp, ki, kd);
-            printf("[INFO] Speed PID Updated: Kp=%.3f, Ki=%.3f, Kd=%.3f\n", kp, ki, kd);
-        } else if (strcmp(loop_name, "position") == 0) {
-            Set_Position_PID(kp, ki, kd);
-        }
-    } 
-    // 急停指令处理
-    else if (strcmp(cmd_line, "ESTOP") == 0) {
-        Emergency_Shutdown_Motors();
-        printf("[WARN] EMERGENCY STOP EXECUTED!\n");
-    }
-}
-```
+## 可核对的源码依据
 
-### 4.3 Arduino / ESP32 示例代码
+- 实时文本解析与通道身份：[Rust demuxer](../src-tauri/src/pipeline/demuxer.rs)、[Web demuxer](../src/services/transport/worker/stream-demuxer.ts)。
+- 协议应用与实时接收：[App](../src/App.vue)、[session](../src/services/transport/session.ts)、[Tauri transport](../src/services/transport/tauri-transport.ts)、[Web transport](../src/services/transport/web-serial-transport.ts)、[Rust pipeline](../src-tauri/src/pipeline/mod.rs)。
+- 二进制字节解析：[Rust protocol](../src-tauri/src/protocol.rs)、[JustFloatParser](../src/core/protocol/JustFloatParser.ts)。
+- 当前环模板、确认与本地校验：[TuningWorkbench](../src/components/TuningWorkbench.vue)、[tuning engine](../src/core/tuning/engine.ts)、[字节契约](../src/core/tuning/commandContract.ts)、[协议与真实通道检查](../src/core/tuning/protocolCapabilities.ts)、[write correlation](../src/core/tuning/write-correlation.ts)。
+- 控件与最终编码：[控件模板](../src/core/widget/templateEngine.ts)、[命令编码器](../src/services/transport/command-encoder.ts)。
 
-```cpp
-void setup() {
-    Serial.begin(115200);
-    // 上电声明通道名称
-    Serial.println("#target,actual,output");
-}
-
-void loop() {
-    static unsigned long last_time = 0;
-    if (millis() - last_time >= 10) { // 100Hz
-        last_time = millis();
-
-        float target = 100.0;
-        float actual = Read_Sensor();
-        float output = Calculate_PID(target, actual);
-
-        // 输出波形数据
-        Serial.print(target, 2);
-        Serial.print(",");
-        Serial.print(actual, 2);
-        Serial.print(",");
-        Serial.println(output, 2);
-    }
-
-    // 接收上位机调参指令
-    if (Serial.available()) {
-        String line = Serial.readStringUntil('\n');
-        line.trim();
-        if (line.startsWith("SET:SPD=")) {
-            float val = line.substring(8).toFloat();
-            Set_Target_Speed(val);
-        }
-    }
-}
-```
-
----
-
-## 5. 通信优化与避坑建议
-
-1. **避免在中断中执行阻塞式 `printf`**：
-   在 115200 波特率下，每秒最多传输约 11,520 字节。若单行数据长 40 字节，在 1kHz 频率下发送将产生 40,000 字节/秒，导致串口缓冲区溢出并阻塞 MCU。建议调高波特率至 460800 或 921600，或者使用 DMA 循环发送。
-2. **浮点数格式化精度**：
-   `printf` 时建议使用 `%.2f` 或 `%.3f`，既能保证控制精度，又能显著削减字符长度。
-3. **下位机安全看门狗**：
-   工业和机器人应用中，下位机应当配备通信超时保护机制：若连续 500ms 未收到上位机心跳或数据，建议下位机主动降速或关闭电机，防范意外断线。
+操作流程及各层验收边界另见[场景 AI 实施方案](SCENARIO_AI_IMPLEMENTATION_2026-09-30.md)与[串级依赖及反馈窗口](SCENARIO_CASCADE_2026-10-01.md)。本文更新仅纠正文档和接入步骤，未改变协议源码，也未新增原生、硬件或在线 AI 验收证据。

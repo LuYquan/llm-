@@ -9,6 +9,9 @@ import '../tests/scenario-cascade-model.test.ts';
 import '../tests/tuning-confirmed-context.test.ts';
 import '../tests/tuning-feedback-evidence.test.ts';
 import '../tests/tuning-alignment.test.ts';
+import '../tests/tuning-command-contract.test.ts';
+import '../tests/tuning-protocol-capabilities.test.ts';
+import '../tests/tuning-write-correlation.test.ts';
 import {
   parseEscapeSequences,
   encodeNumberToHex,

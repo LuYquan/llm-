@@ -14,6 +14,7 @@
     "release": "node scripts/build-portable.mjs --release",
     "test:widget": "node --experimental-strip-types --import ./tests/register-ts-loader.mjs ./scripts/test-widget-core.mjs",
     "test:tuning": "node --experimental-strip-types --import ./tests/register-ts-loader.mjs ./tests/tuning-engine.test.ts",
+    "test:write-queue": "node --experimental-strip-types --import ./tests/register-ts-loader.mjs ./tests/write-quiescence.test.ts",
     "test:transport": "node --experimental-strip-types --import ./tests/register-ts-loader.mjs ./tests/transport.test.ts",
     "test:evidence": "node --test tests/dependency-inventory.test.mjs tests/rust-advisory-audit.test.mjs",
     "check:dependencies": "node scripts/dependency-inventory.mjs",

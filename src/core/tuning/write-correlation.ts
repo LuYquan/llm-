@@ -27,9 +27,25 @@ export interface CorrelatedWriteResult {
 
 export interface CorrelatedChannelValue {
   receivedAt: number;
+  /** Canonical channel ingestion revision, captured before subscriber dispatch. */
+  revision: number;
   generation: number;
   value: number;
 }
+
+export interface WrittenConfirmationContext {
+  writeStatus: CorrelatedWriteResult['status'];
+  sessionId?: string;
+  epoch?: number;
+  currentSessionId: string | null;
+  currentEpoch: number | null;
+}
+
+export type ParameterReadbackCorrelation = WrittenConfirmationContext &
+  Pick<WriteCorrelation, 'startedAt' | 'channelGeneration'> & { startRevision: number };
+
+export type AcknowledgementCorrelation = WrittenConfirmationContext &
+  Pick<WriteCorrelation, 'startedAt' | 'startLogId'> & { protocolRequestId: string };
 
 export interface CorrelatedLogLine {
   id: number;
@@ -51,32 +67,50 @@ export function isWriteResultForTrial(
   return !expectedRequestId || requestId === expectedRequestId;
 }
 
-/** A parameter channel is fresh only in the same display generation and after the write. */
+function isWrittenInCurrentSession(context: WrittenConfirmationContext): boolean {
+  return context.writeStatus === 'written'
+    && typeof context.sessionId === 'string' && context.sessionId.trim().length > 0
+    && context.sessionId === context.currentSessionId
+    && Number.isSafeInteger(context.epoch) && context.epoch! >= 0
+    && context.epoch === context.currentEpoch;
+}
+
+/**
+ * Require a new ingested value after the dispatch watermark, plus an independently
+ * confirmed driver write. Subscriber callback order and millisecond timestamps do
+ * not establish whether a sample preceded this write attempt.
+ */
 export function isFreshChannelValue(
   value: CorrelatedChannelValue | undefined,
-  correlation: Pick<WriteCorrelation, 'channelGeneration' | 'completedAt'>,
+  correlation: ParameterReadbackCorrelation,
 ): boolean {
   return Boolean(
-    value &&
+    value && isWrittenInCurrentSession(correlation) &&
       value.generation === correlation.channelGeneration &&
+    Number.isSafeInteger(correlation.startRevision) && correlation.startRevision >= 0 &&
+    Number.isSafeInteger(value.revision) && value.revision > correlation.startRevision &&
+    Number.isFinite(correlation.startedAt) &&
       Number.isFinite(value.receivedAt) &&
-      correlation.completedAt !== undefined &&
-      value.receivedAt >= correlation.completedAt,
+    value.receivedAt >= correlation.startedAt,
   );
 }
 
 /**
- * A text acknowledgement is only considered after this attempt's write marker.
- * The transport cannot prove device-level causality for a generic text token;
- * callers should keep a manual confirmation option available.
+ * Match this attempt's unique protocol id after its RX watermark, and require
+ * written receipt/session identity separately. A real ACK may reach the frontend
+ * before the driver receipt callback; their arrival order is not device causality.
  */
 export function isAcknowledgementForWrite(
   log: CorrelatedLogLine,
   expectedText: string,
-  correlation: Pick<WriteCorrelation, 'startLogId' | 'completedAt'>,
+  correlation: AcknowledgementCorrelation,
 ): boolean {
   const expected = expectedText.trim();
-  if (!expected || log.id <= correlation.startLogId) return false;
-  if (log.at !== undefined && correlation.completedAt !== undefined && log.at < correlation.completedAt) return false;
-  return /RX|接收/i.test(`${log.tag ?? ''} ${log.level ?? ''}`) && log.text.includes(expected);
+  const protocolRequestId = correlation.protocolRequestId?.trim();
+  if (!isWrittenInCurrentSession(correlation) || !protocolRequestId || !expected.includes(protocolRequestId)
+    || !Number.isSafeInteger(correlation.startLogId) || correlation.startLogId < 0
+    || !Number.isSafeInteger(log.id) || log.id <= correlation.startLogId
+    || !Number.isFinite(correlation.startedAt)) return false;
+  if (log.at !== undefined && (!Number.isFinite(log.at) || log.at < correlation.startedAt)) return false;
+  return /RX|接收/i.test(`${log.tag ?? ''} ${log.level ?? ''}`) && log.text.trim() === expected;
 }

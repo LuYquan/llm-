@@ -29,6 +29,8 @@ import type { ProtocolConfig } from '../../core/protocol/types';
 import { LEGACY_WORKSPACE_KEY, loadBrowserWorkspace, saveBrowserWorkspace } from '../workspace/browser-storage';
 import { BrowserRecordingStore } from '../recording/browser-recording';
 import { PipelineStatistics } from './pipeline-statistics';
+import { WriteQuiescenceTracker } from './write-quiescence';
+import type { WriteQuiescenceResult } from './write-quiescence';
 
 export interface PipelineStatus {
   is_running: boolean;
@@ -99,9 +101,12 @@ const droppedBytes = ref<number>(0);
 const totalDroppedBytes = ref<number>(0);
 const protocolErrors = ref<number>(0);
 const softwareStopLocked = ref(false);
+let softwareStopRevision = 0;
 const acquisitionEnabled = ref(false);
 const currentBaudRate = ref(115200);
 const currentProtocolConfig = ref<ProtocolConfig>({ type: 'firewater' });
+const writeQueueState = shallowRef({ generation: 0, pendingCount: 0, connected: false, ready: false, error: null as string | null });
+const writeTracker = new WriteQuiescenceTracker((state) => { writeQueueState.value = state; });
 const browserRecording = new BrowserRecordingStore();
 const browserStatistics = new PipelineStatistics();
 function hostNowMs(): number { return typeof performance !== 'undefined' ? performance.now() : Date.now(); }
@@ -118,6 +123,8 @@ let unlistenStatus: Unsubscribe | null = null;
 let unlistenError: Unsubscribe | null = null;
 let unlistenBatch: Unsubscribe | null = null;
 let unlistenRawData: Unsubscribe | null = null;
+let unlistenInternalWriteResult: Unsubscribe | null = null;
+let unlistenWriteIdentity: Unsubscribe | null = null;
 let webPeriodicTimer: any = null;
 
 /**
@@ -151,6 +158,12 @@ export async function getOrInitTransport(): Promise<ISerialTransport> {
       // 注册状态与错误监听
       unlistenStatus = tp.onStatusChange((s) => {
         currentStatus.value = s;
+        writeTracker.setConnected(s === 'connected');
+      });
+
+      unlistenInternalWriteResult = tp.onWriteResult((result) => writeTracker.acceptResult(result));
+      if (tp.onWaveformBatch) unlistenWriteIdentity = tp.onWaveformBatch((batch) => {
+        writeTracker.observeIdentity(batch.session_id, batch.channel_epoch);
       });
 
       unlistenError = tp.onError((err) => {
@@ -274,6 +287,7 @@ export function useSerialSession() {
 
   async function configureProtocol(config: ProtocolConfig): Promise<void> {
     const tp = await getOrInitTransport();
+    writeTracker.changeContext('解析会话切换时仍有未完成写入，队列状态未知；请重新连接并核对设备。');
     await tp.configureProtocol(config);
     browserStatistics.resetProtocol();
     currentProtocolConfig.value = JSON.parse(JSON.stringify(config)) as ProtocolConfig;
@@ -287,8 +301,24 @@ export function useSerialSession() {
     if (softwareStopLocked.value) {
       throw new Error('软件停止屏障已锁定发送；请确认设备状态后显式恢复发送');
     }
-    const tp = await getOrInitTransport();
-    return tp.write(bytes);
+    if (writeQueueState.value.error) {
+      throw new Error(`${writeQueueState.value.error} 当前普通写入保持禁用，请重新连接并核对设备。`);
+    }
+    const attempt = writeTracker.begin(bytes.length);
+    try {
+      const tp = await getOrInitTransport();
+      const receipt = await tp.write(bytes);
+      if (!writeTracker.acceptReceipt(attempt, receipt)) throw new Error(writeQueueState.value.error || '写入过程中设备会话已变化；原回执不能继续实验。');
+      return receipt;
+    } catch (error) {
+      writeTracker.fail(attempt, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  }
+
+  async function waitForWriteQuiescence(timeoutMs = 5000): Promise<WriteQuiescenceResult> {
+    if (softwareStopLocked.value) return { ready: false, reason: '软件停止已锁定发送，请先核对设备并显式恢复。' };
+    return writeTracker.wait(timeoutMs);
   }
 
   async function write(data: Uint8Array | string): Promise<WriteReceipt> {
@@ -301,6 +331,11 @@ export function useSerialSession() {
    * 绕过普通发送队列直接清空待发缓冲
    */
   async function emergencyStop(frame?: Uint8Array | string): Promise<void> {
+    // Lock new renderer writes synchronously, before initialization, encoding or
+    // the driver stop promise. Already-submitted writes remain observable; this
+    // latch alone does not prove a native queue barrier or device stop succeeded.
+    softwareStopRevision += 1;
+    softwareStopLocked.value = true;
     const tp = await getOrInitTransport();
     let bytes: Uint8Array;
     if (!frame) {
@@ -314,20 +349,27 @@ export function useSerialSession() {
     }
     if (tp.kind !== 'tauri') await stopPeriodicSend();
     await tp.emergencyStop(bytes);
-    softwareStopLocked.value = true;
   }
 
   async function refreshWriteLockStatus(): Promise<boolean> {
     if (typeof window !== 'undefined' && isTauri()) {
       const locked = await safeInvoke<boolean>('get_write_lock_status');
-      if (locked !== null) softwareStopLocked.value = locked;
+      // Native false cannot undo a local stop requested while its IPC failed.
+      // Only a successful explicit resumeWrites call clears the renderer latch.
+      if (locked === true) softwareStopLocked.value = true;
     }
     return softwareStopLocked.value;
   }
 
   async function resumeWrites(): Promise<void> {
+    const stopRevision = softwareStopRevision;
     const tp = await getOrInitTransport();
     await tp.resumeWrites();
+    if (stopRevision !== softwareStopRevision) {
+      // The driver may have resumed, but this receipt predates a newer local
+      // stop. It cannot clear that stop or prove the current native barrier.
+      throw new Error('恢复发送期间发生新的软件停止；旧恢复回执不能解除新停止锁。驱动可能已恢复，请重新核对设备和停止屏障后显式恢复。');
+    }
     softwareStopLocked.value = false;
   }
 
@@ -920,6 +962,10 @@ export function useSerialSession() {
     write,
     emergencyStop,
     softwareStopLocked,
+    pendingWriteCount: computed(() => writeQueueState.value.pendingCount),
+    writesReady: computed(() => writeQueueState.value.ready && !softwareStopLocked.value),
+    writeQuiescenceError: computed(() => writeQueueState.value.error),
+    waitForWriteQuiescence,
     refreshWriteLockStatus,
     resumeWrites,
     reset,
@@ -1002,10 +1048,15 @@ export async function resetSession(): Promise<void> {
   if (unlistenError) unlistenError();
   if (unlistenBatch) unlistenBatch();
   if (unlistenRawData) unlistenRawData();
+  if (unlistenInternalWriteResult) unlistenInternalWriteResult();
+  if (unlistenWriteIdentity) unlistenWriteIdentity();
   unlistenStatus = null;
   unlistenError = null;
   unlistenBatch = null;
   unlistenRawData = null;
+  unlistenInternalWriteResult = null;
+  unlistenWriteIdentity = null;
+  writeTracker.reset();
 
   if (webPeriodicTimer) {
     clearInterval(webPeriodicTimer);

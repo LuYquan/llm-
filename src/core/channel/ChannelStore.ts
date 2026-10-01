@@ -42,6 +42,7 @@ export class ChannelStore {
   private scheduledTimer: any = null;
   private dirtyChannels: Set<string> = new Set();
   private channelUpdatedAtMs: Map<string, number> = new Map();
+  private channelRevisions: Map<string, number> = new Map();
   private generation = 0;
   private capacityExceededListeners = new Set<(channelId: string) => void>();
   private capacityExceededReported = false;
@@ -80,6 +81,11 @@ export class ChannelStore {
 
   public getGeneration(): number {
     return this.generation;
+  }
+
+  /** Capture the ingestion watermark before dispatching a device command. */
+  public getChannelRevision(channelId: string): number {
+    return this.channelRevisions.get(this.resolveChannelKey(channelId)) ?? 0;
   }
 
   /**
@@ -413,6 +419,7 @@ export class ChannelStore {
       this.buffers.get(key)?.clear();
       this.dirtyChannels.delete(key);
       this.channelUpdatedAtMs.delete(key);
+      this.channelRevisions.delete(key);
       for (const subscriber of this.subscribers.values()) subscriber.pendingChannels.delete(key);
     } else {
       for (const buf of this.buffers.values()) {
@@ -420,6 +427,7 @@ export class ChannelStore {
       }
       this.dirtyChannels.clear();
       this.channelUpdatedAtMs.clear();
+      this.channelRevisions.clear();
       for (const subscriber of this.subscribers.values()) subscriber.pendingChannels.clear();
     }
     if (!channelId) this.sessionContext = { sessionId: null, epoch: null };
@@ -460,6 +468,7 @@ export class ChannelStore {
   private markDirty(channelId: string) {
     this.dirtyChannels.add(channelId);
     this.channelUpdatedAtMs.set(channelId, Date.now());
+    this.channelRevisions.set(channelId, (this.channelRevisions.get(channelId) ?? 0) + 1);
     this.scheduleDispatch();
   }
 
@@ -541,12 +550,14 @@ export class ChannelStore {
     const views: Record<string, ChannelSnapshot> = {};
     const latest: Record<string, ChannelPoint | undefined> = {};
     const updatedAtMs: Record<string, number> = {};
+    const updatedRevisions: Record<string, number> = {};
     const updatedCanonical = new Set(updatedChannelIds.map((channel) => this.resolveChannelKey(channel)));
     for (const requestedChannel of sub.channelIds) {
       const canonical = this.resolveChannelKey(requestedChannel);
       if (updatedCanonical.has(canonical)) {
         const updatedAt = this.channelUpdatedAtMs.get(canonical);
         if (updatedAt !== undefined) updatedAtMs[requestedChannel] = updatedAt;
+        updatedRevisions[requestedChannel] = this.channelRevisions.get(canonical) ?? 0;
       }
     }
 
@@ -596,6 +607,7 @@ export class ChannelStore {
         // with their configured channel name while storage remains canonical.
         updatedChannelIds: sub.channelIds.filter((channel) => updatedCanonical.has(this.resolveChannelKey(channel))),
         updatedAtMs,
+        updatedRevisions,
         generation: this.generation,
         views,
         latest,

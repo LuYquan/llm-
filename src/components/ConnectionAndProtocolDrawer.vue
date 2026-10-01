@@ -79,8 +79,13 @@ const protocolList = [
     id: 'firewater',
     name: 'FireWater',
     badge: '推荐',
-    summary: 'CSV文本与Teleplot混合流，适合教学与低频调试 (val0,val1\\n)',
-    codeSample: 'printf("%f,%f\\r\\n", ch0, ch1);',
+    summary: 'CSV 数值行或命名 Teleplot，与 UTF-8 日志共用串口',
+    codeSample: '// CSV 列 ID：setpoint、actual、output\nprintf("%f,%f,%f\\n", target, actual, output);\n\n// 或使用命名 Teleplot：>变量名:数值\\n\nprintf(">target:%f\\n>actual:%f\\n>output:%f\\n", target, actual, output);',
+    helpNotes: [
+      'CSV 默认前三列为 setpoint / actual / output，含义和单位仍由固件定义；单变量可用命名 Teleplot。',
+      '# 开头的行是日志，不是 CSV 表头。不要用 #target,actual,output 声明通道名。',
+      '每行用 LF 或 CRLF 结束，发送有限数值。选择 CSV 或 Teleplot 的一种数值布局，再绑定当前环的目标、反馈和输出。',
+    ],
   },
   {
     id: 'justfloat',
@@ -88,13 +93,21 @@ const protocolList = [
     badge: '高速',
     summary: '小端 IEEE-754 单精度浮点序列 + 00 00 80 7F 尾帧；通道数可指定或自动识别',
     codeSample: '发送：float32 小端通道值... + 00 00 80 7F',
+    helpNotes: [
+      '通道依次为 ch0、ch1…，请核对顺序、通道数和原始单位。主机接收时间不是设备采样时钟。',
+      '不要混入 ASCII 日志或 ACK。调参可用独立参数通道回传，或逐轮人工核对；文本 ACK 仅支持 FireWater。',
+    ],
   },
   {
     id: 'rawdata',
     name: 'RawData',
     badge: '透传',
     summary: '默认只显示原始字节；启用数值解码后按指定类型与通道数组帧',
-    codeSample: 'HAL_UART_Transmit(&huart1, buffer, len, 100);',
+    codeSample: '原始显示：按实际固件格式发送字节\n数值解码：核对数值类型 + 通道数，再应用配置',
+    helpNotes: [
+      '只显示原始字节时不产生数值通道，不能直接用于波形或调参反馈。',
+      '解码模式按连续固定宽度帧分组；需知道固件布局。此路径不解析文本 ACK。',
+    ],
   },
   {
     id: 'custom',
@@ -102,6 +115,10 @@ const protocolList = [
     badge: '工业',
     summary: '固定帧头 + 固定长度负载 + 可选校验 + 可选帧尾',
     codeSample: '[Header] [Payload] [Checksum?] [Tail?]；校验范围为负载字节',
+    helpNotes: [
+      '按固件核对帧头、固定负载长度、数值类型、校验和帧尾；不会自动识别变长字段或单位。',
+      '数值帧不解析文本 ACK。调参确认使用独立参数通道回传，或逐轮人工核对。',
+    ],
   },
 ];
 
@@ -234,7 +251,7 @@ onBeforeUnmount(() => setBreak(false));
         </svg>
         <span>协议与接口连接</span>
       </div>
-      <button class="btn-close" @click="emit('close')">✕</button>
+      <button type="button" class="btn-close" aria-label="关闭连接与协议设置" @click="emit('close')">✕</button>
     </header>
 
     <div class="drawer-body custom-scrollbar">
@@ -242,7 +259,7 @@ onBeforeUnmount(() => setBreak(false));
       <section class="drawer-section">
         <div class="section-title-row">
           <span class="section-title">数据引擎 (Protocol Engine)</span>
-          <button class="btn-help-proto" @click="showProtoHelp = !showProtoHelp" title="查看协议协议说明与单片机代码范例">
+          <button type="button" class="btn-help-proto" :aria-expanded="showProtoHelp" aria-controls="protocol-help" aria-label="查看协议接入说明" @click="showProtoHelp = !showProtoHelp" title="查看协议说明与固件发送示例">
             ?
           </button>
         </div>
@@ -265,13 +282,17 @@ onBeforeUnmount(() => setBreak(false));
         </div>
 
         <!-- 协议代码范例浮动卡片 -->
-        <div v-if="showProtoHelp" class="proto-help-card">
+        <div v-if="showProtoHelp" id="protocol-help" class="proto-help-card">
           <div class="help-header">
             <span>下位机发送范例 ({{ selectedProtocol }})</span>
-            <button class="btn-mini-close" @click="showProtoHelp = false">✕</button>
+            <button type="button" class="btn-mini-close" aria-label="关闭协议接入说明" @click="showProtoHelp = false">✕</button>
           </div>
           <pre class="help-code"><code>{{ protocolList.find((p) => p.id === selectedProtocol)?.codeSample }}</code></pre>
+          <p v-for="note in protocolList.find((p) => p.id === selectedProtocol)?.helpNotes" :key="note" class="protocol-hint">{{ note }}</p>
+          <p class="protocol-hint">完整接入步骤见 README 中的「下位机接入与场景反馈指南」。示例仅说明格式，不是设备控制值或安全参数。</p>
         </div>
+
+        <p v-if="!props.isRunning" class="protocol-hint">没有设备也可打开「AI 辅助 → 场景调参」，选择「物理模型计算」做离线模型练习；设备通道和写入设置在实机阶段核对。</p>
 
         <p class="protocol-hint" role="status">
           当前应用：{{ protocolList.find((p) => p.id === appliedProtocol)?.name || appliedProtocol }}。

@@ -16,6 +16,7 @@ const commands = [
   ['transport', 'npm run test:transport'],
   ['widgetAndReplay', 'npm run test:widget'],
   ['tuning', 'npm run test:tuning'],
+  ['writeQuiescence', 'npm run test:write-queue'],
   ...frontendOnly ? [] : [
     ['rust', 'cargo test --locked --manifest-path src-tauri/Cargo.toml --no-fail-fast'],
     ['npmAudit', 'npm audit --audit-level=high --json'],

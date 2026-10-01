@@ -226,6 +226,7 @@ const manifest = {
     transport: checkStatus,
     widgetAndReplay: checkStatus,
     tuning: checkStatus,
+    writeQuiescence: checkStatus,
     rust: checkStatus,
     frontendBuild: checkStatus,
     nativeBuild: checkStatus,

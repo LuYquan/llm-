@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>场景调参 · 合成协议交互夹具</title>
+    <style>
+      :root{--bg-base:#15191f;--bg-surface:#1d222b;--bg-elevated:#252d38;--text-main:#eef2f5;--text-muted:#aab5c3;--border-subtle:#344152;--border-strong:#506074;--accent-terracotta:#eab18c;--accent-terracotta-soft:#46322d;--accent-action:#995b36;--accent-rose:#fb8292;--accent-amber:#efc67a;--accent-emerald:#8cddb9;--font-mono:Consolas,monospace;color-scheme:dark;font-family:system-ui,sans-serif;background:var(--bg-base);color:var(--text-main)}
+      *{box-sizing:border-box}body{margin:0}header.fixture-header{padding:18px 24px;border-bottom:1px solid var(--border-subtle)}h1{font-size:20px;margin:0 0 8px}p{line-height:1.6;margin:8px 0}button,select{font:inherit;padding:8px 12px;border:1px solid var(--border-strong);border-radius:5px;background:var(--bg-elevated);color:var(--text-main)}button{cursor:pointer}button:disabled{opacity:.5;cursor:wait}.controls{display:flex;gap:8px;flex-wrap:wrap}.layout{display:grid;grid-template-columns:minmax(380px,520px) minmax(360px,1fr);height:calc(100vh - 180px);min-height:520px}#component-host{height:100%;min-height:0;border-right:1px solid var(--border-subtle)}aside{overflow:auto;padding:18px 24px}pre{font:12px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;border:1px solid var(--border-subtle);padding:12px;background:var(--bg-surface)}.status{color:var(--accent-amber);font-weight:600}.passed{color:var(--accent-emerald)}.failed{color:var(--accent-rose)}#case-results{padding-left:22px}#case-results li{padding:5px 0}.disclaimer{color:var(--text-muted);font-size:13px}summary{cursor:pointer}#event-log{max-height:420px;overflow:auto}@media(max-width:850px){.layout{grid-template-columns:1fr;height:auto}#component-host{height:750px}aside{height:auto}}
+    </style>
+  </head>
+  <body>
+    <header class="fixture-header">
+      <h1>场景调参 · 合成协议交互夹具</h1>
+      <p class="disclaimer">真实 Vue 组件、协议解析器、调参服务和本地 AI HTTP 响应；串口驱动、设备响应、遥测与授权点击均为合成测试。结果不构成原生界面或硬件验收。此页仅运行于独立 localhost:5191，不读取应用来源的设置、密钥或用户数据。</p>
+      <div class="controls"><select id="case-select" aria-label="交互用例"></select><button id="prepare-case">准备所选用例（手动交互）</button><button id="run-case">运行所选合成交互</button><button id="run-all">运行全部合成交互</button></div>
+    </header>
+    <div class="layout">
+      <main id="component-host"></main>
+      <aside>
+        <p id="fixture-status" class="status" role="status">正在载入夹具…</p>
+        <p class="disclaimer">手动方式：准备后，在左侧核对基线与独立保护，等待观察窗口，启动自动反馈并检查真实授权弹窗。自动方式通过同一 DOM 控件模拟这些合成授权步骤。</p>
+        <ol id="case-results"></ol>
+        <details open><summary>实际冻结字节与协议事件</summary><pre id="event-log">尚未发送命令。</pre></details>
+        <details open><summary>机器可读组件结果</summary><pre id="result-json">{ "status": "not-run", "hardwareAcceptance": "not-run" }</pre></details>
+      </aside>
+    </div>
+    <script type="module" src="./tuning-harness.ts"></script>
+  </body>
+</html>

@@ -2,6 +2,7 @@ import type { PlantModel, SolvePidResult } from '../control/types';
 import { solvePid } from '../control/solvePid';
 import { getPlantControlGain, validatePlantModel, withPlantGainMultiplier } from '../control/transferFunction';
 import { isCascadeDependencySnapshot } from './cascadeDependencies';
+import { isTuningCommandFormat } from './commandContract';
 import type { LoopStructure, PidValues } from '../project/types';
 import type {
   CandidateValidation,
@@ -26,6 +27,7 @@ export function parametersForStructure(structure: LoopStructure, params: PidValu
 export function validateCandidateInputs(plan: TuningPlan): string[] {
   if (plan.route === 'feedback') return validatePlan(plan);
   const errors: string[] = [];
+  if (plan.commandFormat !== undefined && !isTuningCommandFormat(plan.commandFormat)) errors.push('调参命令的转义和行尾格式无效。');
   if (!plan.name.trim()) errors.push('请填写实验名称。');
   if (!plan.project.trim()) errors.push('请填写项目名称。');
   if (!plan.loopId.trim()) errors.push('请选择或填写控制环名称。');
@@ -49,6 +51,7 @@ export function validateCandidateInputs(plan: TuningPlan): string[] {
 
 export function validatePlan(plan: TuningPlan): string[] {
   const errors: string[] = plan.route === 'model' ? validateCandidateInputs(plan) : [];
+  if (plan.commandFormat !== undefined && !isTuningCommandFormat(plan.commandFormat)) errors.push('调参命令的转义和行尾格式无效。');
   if (!plan.name.trim()) errors.push('请填写实验名称。');
   if (!plan.project.trim()) errors.push('请填写项目名称。');
   if (!plan.loopId.trim()) errors.push('请选择或填写控制环名称。');
@@ -377,6 +380,7 @@ export function validatePlanShape(value: unknown): string[] {
   for (const [key, limit] of [['name', 120], ['project', 120], ['description', 4000], ['prompt', 12000], ['loopId', 160], ['commandTemplate', 512]] as const) {
     if (!boundedString(p[key], limit)) return [`调参计划 ${key} 必须是长度受限的文本。`];
   }
+  if (p.commandFormat !== undefined && !isTuningCommandFormat(p.commandFormat)) return ['调参命令的转义和行尾格式无效。'];
   if (!['model', 'feedback'].includes(p.route as string) || !['manual', 'bounded-auto'].includes(p.mode as string)
     || !['P', 'PI', 'PD', 'PID'].includes(p.structure as string) || ![null, 'direct', 'reverse'].includes(p.controlDirection as never)) return ['调参路线、模式、控制结构或方向无效。'];
   for (const key of ['sampleTimeSeconds', 'maxParameterChangePercent', 'maximumTrials', 'evaluationWindowSeconds', 'maximumTelemetryAgeSeconds', 'maximumOutputMagnitude']) {

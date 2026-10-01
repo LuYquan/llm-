@@ -26,6 +26,8 @@ export interface ChannelViewBatch {
   updatedChannelIds: string[];
   /** Wall-clock ingestion time in milliseconds for each updated channel. */
   updatedAtMs: Record<string, number>;
+  /** Canonical ingestion revisions, keyed by each requested subscription name. */
+  updatedRevisions: Record<string, number>;
   /** Increments whenever the live display buffers are cleared for a new session. */
   generation: number;
   views: Record<string, ChannelSnapshot>;

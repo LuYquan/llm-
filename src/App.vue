@@ -46,6 +46,7 @@ import {
   type WorkspaceDocument,
 } from './services/workspace/document';
 import { runWorkspaceTransaction } from './services/workspace/transaction';
+import { tuningCommandBytes, type TuningCommandPayload } from './core/tuning/commandContract';
 
 interface AppConfig {
   port_name: string | null;
@@ -73,6 +74,8 @@ const copilotVisited = ref(false);
 const recordingsVisited = ref(false);
 const isTuningBusy = ref(false);
 const tuningWriteAccessReady = ref(true);
+const ordinaryWriteRevision = ref(0);
+const pendingSignalChanges = ref(0);
 const tuningStopToken = ref(0);
 const tuningWriteResult = ref<{
   id: string;
@@ -982,15 +985,27 @@ function handleKeyDown(event: KeyboardEvent) {
 }
 
 // ADR 0004 急停发送状态机
+function reportSoftwareStopFailure(error: unknown) {
+  const detail = error instanceof Error ? error.message : String(error);
+  emergencyToastTitle.value = '软件停止未完成 · 驱动屏障未确认';
+  emergencyToastDesc.value = `${session.softwareStopLocked.value ? '本机新增发送已锁定。' : '本机发送锁定尚未确认。'}驱动停止操作失败：${detail}。此前进入驱动的命令可能继续写入，设备停机需另外确认。`;
+  emergencyToastLevel.value = 'error';
+  showEmergencyToast.value = true;
+  appendLog('error', '[SOFTWARE STOP]', emergencyToastDesc.value);
+  resetEmergencyTimer();
+}
+
 async function triggerEmergencyStop() {
+  if (!isTuningBusy.value) ordinaryWriteRevision.value += 1;
   tuningStopToken.value += 1;
   const cmd = appConfig.value.emergency_command?.trim();
 
   if (!cmd) {
     try {
       await session.emergencyStop();
-    } catch (error: any) {
-      appendLog('error', '[SOFTWARE STOP]', `本机发送屏障操作失败: ${error?.message || error}`);
+    } catch (error) {
+      reportSoftwareStopFailure(error);
+      return;
     }
     emergencyToastTitle.value = '软件停止已启用';
     emergencyToastDesc.value = '软件已锁定普通发送并取消待发命令；未发送设备停止字节。请确认设备状态后再显式恢复发送。';
@@ -1004,8 +1019,9 @@ async function triggerEmergencyStop() {
   if (!isRunning.value) {
     try {
       await session.emergencyStop();
-    } catch (error: any) {
-      appendLog('error', '[SOFTWARE STOP]', `本机发送屏障操作失败: ${error?.message || error}`);
+    } catch (error) {
+      reportSoftwareStopFailure(error);
+      return;
     }
     emergencyToastTitle.value = '软件停止已启用，设备命令未送达';
     emergencyToastDesc.value = `普通发送已锁定；端口未打开，设备停止字节 [${cmd}] 未发送。`;
@@ -1086,6 +1102,7 @@ async function handleSendSerialData(data: string, isHex: boolean, appendNewline:
     throw new Error(message);
   }
   try {
+    ordinaryWriteRevision.value += 1;
     const result = await session.sendSerialData(data, isHex, appendNewline, escapeText, lineEnding);
     reportWriteReceipt(result, result.status === 'queued' ? '[TX_QUEUED]' : '[TX_WRITTEN]', `${isHex ? '(HEX) ' : ''}${data}`);
   } catch (err: any) {
@@ -1094,17 +1111,21 @@ async function handleSendSerialData(data: string, isHex: boolean, appendNewline:
   }
 }
 
-async function handleTuningSend(request: { trialId: string; command: string }) {
+async function handleTuningSend(request: { trialId: string; command: string; payload: TuningCommandPayload }) {
   tuningWriteResult.value = null;
   try {
     if (!isRunning.value) throw new Error('串口未连接，参数命令没有发送。');
     if (!isAcquiring.value) throw new Error('采集已暂停，不能监测本轮实验，参数命令没有发送。');
+    if (isApplyingProtocol.value) throw new Error('协议正在切换，参数命令没有发送。');
     if (mode.value === 'mock') throw new Error('当前为演示数据源，无法验证设备控制，参数命令没有发送。');
     if (!appConfig.value.emergency_command?.trim()) throw new Error('请先配置设备停止命令，再授权参数实验。');
     if (session.softwareStopLocked.value) throw new Error('软件停止已锁定发送，参数命令没有发送。');
     if (!isTuningBusy.value || !tuningWriteAccessReady.value) throw new Error('本轮实验未取得独占写入权限，参数命令没有发送。');
-    const result = await session.sendSerialData(request.command, false, true);
-    reportWriteReceipt(result, result.status === 'queued' ? '[TX:TUNING_QUEUED]' : '[TX:TUNING_WRITTEN]', request.command);
+    // The reviewed payload owns escaping and line endings. Write these exact
+    // bytes through the shared barrier without a second text transformation.
+    const bytes = tuningCommandBytes(request.payload, request.command);
+    const result = await session.write(bytes);
+    reportWriteReceipt(result, result.status === 'queued' ? '[TX:TUNING_QUEUED]' : '[TX:TUNING_WRITTEN]', request.payload.visibleText);
     const completed = result.status === 'queued'
       ? await waitForWriteResult(result.request_id, 3000)
       : null;
@@ -1134,7 +1155,15 @@ async function handleTuningExecutionState(working: boolean) {
   if (working) {
     tuningWriteAccessReady.value = false;
     await globalSendGate.acquireExperimentLock();
-    if (isTuningBusy.value) tuningWriteAccessReady.value = true;
+    if (!isTuningBusy.value) return;
+    const drained = await session.waitForWriteQuiescence(5000);
+    if (!isTuningBusy.value) return;
+    if (!drained.ready) {
+      appendLog('error', '[TUNING QUEUE]', drained.reason || '普通命令的驱动写入状态尚未明确，实验不会取得写入权。');
+      tuningStopToken.value += 1;
+      return;
+    }
+    tuningWriteAccessReady.value = true;
     return;
   }
   globalSendGate.releaseExperimentLock();
@@ -1178,6 +1207,7 @@ async function handleSendQuickCommand(cmd: QuickCmd) {
     return;
   }
   try {
+    ordinaryWriteRevision.value += 1;
     const result = await session.sendSerialData(cmd.command, cmd.is_hex, true);
     reportWriteReceipt(result, result.status === 'queued' ? '[TX:CMD_QUEUED]' : '[TX:CMD_WRITTEN]', `${cmd.name}: ${cmd.command}`);
   } catch (err: any) {
@@ -1287,6 +1317,15 @@ async function applySerialSignals(signals: { dtr?: boolean; rts?: boolean; brk?:
     appendLog('warn', '[SERIAL]', `${label}不可用：当前连接驱动未提供串口信号控制`);
     return false;
   }
+  // A Break release must remain possible even when an experiment has started.
+  // Other signal changes may reset the board and cannot share its control scope.
+  if (isTuningBusy.value && signals.brk !== false) {
+    appendLog('warn', '[SERIAL]', '先停止参数实验并核对设备，再修改 DTR、RTS 或开始 Break。');
+    return false;
+  }
+  if (isTuningBusy.value) tuningStopToken.value += 1;
+  ordinaryWriteRevision.value += 1;
+  pendingSignalChanges.value += 1;
 
   try {
     await transport.setSignals(signals);
@@ -1295,6 +1334,8 @@ async function applySerialSignals(signals: { dtr?: boolean; rts?: boolean; brk?:
   } catch (error) {
     appendLog('error', '[SERIAL]', `${label}设置失败：${error instanceof Error ? error.message : String(error)}`);
     return false;
+  } finally {
+    pendingSignalChanges.value -= 1;
   }
 }
 
@@ -1358,6 +1399,10 @@ function handleClearBuffer() {
 
 async function handleProtocolChange(protocol: ProtocolConfig) {
   if (isApplyingProtocol.value) return false;
+  if (isTuningBusy.value) {
+    appendLog('error', '[PROTOCOL]', '当前参数实验尚未结束。先停止调参流程并核对设备状态，再切换解析协议。');
+    return false;
+  }
   isApplyingProtocol.value = true;
   try {
     await session.configureProtocol(protocol);
@@ -1473,6 +1518,7 @@ onMounted(async () => {
 
   globalSendGate.setSender(async (payload, isHex, appendNewline) => {
     if (isTuningBusy.value) throw new Error('自动调参期间普通串口发送已暂停。');
+    ordinaryWriteRevision.value += 1;
     const result = await session.sendSerialData(payload, isHex, appendNewline);
     reportWriteReceipt(result, result.status === 'queued' ? '[TX:WIDGET_QUEUED]' : '[TX:WIDGET_WRITTEN]', payload);
   });
@@ -1734,12 +1780,16 @@ onUnmounted(() => {
         :connection-label="assistantContextLabel"
         :demo="mode === 'mock'"
         :ai-config="appConfig.ai_config"
+        :protocol-config="appConfig.protocol_config"
         :logs="logs"
         :write-result="tuningWriteResult"
         :stop-token="tuningStopToken"
         :write-access-ready="tuningWriteAccessReady"
-        :execution-enabled="isRunning && isAcquiring && mode !== 'mock' && Boolean(appConfig.emergency_command?.trim()) && !session.softwareStopLocked.value"
+        :ordinary-write-revision="ordinaryWriteRevision"
+        :ordinary-writes-ready="session.writesReady.value && pendingSignalChanges === 0 && !isApplyingProtocol"
+        :execution-enabled="isRunning && isAcquiring && !isApplyingProtocol && mode !== 'mock' && Boolean(appConfig.emergency_command?.trim()) && !session.softwareStopLocked.value"
         @open-ai-settings="openAssistantSettings"
+        @open-protocol-settings="activeDockDrawer = 'connection'"
         @send-command="handleTuningSend"
         @execution-state="handleTuningExecutionState"
         @safety-stop="handleTuningSafetyStop"

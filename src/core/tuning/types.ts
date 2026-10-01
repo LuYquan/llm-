@@ -2,6 +2,7 @@ import type { LoopStructure, PidValues } from '../project/types';
 import type { PidStructure, PlantModel } from '../control/types';
 import type { TuningScenarioContext } from './scenarios';
 import type { CascadeDependencySnapshot } from './cascadeDependencies';
+import type { TuningCommandFormat, TuningCommandPayload } from './commandContract';
 
 export type TuningRoute = 'model' | 'feedback';
 export type TuningMode = 'manual' | 'bounded-auto';
@@ -52,6 +53,8 @@ export interface TuningPlan {
   controlDirection: 'direct' | 'reverse' | null;
   sampleTimeSeconds: number | null;
   commandTemplate: string;
+  /** Omitted historical settings use the documented CRLF/text-escape default. */
+  commandFormat?: TuningCommandFormat;
   baseline: {
     params: PidValues | null;
     source: 'unset' | 'manual' | 'parameter-channels';
@@ -116,6 +119,8 @@ export interface TuningTrial {
   before: PidValues;
   candidate: PidValues;
   command?: string;
+  /** Exact reviewed wire bytes; historical records without it remain readable. */
+  commandPayload?: TuningCommandPayload;
   confirmation?: string;
   confirmationMode?: WriteConfirmationMode;
   /** Driver write identity captured for this exact trial attempt. */
@@ -127,6 +132,8 @@ export interface TuningTrial {
   writeStartedAt?: number;
   writeCompletedAt?: number;
   writeChannelGeneration?: number;
+  /** Per-parameter channel revisions captured immediately before this write. */
+  writeParameterRevisions?: Partial<Record<PidParameter, number>>;
   writeStartLogId?: number;
   acknowledgementLogId?: number;
   sampleWindowStart?: number;

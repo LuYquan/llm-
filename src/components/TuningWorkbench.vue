@@ -18,6 +18,9 @@ import { globalChannelStore } from '../core/channel/ChannelStore';
 import { globalProjectModel } from '../core/project/ProjectModel';
 import { isAcknowledgementForWrite, isFreshChannelValue, isWriteResultForTrial } from '../core/tuning/write-correlation';
 import { confirmedTrialContextFailure, executionSafetyStopReason, manualCandidateEligibility } from '../core/tuning/flow';
+import { materializeTuningCommand, validateTuningCommandPayload, type TuningCommandPayload } from '../core/tuning/commandContract';
+import { validateTuningProtocolCapabilities } from '../core/tuning/protocolCapabilities';
+import type { ProtocolConfig } from '../core/protocol/types';
 
 type LogLine = { id: number; time: string; at?: number; tag: string; level: string; text: string };
 type WriteResult = { id: string; requestId?: string; sessionId?: string; epoch?: number; status: 'queued' | 'written' | 'failed'; at: number; error?: string } | null;
@@ -32,13 +35,17 @@ const props = defineProps<{
   stopToken: number;
   writeAccessReady: boolean;
   executionEnabled?: boolean;
+  protocolConfig: ProtocolConfig;
+  ordinaryWriteRevision: number;
+  ordinaryWritesReady: boolean;
 }>();
 
 const emit = defineEmits<{
-  (event: 'send-command', request: { trialId: string; command: string }): void;
+  (event: 'send-command', request: { trialId: string; command: string; payload: TuningCommandPayload }): void;
   (event: 'execution-state', working: boolean): void;
   (event: 'leave', workspace: 'canvas' | 'tuning'): void;
   (event: 'open-ai-settings'): void;
+  (event: 'open-protocol-settings'): void;
   (event: 'safety-stop', reason: string): void;
 }>();
 
@@ -74,7 +81,7 @@ const parameterSettingsOpen = ref(false);
 const goalSettingsOpen = ref(false);
 const suiteSettingsOpen = ref(false);
 const channelIds = ref<string[]>(globalChannelStore.listChannels());
-const channelValues = ref<Record<string, { value: number; receivedAt: number; generation: number }>>({});
+const channelValues = ref<Record<string, { value: number; receivedAt: number; generation: number; revision: number }>>({});
 const clockNow = ref(Date.now());
 const isWorking = ref(false);
 const stopRequested = ref(false);
@@ -84,6 +91,9 @@ const notice = ref<{ type: 'info' | 'warning' | 'error' | 'success'; title: stri
 const proposalErrors = ref<string[]>([]);
 const importInput = ref<HTMLInputElement | null>(null);
 const pendingTrialId = ref<string | null>(null);
+// Only device confirmation ends this uncertainty; an older evaluated window
+// cannot describe parameters after a new write was dispatched.
+const unconfirmedWriteId = ref<string | null>(null);
 const manualConfirmation = ref(false);
 const awaitingManualConfirmation = ref(false);
 const autoProgress = ref('');
@@ -110,6 +120,7 @@ function newPlan(): TuningPlan {
     controlDirection: null,
     sampleTimeSeconds: null,
     commandTemplate: '',
+    commandFormat: { escapeText: true, lineEnding: 'crlf' },
     baseline: { params: null, source: 'unset', confirmed: false, stableBaseConfirmed: false },
     bounds: { kp: null, ki: null, kd: null },
     maxParameterChangePercent: null,
@@ -143,6 +154,7 @@ function hydratePlan(value: TuningPlan): TuningPlan {
   next.goal = { ...base.goal, ...value.goal };
   next.controlDirection = value.controlDirection ?? null;
   next.commandTemplate = value.commandTemplate ?? globalProjectModel.getLoop(next.loopId)?.cmd_template ?? '';
+  next.commandFormat = { ...base.commandFormat!, ...value.commandFormat };
   next.model = value.model ?? null;
   return next;
 }
@@ -212,6 +224,8 @@ const sceneInnerSource = computed<ScenarioInnerLoopSource | undefined>(() => {
 });
 const feedbackEvidenceStatus = computed(() => {
   void clockNow.value;
+  if (unconfirmedWriteId.value) return { status: 'pending' as const, reason: '本轮命令已派发但设备参数尚未确认，不能沿用旧参数的观察窗口。' };
+  if (props.ordinaryWritesReady === false && !isWorking.value) return { status: 'pending' as const, reason: '驱动写入队列未明确完成，先处理发送状态，再核对基线和观察窗口。' };
   return selectFeedbackEvidence({ plan: plan.value, currentConfigurationSignature: cascadeStageConfigurationSignature(plan.value).signature ?? '',
     generation: deviceGeneration.value, sessionContext: globalChannelStore.getSessionContext(), now: clockNow.value,
     currentTelemetryTimestamp: latestTelemetryTimestamp(), lastConfirmed: session.value.lastConfirmed, trials: session.value.trials,
@@ -299,8 +313,10 @@ function archiveCurrentStage() {
 }
 
 const activeParameters = computed(() => (['kp', 'ki', 'kd'] as PidParameter[]).filter((key) => isActiveParameter(plan.value.structure, key)));
-const planErrors = computed(() => [...validatePlan(plan.value), ...cascadeDeviceCheck.value.issues]);
-const candidateErrors = computed(() => [...validateCandidateInputs(plan.value), ...(plan.value.route === 'model' ? cascadeConfiguration.value.issues : cascadeDeviceCheck.value.issues)]);
+const protocolErrors = computed(() => validateTuningProtocolCapabilities({ protocolConfig: props.protocolConfig, plan: plan.value, canonicalChannelIds: channelIds.value }));
+const planErrors = computed(() => [...validatePlan(plan.value), ...cascadeDeviceCheck.value.issues, ...protocolErrors.value]);
+const candidateErrors = computed(() => [...validateCandidateInputs(plan.value), ...(plan.value.route === 'model' ? cascadeConfiguration.value.issues : [...cascadeDeviceCheck.value.issues, ...protocolErrors.value,
+  ...(props.ordinaryWritesReady === false ? ['普通命令尚未确认写完或写入状态未知；先处理发送队列，再重新核对基线并采集窗口。'] : [])])]);
 const selectedSuite = computed(() => plan.value.suite ? getScenarioSuite(plan.value.suite.id) : null);
 const selectedTopology = computed(() => selectedSuite.value?.topologies.find((item) => item.id === plan.value.suite?.topologyId));
 const sceneStages = computed(() => plan.value.suite?.id === 'custom' ? customStages.value : selectedTopology.value?.stages ?? []);
@@ -322,7 +338,7 @@ const latestSummary = computed(() => {
   ].map((item) => ({ ...item, reading: channelValues.value[item.channel] }));
 });
 const currentParams = computed(() => session.value.lastConfirmed?.params ?? plan.value.baseline.params);
-const currentParamsLabel = computed(() => session.value.lastConfirmed
+const currentParamsLabel = computed(() => unconfirmedWriteId.value ? '本轮参数待设备确认；所列旧基线不能代表当前设备值' : session.value.lastConfirmed
   ? confirmationLabel(session.value.lastConfirmed.mode)
   : plan.value.baseline.confirmed ? '用户确认的当前参数' : '未确认设备当前值');
 const currentProposal = computed(() => session.value.trials.find((trial) => trial.id === pendingTrialId.value));
@@ -341,7 +357,7 @@ const openIssues = computed(() => {
   else if (!telemetryFresh()) issues.push('等待绑定通道的实时遥测更新后再开始试验。');
   return issues.slice(0, 3);
 });
-const experimentCanStart = computed(() => props.executionEnabled === true && props.connected && telemetryFresh() && planErrors.value.length === 0 && !isWorking.value && session.value.status !== 'completed'
+const experimentCanStart = computed(() => props.ordinaryWritesReady && props.executionEnabled === true && props.connected && telemetryFresh() && planErrors.value.length === 0 && !isWorking.value && session.value.status !== 'completed'
   && (plan.value.route !== 'feedback' || feedbackEvidenceStatus.value.status === 'ready'));
 const canProposeCandidate = computed(() => manualCandidateEligibility({
   planErrorCount: candidateErrors.value.length + (plan.value.route === 'feedback' && feedbackEvidenceStatus.value.status === 'pending' ? 1 : 0),
@@ -397,7 +413,7 @@ watch(() => [session.value.id, cascadeStageConfigurationSignature(plan.value).si
 function captureBaselineObservation() {
   const signature = cascadeStageConfigurationSignature(plan.value).signature;
   const context = globalChannelStore.getSessionContext();
-  if (!plan.value.baseline.confirmed || !plan.value.baseline.params || !signature || !props.connected
+  if (props.ordinaryWritesReady === false || !plan.value.baseline.confirmed || !plan.value.baseline.params || !signature || !props.connected
     || !context.sessionId || context.epoch === null) {
     baselineObservation.value = null;
     return;
@@ -408,7 +424,7 @@ function captureBaselineObservation() {
 }
 
 function confirmCurrentBaseline(confirmed: boolean) {
-  if (isWorking.value || aiBusy.value || modelBusy.value) return;
+  if (isWorking.value || aiBusy.value || modelBusy.value || props.ordinaryWritesReady === false) return;
   plan.value.baseline.confirmed = confirmed && Boolean(plan.value.baseline.params);
   plan.value.baseline.stableBaseConfirmed = false;
   session.value.lastConfirmed = null;
@@ -479,14 +495,14 @@ watch(() => props.writeResult, (result) => {
   trial.status = 'sent';
   trial.command = trial.command || '';
   const writeGeneration = globalChannelStore.getGeneration();
+  const writeContext = globalChannelStore.getSessionContext();
   // A disconnect/reconnect during an in-flight write must invalidate the
   // receipt. Keeping the generation captured before sending prevents samples
   // from the new session being used as confirmation for the old command.
-  if (trial.writeChannelGeneration !== undefined && writeGeneration !== trial.writeChannelGeneration) {
+  if (trial.writeChannelGeneration !== undefined && writeGeneration !== trial.writeChannelGeneration
+    || !result.sessionId || result.sessionId !== writeContext.sessionId || result.epoch !== writeContext.epoch) {
     trial.status = 'failed';
-    session.value.status = 'paused';
-    session.value.stopReason = '串口会话在写入完成前发生变化；本轮命令未进入确认或评价。';
-    setNotice('warning', '命令确认已失效', session.value.stopReason);
+    requestSafetyStop('串口会话或回执身份在写入完成前发生变化；本轮命令不能进入确认或评价。');
     return;
   }
   trial.writeCompletedAt = result.at;
@@ -497,7 +513,13 @@ watch(() => props.writeResult, (result) => {
 }, { deep: true });
 
 watch(() => props.stopToken, (token, previous) => {
-  if (token !== previous && isWorking.value) requestStop('设备紧急操作已触发，调参循环暂停。');
+  if (token === previous) return;
+  clearVolatileDeviceEvidence();
+  session.value.lastConfirmed = null;
+  plan.value.baseline.confirmed = false;
+  plan.value.baseline.stableBaseConfirmed = false;
+  requireCurrentStageRevalidation();
+  if (isWorking.value) requestStop('设备紧急操作已触发，调参循环暂停。');
 });
 
 watch(isWorking, (working) => emit('execution-state', working), { flush: 'sync' });
@@ -509,6 +531,20 @@ watch(() => props.connected, (connected) => {
     if (isWorking.value) requestSafetyStop('串口断开，设备停止字节可能无法送达。');
   }
 });
+
+watch(() => JSON.stringify(props.protocolConfig), () => invalidateDeviceContext());
+
+watch(() => props.ordinaryWriteRevision, (revision, previous) => {
+  if (revision === previous) return;
+  clearVolatileDeviceEvidence();
+  session.value.lastConfirmed = null;
+  plan.value.baseline.confirmed = false;
+  plan.value.baseline.stableBaseConfirmed = false;
+  requireCurrentStageRevalidation();
+  rejectPendingStageProposals('普通设备命令已提交，需重新核对当前参数和观察窗口。');
+  if (isWorking.value) requestSafetyStop('实验范围之外有设备写入请求，当前基线与授权已失效。');
+  else setNotice('warning', '设备参数需重新核对', '普通命令可能改变设备状态。等待驱动队列完成，再确认当前参数并重新观察遥测。');
+}, { flush: 'sync' });
 
 watch(() => props.executionEnabled, (enabled) => {
   if (enabled !== true && (isWorking.value || ['awaiting-confirmation', 'collecting'].includes(session.value.status))) requestStop('采集、设备保护或会话执行条件已变化；调参流程暂停。');
@@ -556,6 +592,7 @@ function refreshSubscription() {
         value: latest.v,
         receivedAt: batch.updatedAtMs[channel] ?? receivedAt,
         generation: batch.generation,
+        revision: batch.updatedRevisions[channel] ?? 0,
       };
       }
     }
@@ -623,11 +660,12 @@ function activateStage(context: TuningScenarioContext) {
   const prior = plan.value;
   const groupId = session.value.scenarioGroupId ?? session.value.id;
   const restored = loadTuningStageSession(groupId, context.id, context.topologyId, context.stageId);
-  const next = restored?.plan ?? { ...newPlan(), name: prior.name, project: prior.project, description: prior.description, prompt: prior.prompt, route: prior.route, mode: prior.mode, suite: context, loopId: context.stageId };
+  const next = restored ? hydratePlan(restored.plan) : { ...newPlan(), name: prior.name, project: prior.project, description: prior.description, prompt: prior.prompt, route: prior.route, mode: prior.mode, suite: context, loopId: context.stageId };
   if (!restored) next.structure = (context.id === 'custom' ? customStages.value : selectedSuite.value?.topologies.find((topology) => topology.id === context.topologyId)?.stages)?.find((stage) => stage.id === context.stageId)?.structure ?? 'PID';
   if (next.suite?.id === 'custom') next.suite.customStages = customStages.value.map((stage) => ({ ...stage, supportedStructures: [...stage.supportedStructures] }));
   plan.value = next;
   session.value = restored ?? { id: id(), scenarioGroupId: groupId, plan: next, status: 'draft', trials: [], bestVerified: null, lastConfirmed: null, startedAt: null, updatedAt: Date.now(), stopReason: null };
+  session.value.plan = next;
   refreshGroupDrafts();
   pendingTrialId.value = null;
   manualConfirmation.value = false;
@@ -824,18 +862,25 @@ function readParametersFromChannels() {
 
 function currentReadback(trial?: TuningTrial): Partial<Record<PidParameter, number>> {
   const values: Partial<Record<PidParameter, number>> = {};
-  const correlation = trial && trial.writeCompletedAt !== undefined && trial.writeChannelGeneration !== undefined
-    ? { completedAt: trial.writeCompletedAt, channelGeneration: trial.writeChannelGeneration }
-    : null;
+  const context = globalChannelStore.getSessionContext();
   for (const key of activeParameters.value) {
     const channel = plan.value.channels.parameters[key];
     const item = channel ? channelValues.value[channel] : undefined;
-    if (item && correlation && isFreshChannelValue(item, correlation)) values[key] = item.value;
+    if (item && trial?.writeStartedAt !== undefined && trial.writeChannelGeneration !== undefined
+      && trial.writeParameterRevisions?.[key] !== undefined && isFreshChannelValue(item, {
+        startedAt: trial.writeStartedAt, channelGeneration: trial.writeChannelGeneration,
+        startRevision: trial.writeParameterRevisions[key]!, writeStatus: trial.status === 'sent' ? 'written' : 'failed',
+        sessionId: trial.writeSessionId, epoch: trial.writeEpoch, currentSessionId: context.sessionId, currentEpoch: context.epoch,
+      })) values[key] = item.value;
   }
   return values;
 }
 
 function toggleConfirmationMode(mode: WriteConfirmationMode) {
+  if (mode === 'acknowledgement' && props.protocolConfig.type !== 'firewater') {
+    setNotice('warning', '当前协议不接收文本 ACK', 'JustFloat、RawData 和 CustomFrame 请使用参数变量回传，或逐轮人工核对。文本应答需先切换到 FireWater。');
+    return;
+  }
   plan.value.confirmation.mode = mode;
   if (mode === 'manual') plan.value.mode = 'manual';
 }
@@ -856,7 +901,8 @@ function executionPlanSignature(): string {
   const { baseline, ...executionPlan } = plan.value;
   // Candidate writes legitimately advance the baseline. Keep the preflight
   // stability attestation inside the authorization scope.
-  return JSON.stringify({ ...executionPlan, baselineStableBaseConfirmed: baseline.stableBaseConfirmed, aiService: aiServiceSignature() });
+  return JSON.stringify({ ...executionPlan, baselineStableBaseConfirmed: baseline.stableBaseConfirmed, aiService: aiServiceSignature(), protocol: props.protocolConfig,
+    ordinaryWriteRevision: props.ordinaryWriteRevision ?? 0 });
 }
 
 function aiServiceSignature(): string {
@@ -900,6 +946,10 @@ async function proposeCandidate(aiTransferAlreadyAuthorized = false): Promise<Tu
       planSignature: capturedPlanSignature,
     };
   } else {
+    if (unconfirmedWriteId.value || protocolErrors.value.length) {
+      setNotice('warning', '当前参数或协议未就绪', protocolErrors.value[0] || '先核对本轮已派发命令的设备参数状态，再建立新观察窗口。');
+      return null;
+    }
     const selectedEvidence = selectFeedbackEvidence({ plan: plan.value, currentConfigurationSignature: cascadeStageConfigurationSignature(plan.value).signature ?? '',
       generation: globalChannelStore.getGeneration(), sessionContext: globalChannelStore.getSessionContext(), now: Date.now(),
       currentTelemetryTimestamp: latestTelemetryTimestamp(), lastConfirmed: session.value.lastConfirmed, trials: session.value.trials,
@@ -959,6 +1009,10 @@ async function proposeCandidate(aiTransferAlreadyAuthorized = false): Promise<Tu
   trial.evidence = evidence;
   trial.protocolRequestId = trial.id;
   trial.command = renderCommandTemplate(trial.candidate, trial.protocolRequestId) ?? undefined;
+  if (trial.command) {
+    try { trial.commandPayload = materializeTuningCommand(trial.command, plan.value.commandFormat); }
+    catch (error) { proposalErrors.value = [error instanceof Error ? error.message : String(error)]; }
+  }
   session.value.trials.unshift(trial);
   pendingTrialId.value = trial.id;
   manualConfirmation.value = false;
@@ -975,7 +1029,11 @@ async function sendTrial(trial: TuningTrial, auto = false): Promise<boolean> {
     return false;
   }
   if (trial.status !== 'proposed' || !trial.command) return false;
-  const executionErrors = [...validatePlan(plan.value), ...cascadeDeviceCheck.value.issues];
+  if (!validateTuningCommandPayload(trial.commandPayload, trial.command)) {
+    setNotice('warning', '命令字节未就绪', '旧记录或命令契约已失效，请重新生成候选并核对最终字节。');
+    return false;
+  }
+  const executionErrors = planErrors.value;
   if (executionErrors.length || !isTrialForPlan(trial, plan.value, globalChannelStore.getGeneration())) {
     setNotice('warning', '下发条件已变化', executionErrors[0] || '候选生成后配置已变化，请重新生成并核对候选。');
     return false;
@@ -999,11 +1057,14 @@ async function sendTrial(trial: TuningTrial, auto = false): Promise<boolean> {
     setNotice('warning', '数据或连接已失效', '恢复连接并等待新遥測数据后重新进行检查。');
     return false;
   }
-  clearCurrentStageEvidence();
-  if (!auto && !await requestApproval(`即将向当前设备发送参数写入命令：\n\n${trial.command}\n\n请确认字节与当前设备协议一致。`)) return false;
+  const payload = trial.commandPayload;
+  if (!auto && !await requestApproval(`即将向当前设备发送 UTF-8 参数命令，共 ${payload.byteLength} 字节：\n\n可见文本：${payload.visibleText}\nHEX：${payload.hex}\n\n转义：${payload.format.escapeText ? '启用' : '保留字面字符'}；行尾：${payload.format.lineEnding.toUpperCase()}。请核对最终字节与固件协议。`)) return false;
   checkExecutionSafety();
   if (stopRequested.value || !isWorking.value || !props.writeAccessReady || !authorizedPlanSignature.value || executionPlanSignature() !== authorizedPlanSignature.value || !isTrialForPlan(trial, plan.value, globalChannelStore.getGeneration())) return false;
+  if (planErrors.value.length || !validateTuningCommandPayload(payload, trial.command)) return false;
   session.value.status = 'awaiting-confirmation';
+  clearCurrentStageEvidence();
+  unconfirmedWriteId.value = trial.id;
   trial.writeStartedAt = Date.now();
   trial.writeStartLogId = Math.max(0, ...props.logs.map((log) => log.id));
   trial.writeRequestId = undefined;
@@ -1011,10 +1072,12 @@ async function sendTrial(trial: TuningTrial, auto = false): Promise<boolean> {
   trial.writeEpoch = undefined;
   trial.writeCompletedAt = undefined;
   trial.writeChannelGeneration = globalChannelStore.getGeneration();
+  trial.writeParameterRevisions = Object.fromEntries(activeParameters.value.map(key => [key,
+    globalChannelStore.getChannelRevision(plan.value.channels.parameters[key] ?? '')]));
   pendingTrialId.value = trial.id;
   manualConfirmation.value = false;
   session.value.updatedAt = Date.now();
-  emit('send-command', { trialId: trial.id, command: trial.command });
+  emit('send-command', { trialId: trial.id, command: trial.command, payload });
   const sent = await waitFor(() => {
     const result = props.writeResult;
     return Boolean(result && result.id === trial.id && (result.status === 'failed' || result.requestId));
@@ -1061,10 +1124,14 @@ async function confirmManualTrial() {
 function detectedAcknowledgement(trial: TuningTrial): LogLine | undefined {
   const configured = plan.value.confirmation.acknowledgementText.trim();
   if (!configured.includes('{request_id}') || !trial.protocolRequestId || trial.writeCompletedAt === undefined) return undefined;
-  const expected = configured.split('{request_id}').join(trial.protocolRequestId);
+  const protocolRequestId = trial.protocolRequestId;
+  const expected = configured.split('{request_id}').join(protocolRequestId);
+  const context = globalChannelStore.getSessionContext();
   return props.logs.find((log) => isAcknowledgementForWrite(log, expected, {
     startLogId: trial.writeStartLogId ?? 0,
-    completedAt: trial.writeCompletedAt,
+    startedAt: trial.writeStartedAt ?? Infinity, protocolRequestId,
+    writeStatus: trial.status === 'sent' ? 'written' : 'failed', sessionId: trial.writeSessionId, epoch: trial.writeEpoch,
+    currentSessionId: context.sessionId, currentEpoch: context.epoch,
   }));
 }
 
@@ -1099,6 +1166,7 @@ function acceptWrite(trial: TuningTrial, mode: WriteConfirmationMode, evidence: 
   }
   if (stopRequested.value || !isWorking.value || !authorizedPlanSignature.value || executionPlanSignature() !== authorizedPlanSignature.value || props.executionEnabled !== true || trial.status !== 'sent' || !trial.writeRequestId || trial.writeCompletedAt === undefined) return;
   trial.status = 'confirmed';
+  unconfirmedWriteId.value = null;
   trial.confirmationMode = mode;
   trial.confirmation = evidence;
   trial.sampleWindowStart = latestTelemetryTimestamp();
@@ -1257,6 +1325,10 @@ async function generateManualCandidate() {
 }
 
 async function sendManualTrial(chosen: TuningTrial) {
+  if (!props.ordinaryWritesReady) {
+    setNotice('warning', '驱动写入状态未就绪', '先等待普通命令完成；写入失败或未知时重新连接并核对设备。');
+    return;
+  }
   authorizedPlanSignature.value = executionPlanSignature();
   isWorking.value = true;
   stopRequested.value = false;
@@ -1282,6 +1354,7 @@ async function sendManualTrial(chosen: TuningTrial) {
     }
   } finally {
     if (!awaitingManualConfirmation.value) {
+      invalidateUnconfirmedWrite('流程在设备确认前结束，当前参数需重新核对。');
       isWorking.value = false;
       authorizedPlanSignature.value = null;
     }
@@ -1289,11 +1362,15 @@ async function sendManualTrial(chosen: TuningTrial) {
 }
 
 async function runBoundedExperiment() {
+  if (props.ordinaryWritesReady === false) {
+    setNotice('warning', '普通命令尚未确认完成', '等待驱动写入队列完成；失败或未知状态需要重新连接并核对参数。');
+    return;
+  }
   if (props.executionEnabled !== true) {
     setNotice('warning', '自动调参执行暂不可用', '请等待驱动写入回执、会话绑定和设备确认全部接通并通过验收。');
     return;
   }
-  const missing = [...validatePlan(plan.value), ...cascadeDeviceCheck.value.issues];
+  const missing = planErrors.value;
   if (missing.length) {
     setNotice('warning', '暂时不能授权自动实验', missing[0]);
     return;
@@ -1322,12 +1399,12 @@ async function runBoundedExperiment() {
   const offeredPlan = tuningPlanSignature(plan.value);
   const offeredGeneration = globalChannelStore.getGeneration();
   const offeredDeviceSession = JSON.stringify(globalChannelStore.getSessionContext());
-  const consent = await requestApproval(`请检查自动试验授权范围\n\n项目 / 环路：${plan.value.project} / ${activeLoop.value?.name || plan.value.loopId}\n路线：${routeSummary}\n控制结构 / 方向：${plan.value.structure} / ${plan.value.controlDirection}\n基线：Kp ${currentParams.value?.kp} · Ki ${currentParams.value?.ki} · Kd ${currentParams.value?.kd}\n参数边界：${activeBoundSummary}\n目标：${goalSummary}${modelTarget}\n采样周期：${plan.value.sampleTimeSeconds} 秒 · 最大遥测延迟：${plan.value.maximumTelemetryAgeSeconds} 秒\n输出绝对上限：${plan.value.maximumOutputMagnitude} ${plan.value.units.output}\n每轮最大变化：${plan.value.maxParameterChangePercent}%\n观察窗口：${plan.value.evaluationWindowSeconds} 秒 · 最多 ${roundLimit} 轮\n停止条件：遥测过期、串口断开、输出越界、目标达成或用户停止\n设备确认：${confirmationSummary}\n命令模板：\n${plan.value.commandTemplate}\n\n程序会逐轮检查候选值。是否授权此范围？`);
+  const consent = await requestApproval(`请检查自动试验授权范围\n\n项目 / 环路：${plan.value.project} / ${activeLoop.value?.name || plan.value.loopId}\n路线：${routeSummary}\n控制结构 / 方向：${plan.value.structure} / ${plan.value.controlDirection}\n基线：Kp ${currentParams.value?.kp} · Ki ${currentParams.value?.ki} · Kd ${currentParams.value?.kd}\n参数边界：${activeBoundSummary}\n目标：${goalSummary}${modelTarget}\n采样周期：${plan.value.sampleTimeSeconds} 秒 · 最大遥测延迟：${plan.value.maximumTelemetryAgeSeconds} 秒\n输出绝对上限：${plan.value.maximumOutputMagnitude} ${plan.value.units.output}\n每轮最大变化：${plan.value.maxParameterChangePercent}%\n观察窗口：${plan.value.evaluationWindowSeconds} 秒 · 最多 ${roundLimit} 轮\n停止条件：遥测过期、串口断开、输出越界、目标达成或用户停止\n设备确认：${confirmationSummary}\n命令模板：\n${plan.value.commandTemplate}\nUTF-8 字节格式：行尾 ${(plan.value.commandFormat?.lineEnding ?? 'crlf').toUpperCase()}；${plan.value.commandFormat?.escapeText === false ? '保留字面字符' : '解析文本转义'}。每轮冻结最终字节与预览后使用同一契约写入。\n\n程序会逐轮检查候选值。是否授权此范围？`);
   if (!consent) return;
   if (offeredExecutionScope !== executionPlanSignature() || offeredPlan !== tuningPlanSignature(plan.value)
     || offeredGeneration !== globalChannelStore.getGeneration() || offeredDeviceSession !== JSON.stringify(globalChannelStore.getSessionContext())
-    || !props.connected || props.executionEnabled !== true || !telemetryFresh() || !plan.value.baseline.stableBaseConfirmed
-    || validatePlan(plan.value).length || plan.value.route === 'feedback' && feedbackEvidenceStatus.value.status !== 'ready') {
+    || !props.ordinaryWritesReady || !props.connected || props.executionEnabled !== true || !telemetryFresh() || !plan.value.baseline.stableBaseConfirmed
+    || planErrors.value.length || plan.value.route === 'feedback' && feedbackEvidenceStatus.value.status !== 'ready') {
     setNotice('warning', '授权范围已失效', '授权等待期间的配置、基线或设备会话已变化，或当前遥测不足。请重新检查后授权。');
     return;
   }
@@ -1376,6 +1453,7 @@ async function runBoundedExperiment() {
     session.value.stopReason = error instanceof Error ? error.message : String(error);
     setNotice('error', '自动实验已暂停', session.value.stopReason);
   } finally {
+    invalidateUnconfirmedWrite('自动流程在设备确认前结束，当前参数需重新核对。');
     isWorking.value = false;
     authorizedPlanSignature.value = null;
     autoProgress.value = '';
@@ -1384,8 +1462,24 @@ async function runBoundedExperiment() {
   }
 }
 
+function invalidateUnconfirmedWrite(reason: string) {
+  if (!unconfirmedWriteId.value) return;
+  const trial = findTrial(unconfirmedWriteId.value);
+  clearVolatileDeviceEvidence();
+  session.value.lastConfirmed = null;
+  plan.value.baseline.confirmed = false;
+  plan.value.baseline.stableBaseConfirmed = false;
+  if (trial && !['confirmed', 'evaluated'].includes(trial.status)) {
+    trial.status = 'failed';
+    trial.confirmation = `${reason} 命令可能已到达设备，旧参数与历史窗口不再代表当前状态。`;
+  }
+  unconfirmedWriteId.value = null;
+}
+
 function requestStop(reason = '用户请求停止。') {
   stopRequested.value = true;
+  invalidateUnconfirmedWrite(reason);
+  if (approvalResolve) finishApproval(false);
   if (session.value.status !== 'stopped' && (isWorking.value || ['awaiting-confirmation', 'collecting'].includes(session.value.status))) {
     session.value.status = 'paused';
     session.value.stopReason = reason;
@@ -1413,6 +1507,10 @@ function checkExecutionSafety() {
     requestSafetyStop('内环配置或设备评价已失效，外环流程停止。');
     return;
   }
+  if (protocolErrors.value.length) {
+    requestSafetyStop(protocolErrors.value[0]);
+    return;
+  }
   const reason = executionSafetyStopReason({ connected: props.connected, telemetryFresh: telemetryFresh(), output: channelValues.value[plan.value.channels.output]?.value, maximumOutputMagnitude: plan.value.maximumOutputMagnitude });
   if (!reason) return;
   requestSafetyStop(reason);
@@ -1435,6 +1533,8 @@ function invalidateDeviceContext() {
 function requestSafetyStop(reason: string) {
   if (stopRequested.value) return;
   stopRequested.value = true;
+  if (approvalResolve) finishApproval(false);
+  invalidateUnconfirmedWrite(reason);
   clearVolatileDeviceEvidence();
   plan.value.baseline.confirmed = false;
   plan.value.baseline.stableBaseConfirmed = false;
@@ -1451,6 +1551,7 @@ function requestSafetyStop(reason: string) {
 }
 
 function readMetrics(afterTimestamp = 0, throughTimestamp = Infinity): { metrics: TuningMetrics | null; passed: boolean; message: string } {
+  if (protocolErrors.value.length) return { metrics: null, passed: false, message: protocolErrors.value[0] };
   const bindings = plan.value.channels;
   const selected = [bindings.setpoint, bindings.feedback, bindings.output];
   if (selected.some((channel) => !channel)) return { metrics: null, passed: false, message: '请先绑定目标值、实际反馈和控制输出。' };
@@ -1680,14 +1781,14 @@ function id(): string {
             <div class="form-row"><label class="field"><span>剪切频率 · rad/s</span><input v-model.number="plan.goal.targetCrossoverRadPerSec" type="number" min="0" step="any" placeholder="按目标带宽提供"></label><label class="field"><span>相位裕度 · °</span><input v-model.number="plan.goal.targetPhaseMarginDeg" type="number" min="0" max="180" step="any" placeholder="按响应目标提供"></label></div>
           </section>
           <div class="form-row execution-context"><label class="field"><span>控制方向</span><select v-model="plan.controlDirection"><option :value="null">核对反馈方向</option><option value="direct">输出增加 → 反馈增加</option><option value="reverse">输出增加 → 反馈减少</option></select></label><label class="field"><span>固件采样周期 · 秒</span><input v-model.number="plan.sampleTimeSeconds" type="number" min="0" step="any" placeholder="需从固件确认"></label></div>
-          <details class="settings-section" :open="channelSettingsOpen" @toggle="channelSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>绑定串口变量 <span>{{ plan.channels.feedback || '待绑定' }}</span></summary><div class="details-body"><p class="field-note">顶部选择解析协议，收到变量后绑定。设定值与反馈使用相同单位。</p><div v-for="item in latestSummary" :key="item.key" class="channel-binding"><label class="field"><span>{{ item.key }} <output>{{ format(item.reading?.value,4) }}</output></span><select :value="item.channel" :aria-label="`${item.key}通道`" @change="plan.channels[item.key === '目标' ? 'setpoint' : item.key === '实际反馈' ? 'feedback' : 'output'] = ($event.target as HTMLSelectElement).value"><option value="">选择已解析变量</option><option v-for="channel in liveChannelOptions" :key="channel" :value="channel">{{ channel }}</option></select></label><label class="field"><span>单位</span><input :value="plan.units[item.key === '目标' ? 'setpoint' : item.key === '实际反馈' ? 'feedback' : 'output']" :aria-label="`${item.key}单位`" @input="plan.units[item.key === '目标' ? 'setpoint' : item.key === '实际反馈' ? 'feedback' : 'output'] = ($event.target as HTMLInputElement).value" placeholder="需确认"></label></div><label class="field"><span>最大遥测延迟 · 秒</span><input v-model.number="plan.maximumTelemetryAgeSeconds" type="number" min="0" step="any" placeholder="按设备上报周期提供"></label><p class="field-note">{{ telemetryAge === null ? '当前绑定通道还没有数据' : `最近遥测 ${format(telemetryAge,1)} 秒前` }}</p></div></details>
-          <details class="settings-section" :open="parameterSettingsOpen" @toggle="parameterSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>当前参数与写入边界 <span>{{ plan.baseline.confirmed ? '用户已核对' : '执行前必填' }}</span></summary><div class="details-body"><p class="field-note">按固件实际公式填写参数单位；非活动项固定为 0。模型离线计算可先跳过。</p><div v-for="key in activeParameters" :key="key" class="parameter-setting"><h4>{{ key.toUpperCase() }}</h4><div class="parameter-values"><label class="field"><span>设备当前值</span><input v-model="parameterForm[key]" type="number" step="any" placeholder="待核对" @input="syncManualParams(key,($event.target as HTMLInputElement).value)"></label><label class="field"><span>下限</span><input :value="plan.bounds[key]?.min ?? ''" type="number" step="any" placeholder="待确认" @input="setBound(key,'min',($event.target as HTMLInputElement).value)"></label><label class="field"><span>上限</span><input :value="plan.bounds[key]?.max ?? ''" type="number" step="any" placeholder="待确认" @input="setBound(key,'max',($event.target as HTMLInputElement).value)"></label></div><div class="form-row"><label class="field"><span>参数单位 / 固件定义</span><input v-model.trim="plan.units.parameters[key]" :aria-label="`${key.toUpperCase()}单位`" placeholder="按固件公式填写"></label><label class="field"><span>设备回传变量</span><select v-model="plan.channels.parameters[key]"><option value="">未绑定</option><option v-for="channel in liveChannelOptions" :key="channel" :value="channel">{{ channel }}</option></select><small v-if="plan.channels.parameters[key]">当前 {{ format(parameterChannelValue(key)) }}</small></label></div></div><button type="button" class="text-button" :disabled="!activeParameters.every((key) => plan.channels.parameters[key])" @click="readParametersFromChannels">从本次遥测读取当前参数</button><label class="check-field"><input :checked="plan.baseline.confirmed" type="checkbox" :disabled="!plan.baseline.params || isWorking || aiBusy || modelBusy" @change="confirmCurrentBaseline(($event.target as HTMLInputElement).checked)"><span>我已核对设备当前值与边界。</span></label><label v-if="plan.mode === 'bounded-auto'" class="check-field"><input v-model="plan.baseline.stableBaseConfirmed" type="checkbox"><span>当前控制器在稳定的保守基线下运行，设备已有独立保护。</span></label></div></details>
-          <details class="settings-section" :open="goalSettingsOpen" @toggle="goalSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>目标、预算与设备确认 <span>{{ plan.confirmation.mode === 'manual' ? '人工确认' : '设备确认' }}</span></summary><div class="details-body"><label class="field"><span>成功目标</span><select v-model="plan.goal.mode"><option value="settle">保持在目标误差内</option><option value="step-response">阶跃响应</option><option value="track">轨迹跟踪</option></select></label><div class="form-row"><label v-if="plan.goal.mode !== 'track'" class="field"><span>最大稳态误差</span><input v-model.number="plan.goal.maximumSteadyError" type="number" min="0" step="any" :placeholder="plan.units.feedback || '反馈变量单位'"></label><label v-if="plan.goal.mode === 'step-response'" class="field"><span>最大超调 · %</span><input v-model.number="plan.goal.maximumOvershootPct" type="number" min="0" step="any" placeholder="由目标设定"></label><label v-if="plan.goal.mode === 'track'" class="field"><span>最大 RMS 跟踪误差</span><input v-model.number="plan.goal.maximumTrackingError" type="number" min="0" step="any" :placeholder="plan.units.feedback || '反馈变量单位'"></label><label class="field"><span>最大输出绝对值</span><input v-model.number="plan.maximumOutputMagnitude" type="number" min="0" step="any" :placeholder="plan.units.output || '执行器单位'"></label><label class="field"><span>单轮最大变化 · %</span><input v-model.number="plan.maxParameterChangePercent" type="number" min="0" max="100" step="any" placeholder="自行确认幅度"></label><label class="field"><span>观察时长 · 秒</span><input v-model.number="plan.evaluationWindowSeconds" type="number" min="0" step="any" placeholder="覆盖对象响应"></label><label class="field"><span>最多试验轮数</span><input v-model.number="plan.maximumTrials" type="number" min="1" max="100" step="1" placeholder="有限试验预算"></label></div><label class="field"><span>参数生效确认</span><select :value="plan.confirmation.mode" @change="toggleConfirmationMode(($event.target as HTMLSelectElement).value as WriteConfirmationMode)"><option value="parameter-channels">参数变量回传</option><option value="acknowledgement">带本轮 ID 的设备应答</option><option value="manual">逐轮人工核对</option></select></label><label v-if="plan.confirmation.mode === 'acknowledgement'" class="field"><span>设备成功应答模板</span><input v-model="plan.confirmation.acknowledgementText" placeholder="例如：PID_APPLIED {request_id}"></label><div v-if="plan.confirmation.mode !== 'manual'" class="form-row"><label class="field"><span>确认超时 · 秒</span><input v-model.number="plan.confirmation.timeoutSeconds" type="number" min="0" step="any" placeholder="按设备响应提供"></label><label v-if="plan.confirmation.mode === 'parameter-channels'" class="field"><span>回传容差 · %</span><input v-model.number="plan.confirmation.parameterTolerance" type="number" min="0" step="any" placeholder="按数值精度提供"></label></div><label class="field"><span>参数写入命令模板</span><textarea v-model="plan.commandTemplate" rows="2" placeholder="按固件协议填写，例如 PID,{request_id},{id},{kp},{ki},{kd}"></textarea><small>变量：{id}、{order}、{kp}、{ki}、{kd}、{request_id}。应答确认需携带本轮 ID。</small></label><label v-if="plan.route === 'feedback'" class="field"><span>反馈执行方式</span><select v-model="plan.mode"><option value="bounded-auto" :disabled="plan.confirmation.mode === 'manual'">授权范围内自动迭代</option><option value="manual">只生成建议，逐轮人工执行</option></select></label></div></details>
+          <details class="settings-section" :open="channelSettingsOpen" @toggle="channelSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>绑定串口变量 <span>{{ plan.channels.feedback || '待绑定' }}</span></summary><div class="details-body"><p class="field-note">当前解析协议：{{ protocolConfig.type.toUpperCase() }}。收到变量后绑定原始通道 ID；设定值与反馈使用相同单位。</p><button type="button" class="text-button" :disabled="isWorking" @click="emit('open-protocol-settings')">设置串口与解析协议</button><p v-if="!liveChannelOptions.length" class="field-note">尚无已解析变量。先连接并接收数值帧；无设备时可使用物理模型计算路线。</p><div v-for="item in latestSummary" :key="item.key" class="channel-binding"><label class="field"><span>{{ item.key }} <output>{{ format(item.reading?.value,4) }}</output></span><select :value="item.channel" :aria-label="`${item.key}通道`" @change="plan.channels[item.key === '目标' ? 'setpoint' : item.key === '实际反馈' ? 'feedback' : 'output'] = ($event.target as HTMLSelectElement).value"><option value="">选择已解析变量</option><option v-for="channel in liveChannelOptions" :key="channel" :value="channel">{{ channel }}</option></select></label><label class="field"><span>单位</span><input :value="plan.units[item.key === '目标' ? 'setpoint' : item.key === '实际反馈' ? 'feedback' : 'output']" :aria-label="`${item.key}单位`" @input="plan.units[item.key === '目标' ? 'setpoint' : item.key === '实际反馈' ? 'feedback' : 'output'] = ($event.target as HTMLInputElement).value" placeholder="需确认"></label></div><label class="field"><span>最大遥测延迟 · 秒</span><input v-model.number="plan.maximumTelemetryAgeSeconds" type="number" min="0" step="any" placeholder="按设备上报周期提供"></label><p class="field-note">{{ telemetryAge === null ? '当前绑定通道还没有数据' : `最近遥测 ${format(telemetryAge,1)} 秒前` }}</p></div></details>
+          <details class="settings-section" :open="parameterSettingsOpen" @toggle="parameterSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>当前参数与写入边界 <span>{{ plan.baseline.confirmed ? '用户已核对' : '执行前必填' }}</span></summary><div class="details-body"><p class="field-note">按固件实际公式填写参数单位；非活动项固定为 0。模型离线计算可先跳过。</p><div v-for="key in activeParameters" :key="key" class="parameter-setting"><h4>{{ key.toUpperCase() }}</h4><div class="parameter-values"><label class="field"><span>设备当前值</span><input v-model="parameterForm[key]" type="number" step="any" placeholder="待核对" @input="syncManualParams(key,($event.target as HTMLInputElement).value)"></label><label class="field"><span>下限</span><input :value="plan.bounds[key]?.min ?? ''" type="number" step="any" placeholder="待确认" @input="setBound(key,'min',($event.target as HTMLInputElement).value)"></label><label class="field"><span>上限</span><input :value="plan.bounds[key]?.max ?? ''" type="number" step="any" placeholder="待确认" @input="setBound(key,'max',($event.target as HTMLInputElement).value)"></label></div><div class="form-row"><label class="field"><span>参数单位 / 固件定义</span><input v-model.trim="plan.units.parameters[key]" :aria-label="`${key.toUpperCase()}单位`" placeholder="按固件公式填写"></label><label class="field"><span>设备回传变量</span><select v-model="plan.channels.parameters[key]"><option value="">未绑定</option><option v-for="channel in liveChannelOptions" :key="channel" :value="channel">{{ channel }}</option></select><small v-if="plan.channels.parameters[key]">当前 {{ format(parameterChannelValue(key)) }}</small></label></div></div><button type="button" class="text-button" :disabled="!activeParameters.every((key) => plan.channels.parameters[key])" @click="readParametersFromChannels">从本次遥测读取当前参数</button><label class="check-field"><input :checked="plan.baseline.confirmed" type="checkbox" :disabled="!plan.baseline.params || isWorking || aiBusy || modelBusy || ordinaryWritesReady === false" @change="confirmCurrentBaseline(($event.target as HTMLInputElement).checked)"><span>我已核对设备当前值与边界。</span></label><p v-if="ordinaryWritesReady === false" class="field-note">普通命令尚未写完，或写入状态未知。处理发送队列后，再确认当前参数；软件停止锁定时需先恢复发送。</p><label v-if="plan.mode === 'bounded-auto'" class="check-field"><input v-model="plan.baseline.stableBaseConfirmed" type="checkbox"><span>当前控制器在稳定的保守基线下运行，设备已有独立保护。</span></label></div></details>
+          <details class="settings-section" :open="goalSettingsOpen" @toggle="goalSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>目标、预算与设备确认 <span>{{ plan.confirmation.mode === 'manual' ? '人工确认' : '设备确认' }}</span></summary><div class="details-body"><label class="field"><span>成功目标</span><select v-model="plan.goal.mode"><option value="settle">保持在目标误差内</option><option value="step-response">阶跃响应</option><option value="track">轨迹跟踪</option></select></label><div class="form-row"><label v-if="plan.goal.mode !== 'track'" class="field"><span>最大稳态误差</span><input v-model.number="plan.goal.maximumSteadyError" type="number" min="0" step="any" :placeholder="plan.units.feedback || '反馈变量单位'"></label><label v-if="plan.goal.mode === 'step-response'" class="field"><span>最大超调 · %</span><input v-model.number="plan.goal.maximumOvershootPct" type="number" min="0" step="any" placeholder="由目标设定"></label><label v-if="plan.goal.mode === 'track'" class="field"><span>最大 RMS 跟踪误差</span><input v-model.number="plan.goal.maximumTrackingError" type="number" min="0" step="any" :placeholder="plan.units.feedback || '反馈变量单位'"></label><label class="field"><span>最大输出绝对值</span><input v-model.number="plan.maximumOutputMagnitude" type="number" min="0" step="any" :placeholder="plan.units.output || '执行器单位'"></label><label class="field"><span>单轮最大变化 · %</span><input v-model.number="plan.maxParameterChangePercent" type="number" min="0" max="100" step="any" placeholder="自行确认幅度"></label><label class="field"><span>观察时长 · 秒</span><input v-model.number="plan.evaluationWindowSeconds" type="number" min="0" step="any" placeholder="覆盖对象响应"></label><label class="field"><span>最多试验轮数</span><input v-model.number="plan.maximumTrials" type="number" min="1" max="100" step="1" placeholder="有限试验预算"></label></div><label class="field"><span>参数生效确认</span><select :value="plan.confirmation.mode" @change="toggleConfirmationMode(($event.target as HTMLSelectElement).value as WriteConfirmationMode)"><option value="parameter-channels">参数变量回传</option><option value="acknowledgement" :disabled="protocolConfig.type !== 'firewater'">带本轮 ID 的设备应答 · FireWater</option><option value="manual">逐轮人工核对</option></select></label><p v-if="protocolConfig.type !== 'firewater'" class="field-note">当前协议按数值帧接收，无法读取文本 ACK。可用独立参数变量回传，或逐轮人工核对。</p><label v-if="plan.confirmation.mode === 'acknowledgement'" class="field"><span>设备成功应答模板</span><input v-model="plan.confirmation.acknowledgementText" placeholder="例如：PID_APPLIED {request_id}"></label><div v-if="plan.confirmation.mode !== 'manual'" class="form-row"><label class="field"><span>确认超时 · 秒</span><input v-model.number="plan.confirmation.timeoutSeconds" type="number" min="0" step="any" placeholder="按设备响应提供"></label><label v-if="plan.confirmation.mode === 'parameter-channels'" class="field"><span>回传容差 · %</span><input v-model.number="plan.confirmation.parameterTolerance" type="number" min="0" step="any" placeholder="按数值精度提供"></label></div><label class="field"><span>参数写入命令模板</span><textarea v-model="plan.commandTemplate" rows="2" placeholder="按固件协议填写，例如 PID,{request_id},{id},{kp},{ki},{kd}"></textarea><small>变量：{id}、{order}、{kp}、{ki}、{kd}、{request_id}。应答确认需携带本轮 ID。</small></label><div v-if="plan.commandFormat" class="form-row"><label class="field"><span>UTF-8 命令行尾</span><select v-model="plan.commandFormat.lineEnding"><option value="none">不追加</option><option value="lf">LF · \n</option><option value="cr">CR · \r</option><option value="crlf">CRLF · \r\n</option></select></label><label class="check-field"><input v-model="plan.commandFormat.escapeText" type="checkbox"><span>解析命令中的 \r、\n、\t 与 \\ 转义</span></label></div><p class="field-note">已以 CR 或 LF 结尾的命令不会再追加行尾。候选页显示最终字节。</p><label v-if="plan.route === 'feedback'" class="field"><span>反馈执行方式</span><select v-model="plan.mode"><option value="bounded-auto" :disabled="plan.confirmation.mode === 'manual'">授权范围内自动迭代</option><option value="manual">只生成建议，逐轮人工执行</option></select></label></div></details>
           <details class="settings-section" :open="suiteSettingsOpen" @toggle="suiteSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>套组提示词与能力 <span>{{ selectedSuite.skills.length }} 项约束</span></summary><div class="details-body"><label class="field"><span>实验名称</span><input v-model="plan.name" placeholder="为本次实验命名"></label><label v-if="modelSource !== 'ai' || plan.route !== 'model'" class="field"><span>对象与工作点</span><textarea v-model="plan.description" rows="3" placeholder="说明执行器、传感器、单位、工况与已知限制。"></textarea></label><label class="field"><span>补充提示词约束</span><textarea v-model="plan.prompt" rows="3" placeholder="补充调参经验、任务要求与约束；提示词不会扩大写入权限。"></textarea></label><p class="field-note">基础约束与 skills 随请求发送；本地参数边界和停止规则始终生效。</p><ul class="capability-list"><li v-for="skill in plan.suite?.skills" :key="skill.id"><strong>{{ skill.title }}</strong><p>{{ skill.instructions }}</p></li></ul><p class="field-note">工具：本机 PID 解算、AI 有界反馈建议。套组是可分享的结构化配置。</p><details class="base-prompt"><summary>查看场景基础提示词</summary><p>{{ plan.suite?.prompt }}</p></details></div></details>
         </fieldset>
         <div v-else class="result-pane">
           <p class="field-note">{{ connectionLabel }} · {{ !connected ? '离线计算' : props.demo ? '演示遥测' : '设备遥测' }}</p><p v-if="isWorking" class="working-message" role="status">{{ autoProgress || '正在处理当前轮次；配置暂时锁定' }}</p>
-          <section v-if="currentProposal" class="proposal-review" aria-label="参数候选"><div class="result-heading"><h3>{{ currentProposal.evidence?.tool === 'pid-solver' ? '本机模型计算候选' : 'AI 反馈候选' }}</h3><span>{{ trialStateName(currentProposal.status) }}</span></div><p class="proposal-rationale">{{ proposalRationale }}</p><p class="field-note">{{ currentParams ? currentParamsLabel : '尚未配置设备基线；左列 0 仅为计算参考。' }}</p><div class="parameter-comparison"><div v-for="key in activeParameters" :key="key"><strong>{{ key.toUpperCase() }}</strong><code>{{ format(currentProposal.before[key]) }}</code><span>→</span><code>{{ format(currentProposal.candidate[key]) }}</code></div></div><pre v-if="currentProposal.command" class="command-preview"><code>{{ currentProposal.command }}</code></pre><p v-if="!isTrialForPlan(currentProposal,plan,globalChannelStore.getGeneration())" class="field-error">配置已变化，重新生成候选后才能发送。</p><div v-if="currentProposal.status === 'proposed' && !isWorking" class="proposal-actions"><button type="button" class="secondary-button" :disabled="!executionEnabled || planErrors.length > 0 || !isTrialForPlan(currentProposal,plan,globalChannelStore.getGeneration())" @click="sendManualTrial(currentProposal)">核对命令并发送</button><button type="button" class="text-button" @click="currentProposal.status = 'rejected'; pendingTrialId = null">忽略候选</button></div><p v-if="currentProposal.status === 'queued'" class="field-note">仅已排队，驱动写入与设备生效尚未确认。</p><template v-if="executionEnabled && currentProposal.status === 'sent' && plan.confirmation.mode === 'manual'"><label class="check-field"><input v-model="manualConfirmation" type="checkbox"><span>我已在设备上核对，这组参数已生效。</span></label><button type="button" class="secondary-button" :disabled="!manualConfirmation || !awaitingManualConfirmation || stopRequested" @click="confirmManualTrial">确认并观察遥测</button></template><p v-else-if="currentProposal.status === 'sent'" class="field-note">等待{{ confirmationLabel(plan.confirmation.mode) }}，超时暂停。</p><dl v-if="currentProposal.metrics" class="trial-metrics"><div><dt>{{ plan.goal.mode === 'track' ? 'RMS 跟踪误差' : '稳态误差' }}</dt><dd>{{ format(plan.goal.mode === 'track' ? currentProposal.metrics.rmsTrackingError : currentProposal.metrics.steadyError,4) }} {{ plan.units.feedback }}</dd></div><div><dt>最大输出</dt><dd>{{ format(currentProposal.metrics.maximumOutputMagnitude) }} {{ plan.units.output }}</dd></div><div v-if="currentProposal.metrics.overshootPercent !== null"><dt>实测超调</dt><dd>{{ format(currentProposal.metrics.overshootPercent,2) }}%</dd></div></dl></section>
+          <section v-if="currentProposal" class="proposal-review" aria-label="参数候选"><div class="result-heading"><h3>{{ currentProposal.evidence?.tool === 'pid-solver' ? '本机模型计算候选' : 'AI 反馈候选' }}</h3><span>{{ trialStateName(currentProposal.status) }}</span></div><p class="proposal-rationale">{{ proposalRationale }}</p><p class="field-note">{{ currentParams ? currentParamsLabel : '尚未配置设备基线；左列 0 仅为计算参考。' }}</p><div class="parameter-comparison"><div v-for="key in activeParameters" :key="key"><strong>{{ key.toUpperCase() }}</strong><code>{{ format(currentProposal.before[key]) }}</code><span>→</span><code>{{ format(currentProposal.candidate[key]) }}</code></div></div><template v-if="validateTuningCommandPayload(currentProposal.commandPayload,currentProposal.command)"><p class="field-note">UTF-8 · {{ currentProposal.commandPayload!.byteLength }} 字节 · 行尾 {{ currentProposal.commandPayload!.format.lineEnding.toUpperCase() }} · {{ currentProposal.commandPayload!.format.escapeText ? '解析转义' : '保留字面字符' }}</p><pre class="command-preview" aria-label="最终发送字节的可见文本"><code>{{ currentProposal.commandPayload!.visibleText }}</code></pre><details class="wire-details"><summary>查看最终 HEX 字节</summary><pre class="command-preview"><code>{{ currentProposal.commandPayload!.hex }}</code></pre></details></template><p v-else-if="currentProposal.command" class="field-error">此候选缺少有效的最终字节预览，请重新生成后再核对发送。</p><p v-if="currentProposal.status === 'proposed' && !isTrialForPlan(currentProposal,plan,globalChannelStore.getGeneration())" class="field-error">配置已变化，重新生成候选后才能发送。</p><div v-if="currentProposal.status === 'proposed' && !isWorking" class="proposal-actions"><button type="button" class="secondary-button" :disabled="!executionEnabled || planErrors.length > 0 || !validateTuningCommandPayload(currentProposal.commandPayload,currentProposal.command) || !isTrialForPlan(currentProposal,plan,globalChannelStore.getGeneration())" @click="sendManualTrial(currentProposal)">核对命令并发送</button><button type="button" class="text-button" @click="currentProposal.status = 'rejected'; pendingTrialId = null">忽略候选</button></div><p v-if="currentProposal.status === 'queued'" class="field-note">仅已排队，驱动写入与设备生效尚未确认。</p><template v-if="executionEnabled && currentProposal.status === 'sent' && plan.confirmation.mode === 'manual'"><label class="check-field"><input v-model="manualConfirmation" type="checkbox"><span>我已在设备上核对，这组参数已生效。</span></label><button type="button" class="secondary-button" :disabled="!manualConfirmation || !awaitingManualConfirmation || stopRequested" @click="confirmManualTrial">确认并观察遥测</button></template><p v-else-if="currentProposal.status === 'sent'" class="field-note">等待{{ confirmationLabel(plan.confirmation.mode) }}，超时暂停。</p><dl v-if="currentProposal.metrics" class="trial-metrics"><div><dt>{{ plan.goal.mode === 'track' ? 'RMS 跟踪误差' : '稳态误差' }}</dt><dd>{{ format(plan.goal.mode === 'track' ? currentProposal.metrics.rmsTrackingError : currentProposal.metrics.steadyError,4) }} {{ plan.units.feedback }}</dd></div><div><dt>最大输出</dt><dd>{{ format(currentProposal.metrics.maximumOutputMagnitude) }} {{ plan.units.output }}</dd></div><div v-if="currentProposal.metrics.overshootPercent !== null"><dt>实测超调</dt><dd>{{ format(currentProposal.metrics.overshootPercent,2) }}%</dd></div></dl></section>
           <div v-else class="result-empty"><h3>在波形旁审阅参数候选</h3><p>每轮记录计算依据、命令写入、设备确认和遥测评价。候选与设备结果分别标记。</p><button type="button" class="text-button" @click="assistantPane = 'setup'">返回场景与设置</button></div>
           <details class="settings-section" :open="session.trials.length > 0"><summary>试验记录 <span>{{ session.trials.length }} 轮</span></summary><div class="details-body"><ol v-if="session.trials.length" class="trial-list"><li v-for="trial in session.trials.slice(0,30)" :key="trial.id"><div><time>{{ formatTimestamp(trial.createdAt) }}</time><span>{{ trialStateName(trial.status) }}</span></div><code>Kp {{ format(trial.candidate.kp) }} · Ki {{ format(trial.candidate.ki) }} · Kd {{ format(trial.candidate.kd) }}</code><p>{{ trial.metrics ? `${trial.metrics.sampleCount} 点设备遥测 · 误差 ${format(trial.metrics.steadyError,4)}` : trial.status === 'rejected' ? trial.note : trial.confirmation || '尚未设备确认 / 评价' }}</p></li></ol><p v-else class="field-note">还没有候选。配置后可先审阅一轮。</p><button v-if="session.bestVerified" type="button" class="text-button" :disabled="isWorking || aiBusy || modelBusy" @click="useLastVerified">载入最佳实测验证参数</button></div></details>
           <p v-if="session.stopReason" class="notice notice-warning">{{ session.stopReason }}</p><div v-if="planErrors.length" class="execution-check"><strong>发送与试验前待完成</strong><ul><li v-for="issue in openIssues" :key="issue">{{ issue }}</li></ul><button type="button" class="text-button" @click="assistantPane = 'setup'; channelSettingsOpen = parameterSettingsOpen = goalSettingsOpen = true">完善执行设置</button></div>
