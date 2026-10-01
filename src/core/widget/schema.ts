@@ -8,9 +8,11 @@ import {
   type SliderWidgetConfig,
   type ButtonWidgetConfig,
   type NumberInputWidgetConfig,
+  type ChannelMeta,
 } from '../../types/widget';
 import { validateTemplate } from './templateEngine';
 import { globalWidgetRegistry } from './registry';
+import { normalizeChannelUnitMetadata } from '../channel/channelPresentation';
 
 /**
  * 校验单项控件配置合法性
@@ -282,6 +284,24 @@ export function validateAndMigrateDashboard(raw: any): { ok: boolean; data?: Vof
 
   // 1. 若为标准 V2 结构
   if (raw.version === 2 && Array.isArray(raw.tabs) && raw.tabs.length > 0) {
+    const channels: Record<string, ChannelMeta> = {};
+    if (raw.channels !== undefined) {
+      if (!raw.channels || typeof raw.channels !== 'object' || Array.isArray(raw.channels)) {
+        return { ok: false, error: '通道元数据必须为对象。' };
+      }
+      for (const [id, value] of Object.entries(raw.channels)) {
+        try {
+          const unitMetadata = normalizeChannelUnitMetadata(value);
+          const meta = { ...(value as ChannelMeta) };
+          delete meta.unit;
+          delete meta.unitSource;
+          Object.assign(meta, unitMetadata);
+          Object.defineProperty(channels, id, { value: meta, enumerable: true, configurable: true, writable: true });
+        } catch (error) {
+          return { ok: false, error: `通道 ${id} 的原始单位无效：${error instanceof Error ? error.message : String(error)}` };
+        }
+      }
+    }
     const validTabs: CanvasTab[] = [];
     for (const tab of raw.tabs) {
       if (!tab || typeof tab !== 'object') continue;
@@ -340,7 +360,7 @@ export function validateAndMigrateDashboard(raw: any): { ok: boolean; data?: Vof
           grid_size: [10, 20, 40].includes(raw.grid_size) ? raw.grid_size : 20,
           locked: Boolean(raw.locked),
           tabs: validTabs,
-          channels: raw.channels || {},
+          channels,
           updated_at: Date.now(),
         },
       };

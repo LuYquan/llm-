@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, ref, shallowRef, onMounted, onUnmounted, watch } from 'vue';
+import { computed, defineAsyncComponent, provide, ref, shallowRef, onMounted, onUnmounted, watch } from 'vue';
 import { isTauri } from '@tauri-apps/api/core';
 import AppHeader from './components/AppHeader.vue';
 import IconDock, { type DockDrawerType } from './components/IconDock.vue';
@@ -20,6 +20,8 @@ import type { QuickCmd } from './components/QuickCommandPanel.vue';
 import type { SerialPortInfo } from './components/TopBar.vue';
 import { useWidgetStore, createNewWidget, DEFAULT_CHANNEL_PALETTE } from './stores/widgetStore';
 import type { AssistantAction } from './core/assistant/debugAssistant';
+import { CHART_EVIDENCE_CONTEXT } from './core/assistant/chartEvidenceContext';
+import { assistantEvidenceSelection, clearEvidenceSelection } from './core/assistant/evidenceSelectionStore';
 import { globalSendGate } from './core/widget/sendGate';
 import { globalRenderScheduler } from './core/widget/renderScheduler';
 import { globalChannelStore } from './core/channel/ChannelStore';
@@ -138,6 +140,28 @@ const terminalStripRef = ref<InstanceType<typeof DockedTerminalStrip> | null>(nu
 const copilotDrawerRef = ref<InstanceType<typeof DebugAssistantPanel> | null>(null);
 const pendingCopilotPrompt = ref<{ prompt: string; log?: string } | null>(null);
 const pendingAssistantSettings = ref(false);
+provide(CHART_EVIDENCE_CONTEXT, computed(() => ({
+  source: mode.value === 'mock' ? 'demo' as const : isRunning.value ? 'live' as const : 'unknown' as const,
+  timeSource: mode.value === 'mock' ? '演示生成的时间轴（秒）' : '缓存时间轴（秒）；设备采样时钟未验证',
+  canReview: !isTuningBusy.value && !isApplyingProtocol.value,
+  disabledReason: isTuningBusy.value ? '先停止当前参数实验，再审阅选区。' : isApplyingProtocol.value ? '协议切换完成后重新选择区间。' : '',
+})));
+const clearAssistantOnChannelClear = globalChannelStore.onCleared(() => clearEvidenceSelection());
+watch(assistantEvidenceSelection, (selection) => {
+  if (!selection) return;
+  if (isTuningBusy.value || isApplyingProtocol.value) {
+    clearEvidenceSelection();
+    appendLog('warn', '[AI EVIDENCE]', '当前实验或协议切换占用工作区，请结束后重新选择区间。');
+    return;
+  }
+  analysisOpen.value = false;
+  assistantTab.value = 'debug';
+  copilotVisited.value = true;
+  isCopilotDrawerOpen.value = true;
+  const prompt = { prompt: '解释这个波形选区的变化，区分可直接观察的现象与仍需核对的原因。' };
+  if (copilotDrawerRef.value) copilotDrawerRef.value.prefill(prompt.prompt);
+  else pendingCopilotPrompt.value = prompt;
+}, { flush: 'sync' });
 watch(copilotDrawerRef, (drawer) => {
   if (drawer && pendingAssistantSettings.value) {
     pendingAssistantSettings.value = false;
@@ -922,6 +946,9 @@ async function handleOpenLogDir() {
 
 // ADR 0004 全局急停空格键拦截处理
 function handleKeyDown(event: KeyboardEvent) {
+  // The channel dialog owns its focus, Escape and Tab keys. Let its document
+  // capture handler run before any workbench-wide drawer shortcut consumes them.
+  if (event.target instanceof Element && event.target.closest('[data-channel-config-dialog]')) return;
   // 快捷键 Ctrl + ~ 切换终端日志抽屉
   if ((event.ctrlKey || event.metaKey) && (event.key === '`' || event.key === '~')) {
     event.preventDefault();
@@ -1530,7 +1557,20 @@ onMounted(async () => {
   unsubWaveformBatch = session.onWaveformBatch((batch) => {
     // 即使界面暂停跟随或正在 Scrubber 回溯，后台环形缓冲与安全分析也决不丢弃数据
     if (!batch || !batch.timestamps || batch.timestamps.length === 0) return;
+    const previousContext = globalChannelStore.getSessionContext();
+    const nextSessionId = batch.session_id || null;
+    const nextEpoch = Number.isSafeInteger(batch.channel_epoch) ? batch.channel_epoch : null;
+    if (previousContext.sessionId !== nextSessionId || previousContext.epoch !== nextEpoch) {
+      // The volatile chart cache must never relabel earlier-session samples as
+      // current evidence. Raw recording history remains in its recording store.
+      globalChannelStore.clear();
+    }
     globalChannelStore.setSessionContext(batch.session_id || null, batch.channel_epoch);
+    const frozenSelection = assistantEvidenceSelection.value;
+    const currentContext = globalChannelStore.getSessionContext();
+    if (frozenSelection && (frozenSelection.context.sessionId !== currentContext.sessionId
+      || frozenSelection.context.epoch !== currentContext.epoch
+      || frozenSelection.context.generation !== globalChannelStore.getGeneration())) clearEvidenceSelection();
     const names = batch.channel_names || batch.series.map((_series, index) => `!${index}`);
     globalChannelStore.pushSeries(names, batch.timestamps, batch.series);
     activeChannels.value = globalChannelStore.listChannels().filter(id => (globalChannelStore.getBuffer(id, false)?.getSize() || 0) > 0);
@@ -1544,11 +1584,13 @@ onMounted(async () => {
 watch(isRunning, (val) => {
   dtrState.value = null;
   rtsState.value = null;
-  if (!val) { activeChannels.value = []; activeAnomaly.value = null; anomaliesList.value = []; globalLogAnalyzer.clearAnomalies(); }
+  if (!val) { clearEvidenceSelection(); activeChannels.value = []; activeAnomaly.value = null; anomaliesList.value = []; globalLogAnalyzer.clearAnomalies(); }
   globalSendGate.setPortConnected(val);
 });
 
 onUnmounted(() => {
+  clearAssistantOnChannelClear();
+  clearEvidenceSelection();
   recordingReplayController.close();
   window.removeEventListener('keydown', handleKeyDown, true);
   if (statusInterval) clearInterval(statusInterval);

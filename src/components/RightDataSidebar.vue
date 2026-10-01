@@ -3,6 +3,7 @@ import { ref, onMounted, onUnmounted, nextTick } from 'vue';
 import { useWidgetStore, DEFAULT_CHANNEL_PALETTE } from '../stores/widgetStore';
 import { globalChannelStore } from '../core/channel/ChannelStore';
 import type { ChannelMeta } from '../types/widget';
+import { CHANNEL_UNIT_MAX_LENGTH, normalizeChannelUnitMetadata, presentChannel } from '../core/channel/channelPresentation';
 
 defineProps<{
   isRunning: boolean;
@@ -28,6 +29,12 @@ const editingChannelName = ref('');
 // 通道配置弹窗
 const configModalOpen = ref(false);
 const activeConfigChannel = ref<ChannelMeta | null>(null);
+const rawUnitInput = ref('');
+const rawUnitConfirmed = ref(false);
+const configError = ref('');
+const configDialog = ref<HTMLDivElement | null>(null);
+const rawUnitField = ref<HTMLInputElement | null>(null);
+let configReturnFocus: HTMLElement | null = null;
 
 // 头部更多操作菜单
 const isMenuOpen = ref(false);
@@ -86,6 +93,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (unsubChannels) unsubChannels();
   if (pollTimer) clearInterval(pollTimer);
+  removeConfigFocusGuard();
 });
 
 function toggleCollapse() {
@@ -126,21 +134,91 @@ function cancelRename() {
 
 function openChannelConfig(ch: string, e: MouseEvent) {
   e.stopPropagation();
+  configReturnFocus = e.currentTarget instanceof HTMLElement ? e.currentTarget : document.activeElement instanceof HTMLElement ? document.activeElement : null;
   activeConfigChannel.value = JSON.parse(JSON.stringify(store.getChannelMeta(ch)));
+  rawUnitInput.value = activeConfigChannel.value?.unit ?? '';
+  rawUnitConfirmed.value = false;
+  configError.value = '';
   configModalOpen.value = true;
+  document.addEventListener('keydown', handleConfigKeydown, true);
+  document.addEventListener('focusin', containConfigFocus, true);
+  nextTick(() => {
+    if (configModalOpen.value) rawUnitField.value?.focus();
+  });
+}
+
+function removeConfigFocusGuard() {
+  document.removeEventListener('keydown', handleConfigKeydown, true);
+  document.removeEventListener('focusin', containConfigFocus, true);
+}
+
+function closeChannelConfig() {
+  configModalOpen.value = false;
+  removeConfigFocusGuard();
+  const returnFocus = configReturnFocus;
+  configReturnFocus = null;
+  nextTick(() => {
+    if (returnFocus?.isConnected) returnFocus.focus();
+  });
+}
+
+function containConfigFocus(event: FocusEvent) {
+  if (!configModalOpen.value || !configDialog.value || !(event.target instanceof Node)) return;
+  if (!configDialog.value.contains(event.target)) (rawUnitField.value ?? configDialog.value).focus();
+}
+
+function handleConfigKeydown(event: KeyboardEvent) {
+  if (!configModalOpen.value || !configDialog.value) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    event.stopPropagation();
+    closeChannelConfig();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const focusable = Array.from(configDialog.value.querySelectorAll<HTMLElement>('button, input, select, textarea, a[href], [tabindex]'))
+    .filter((element) => element.tabIndex >= 0 && !element.hasAttribute('disabled') && element.getClientRects().length > 0);
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (!first || !last) {
+    event.preventDefault();
+    configDialog.value.focus();
+    return;
+  }
+  const active = document.activeElement;
+  if (!configDialog.value.contains(active) || (event.shiftKey && active === first) || (!event.shiftKey && active === last)) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  }
+}
+
+function unitInputChanged() {
+  rawUnitConfirmed.value = false;
+  configError.value = '';
+}
+
+function channelLabel(id: string): string {
+  return presentChannel(id, store.getChannelMeta(id)).label;
 }
 
 function saveChannelConfig() {
-  if (activeConfigChannel.value) {
+  if (!activeConfigChannel.value) return;
+  try {
+    const unitMetadata = rawUnitInput.value === '' ? {} : normalizeChannelUnitMetadata({ unit: rawUnitInput.value, unitSource: 'user' });
+    if (unitMetadata.unit && !rawUnitConfirmed.value) throw new Error('保存前请确认这是固件原始数据的单位，尚未进行显示缩放。');
     store.updateChannelMeta(activeConfigChannel.value.id, {
       scale: activeConfigChannel.value.scale,
       yOffset: activeConfigChannel.value.yOffset,
       xOffset: activeConfigChannel.value.xOffset,
       decimal: activeConfigChannel.value.decimal,
       color: activeConfigChannel.value.color,
+      unit: unitMetadata.unit,
+      unitSource: unitMetadata.unitSource,
     });
+    closeChannelConfig();
+  } catch (error) {
+    configError.value = error instanceof Error ? error.message : String(error);
   }
-  configModalOpen.value = false;
 }
 
 function openColorPicker(ch: string, e: MouseEvent) {
@@ -329,7 +407,7 @@ defineExpose({
           draggable="true"
           @dragstart="onDragStart($event, ch)"
           @dragend="onDragEnd"
-          :title="`按住向左拖拽至画布控件绑定通道 [${store.getChannelMeta(ch).name}]；双击重命名`"
+          :title="`按住向左拖拽至画布控件绑定通道 [${channelLabel(ch)}]；双击重命名`"
         >
           <!-- 1. 眼睛可见性切换 -->
           <button
@@ -404,7 +482,7 @@ defineExpose({
               @click.stop
             />
             <span v-else class="channel-name font-mono">
-              {{ store.getChannelMeta(ch).name }}
+              {{ channelLabel(ch) }}
             </span>
           </div>
 
@@ -422,7 +500,8 @@ defineExpose({
           <button
             class="btn-channel-gear"
             @click="openChannelConfig(ch, $event)"
-            title="精细预处理配置 (Scale/Offset/Decimal)"
+            title="原始单位与显示缩放配置"
+            :aria-label="`${channelLabel(ch)}：原始单位与显示缩放配置`"
           >
             ⚙️
           </button>
@@ -431,14 +510,22 @@ defineExpose({
     </div>
 
     <!-- 通道精细配置模态弹窗 -->
-    <div v-if="configModalOpen && activeConfigChannel" class="modal-mask" @click="configModalOpen = false">
-      <div class="config-modal-box" @click.stop>
+    <Teleport to="body">
+    <div v-if="configModalOpen && activeConfigChannel" class="modal-mask" @click.self="closeChannelConfig">
+      <div ref="configDialog" class="config-modal-box" data-channel-config-dialog role="dialog" aria-modal="true" aria-labelledby="channel-config-title" tabindex="-1" @click.stop>
         <header class="modal-header">
-          <h4>通道 [{{ activeConfigChannel.name }}] 高级属性配置</h4>
-          <button class="btn-close" @click="configModalOpen = false">✕</button>
+          <h4 id="channel-config-title">通道 {{ presentChannel(activeConfigChannel.id, activeConfigChannel).label }}</h4>
+          <button class="btn-close" aria-label="关闭通道配置" @click="closeChannelConfig">✕</button>
         </header>
 
         <div class="modal-body">
+          <div class="form-row">
+            <label for="channel-raw-unit">原始数据单位（可留空）:</label>
+            <input id="channel-raw-unit" ref="rawUnitField" v-model="rawUnitInput" type="text" :maxlength="CHANNEL_UNIT_MAX_LENGTH" class="form-input" placeholder="待用户确认" @input="unitInputChanged" />
+          </div>
+          <label v-if="rawUnitInput !== ''" class="unit-confirmation"><input v-model="rawUnitConfirmed" type="checkbox" />我已核对固件原始数据单位；这是用户提供的声明。</label>
+          <p class="unit-note">单位描述收到的原始数值。下方缩放和偏置只影响显示，不修改原始数据、调参执行数值或单位；换设备或协议后应重新核对。</p>
+          <p v-if="configError" class="unit-error" role="alert">{{ configError }}</p>
           <div class="form-row">
             <label>Scale 线性缩放倍率:</label>
             <input v-model.number="activeConfigChannel.scale" type="number" step="0.001" class="form-input" />
@@ -458,11 +545,12 @@ defineExpose({
         </div>
 
         <footer class="modal-footer">
-          <button class="btn-secondary" @click="configModalOpen = false">取消</button>
+          <button class="btn-secondary" @click="closeChannelConfig">取消</button>
           <button class="btn-primary" @click="saveChannelConfig">保存配置</button>
         </footer>
       </div>
     </div>
+    </Teleport>
   </aside>
 </template>
 
@@ -764,11 +852,18 @@ defineExpose({
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 999;
+  z-index: 2000;
+  padding: 16px;
+  box-sizing: border-box;
 }
 
 .config-modal-box {
-  width: 320px;
+  width: min(360px, 100%);
+  max-height: calc(100vh - 32px);
+  max-height: calc(100dvh - 32px);
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
   background: var(--bg-surface, #272623);
   border: 1px solid var(--border-subtle, #383633);
   border-radius: 8px;
@@ -784,12 +879,15 @@ defineExpose({
   border-bottom: 1px solid var(--border-subtle, #383633);
   padding-bottom: 8px;
   margin-bottom: 12px;
+  flex-shrink: 0;
+  gap: 8px;
 }
 
 .modal-header h4 {
   margin: 0;
-  font-size: 13px;
+  font-size: 16px;
   color: var(--text-main, #ECEAE4);
+  overflow-wrap: anywhere;
 }
 
 .btn-close {
@@ -798,6 +896,9 @@ defineExpose({
   color: var(--text-muted, #9E9C94);
   cursor: pointer;
   font-size: 14px;
+  min-width: 32px;
+  min-height: 32px;
+  flex-shrink: 0;
 }
 
 .btn-close:hover {
@@ -808,25 +909,32 @@ defineExpose({
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-height: 0;
+  overflow-y: auto;
 }
+
+.unit-confirmation, .unit-note, .unit-error { font-size: 12px; line-height: 1.5; }
+.unit-confirmation { display: flex; align-items: flex-start; gap: 6px; color: var(--text-main); }
+.unit-note { margin: 0; color: var(--text-muted); }
+.unit-error { margin: 0; color: var(--accent-rose, #fb8292); }
 
 .form-row {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-main, #ECEAE4);
 }
 
 .form-input {
   width: 90px;
-  height: 24px;
+  height: 32px;
   background: var(--bg-elevated, #2F2E2A);
   border: 1px solid var(--border-subtle, #383633);
   border-radius: 4px;
   color: var(--text-main, #ECEAE4);
   padding: 0 6px;
-  font-size: 11px;
+  font-size: 12px;
   font-family: monospace;
 }
 
@@ -842,7 +950,10 @@ defineExpose({
   margin-top: 16px;
   padding-top: 10px;
   border-top: 1px solid var(--border-subtle, #383633);
+  flex-shrink: 0;
 }
+
+.modal-footer button { min-height: 32px; font-size: 12px; }
 
 .btn-secondary {
   background: var(--bg-elevated, #2F2E2A);

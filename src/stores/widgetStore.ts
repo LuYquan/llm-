@@ -12,6 +12,7 @@ import { globalSendGate } from '../core/widget/sendGate';
 import { globalWidgetRegistry } from '../core/widget/registry';
 import { createDefaultVofaPreset, validateAndMigrateDashboard } from '../core/widget/schema';
 import { globalRenderScheduler } from '../core/widget/renderScheduler';
+import { normalizeChannelUnitMetadata } from '../core/channel/channelPresentation';
 
 export { createDefaultVofaPreset } from '../core/widget/schema';
 
@@ -498,8 +499,15 @@ export function useWidgetStore() {
   }
 
   function updateChannelMeta(id: string, partial: Partial<ChannelMeta>) {
+    if (partial.id !== undefined && partial.id !== id) throw new Error('通道元数据不能改变真实通道 ID。');
+    // Invalid edits must not initialize a channel or schedule persistence.
+    const current = dashboardState.value.channels?.[id];
+    const unitMetadata = normalizeChannelUnitMetadata({ ...current, ...partial });
     const meta = getChannelMeta(id);
     Object.assign(meta, partial);
+    delete meta.unit;
+    delete meta.unitSource;
+    Object.assign(meta, unitMetadata);
     if (partial.name) {
       globalChannelStore.setAlias(partial.name, id);
     }

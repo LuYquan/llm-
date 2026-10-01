@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch, shallowRef } from 'vue';
+import { ref, computed, inject, onMounted, onUnmounted, watch, shallowRef } from 'vue';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import type { ChartConfig } from '../../types/widget';
@@ -11,6 +11,9 @@ import type { FftInputQuality, FftResult } from '../../core/analysis/fft';
 import { analysisWorker, type CancellableAnalysis } from '../../services/analysis/analysis-worker-client';
 import { useWidgetStore, DEFAULT_CHANNEL_PALETTE } from '../../stores/widgetStore';
 import { alignSnapshotsByTimestamp } from '../../core/channel/alignment';
+import { CHART_EVIDENCE_CONTEXT, UNKNOWN_CHART_EVIDENCE_CONTEXT } from '../../core/assistant/chartEvidenceContext';
+import { createFrozenSelection } from '../../core/assistant/evidenceSelection';
+import { publishEvidenceSelection } from '../../core/assistant/evidenceSelectionStore';
 
 const props = defineProps<{
   config: ChartConfig;
@@ -25,6 +28,11 @@ const emit = defineEmits<{
 }>();
 
 const store = useWidgetStore();
+const evidenceContext = inject(CHART_EVIDENCE_CONTEXT, computed(() => UNKNOWN_CHART_EVIDENCE_CONTEXT));
+const selectedRawRange = ref<{ from: number; to: number; generation: number; sessionId: string | null; epoch: number | null } | null>(null);
+const selectionEvidenceMessage = ref('');
+const selectionFrom = ref<string | number>('');
+const selectionTo = ref<string | number>('');
 const chartContainer = ref<HTMLDivElement | null>(null);
 const uplotInstance = shallowRef<uPlot | null>(null);
 const pointCount = ref(0);
@@ -64,9 +72,9 @@ let fftJob: CancellableAnalysis<{ quality: FftInputQuality; result: FftResult | 
 const selectionStats = ref<{
   dt: number;
   freq: number;
-  yMin: number;
-  yMax: number;
-  dy: number;
+  yMin: number | null;
+  yMax: number | null;
+  dy: number | null;
   dutyCycle?: number;
 } | null>(null);
 
@@ -125,6 +133,42 @@ watch(
 // 缓存的数据切片
 let xData: any = new Float64Array(0);
 let ySeriesData: any[] = [];
+
+function updateSelectedRange(from: number, to: number) {
+  const dt = to - from;
+  if (!Number.isFinite(from) || !Number.isFinite(to) || !Number.isFinite(dt) || dt <= 0) {
+    selectedRawRange.value = null;
+    selectionStats.value = null;
+    return;
+  }
+  selectedRawRange.value = { from, to, generation: globalChannelStore.getGeneration(), ...globalChannelStore.getSessionContext() };
+  selectionEvidenceMessage.value = '';
+  const primaryIdx = localSeries.value.findIndex((series) => series.visible && store.getChannelMeta(series.channel).visible);
+  const displayedValues: number[] = [];
+  if (primaryIdx >= 0 && ySeriesData[primaryIdx]) {
+    const yArr = ySeriesData[primaryIdx];
+    for (let index = 0; index < xData.length; index++) {
+      const time = xData[index];
+      const value = yArr[index];
+      if (Number.isFinite(time) && time >= from && time <= to && Number.isFinite(value)) displayedValues.push(value);
+    }
+  }
+  const yMin = displayedValues.length ? Math.min(...displayedValues) : null;
+  const yMax = displayedValues.length ? Math.max(...displayedValues) : null;
+  const difference = yMin !== null && yMax !== null ? yMax - yMin : null;
+  const dy = difference !== null && Number.isFinite(difference) ? difference : null;
+  const yMid = yMin !== null && yMax !== null ? yMin / 2 + yMax / 2 : null;
+  const highCount = yMid !== null ? displayedValues.filter((value) => value >= yMid).length : 0;
+  selectionStats.value = {
+    dt,
+    freq: 1 / dt,
+    yMin,
+    yMax,
+    dy,
+    dutyCycle: displayedValues.length > 0 && dy !== null && dy > 1e-4
+      ? (highCount / displayedValues.length) * 100 : undefined,
+  };
+}
 
 // 每条曲线最多向绘图器提供此数量的显示点。记录缓冲仍保留完整原始样本。
 const MAX_DISPLAY_POINTS_PER_CHANNEL = 3000;
@@ -200,48 +244,7 @@ function initChart() {
         (u) => {
           const min = u.posToVal(u.select.left, 'x');
           const max = u.posToVal(u.select.left + u.select.width, 'x');
-          if (max > min) {
-            const dt = max - min;
-            const freq = dt > 0 ? 1 / dt : 0;
-            // 统计主显示通道在这个时间区间内的 Min/Max/Delta
-            let yMin = Infinity;
-            let yMax = -Infinity;
-            let highCount = 0;
-            let totalCount = 0;
-            const primaryIdx = localSeries.value.findIndex((s) => s.visible);
-            if (primaryIdx >= 0 && ySeriesData[primaryIdx]) {
-              const yArr = ySeriesData[primaryIdx];
-              for (let i = 0; i < xData.length; i++) {
-                const t = xData[i];
-                if (t >= min && t <= max) {
-                  const val = yArr[i];
-                  if (val < yMin) yMin = val;
-                  if (val > yMax) yMax = val;
-                }
-              }
-              const yMid = (yMin + yMax) / 2;
-              for (let i = 0; i < xData.length; i++) {
-                const t = xData[i];
-                if (t >= min && t <= max) {
-                  const val = yArr[i];
-                  if (val >= yMid) highCount++;
-                  totalCount++;
-                }
-              }
-            }
-            const dutyCycle = totalCount > 0 && yMax - yMin > 1e-4
-              ? (highCount / totalCount) * 100
-              : undefined;
-
-            selectionStats.value = {
-              dt,
-              freq,
-              yMin: isFinite(yMin) ? yMin : 0,
-              yMax: isFinite(yMax) ? yMax : 0,
-              dy: isFinite(yMax - yMin) ? yMax - yMin : 0,
-              dutyCycle,
-            };
-          }
+          updateSelectedRange(min, max);
         },
       ],
     },
@@ -263,11 +266,43 @@ function initChart() {
 }
 
 function reinitChart() {
+  selectedRawRange.value = null;
+  selectionStats.value = null;
   if (uplotInstance.value) {
     uplotInstance.value.destroy();
     uplotInstance.value = null;
   }
   initChart();
+}
+
+function selectTypedRange(event: Event) {
+  selectedRawRange.value = null;
+  selectionStats.value = null;
+  uplotInstance.value?.setSelect({ left: 0, top: 0, width: 0, height: 0 }, false);
+  const from = Number(selectionFrom.value);
+  const to = Number(selectionTo.value);
+  if (!String(selectionFrom.value).trim() || !String(selectionTo.value).trim() || !Number.isFinite(from) || !Number.isFinite(to) || !Number.isFinite(to - from) || to <= from) {
+    selectionEvidenceMessage.value = '请输入有限的起止时间，终点须大于起点。';
+    return;
+  }
+  const chart = uplotInstance.value;
+  if (!chart || viewMode.value !== 'waveform') {
+    selectionEvidenceMessage.value = '收到波形样本后才能选择区间；请先切换到波形视图。';
+    return;
+  }
+  const { min, max } = chart.scales.x;
+  if (min == null || max == null || from < min || to > max) {
+    selectionEvidenceMessage.value = '区间超出当前视窗。请先回溯到对应波形，再选择区间。';
+    return;
+  }
+  isLiveFollowing.value = false;
+  const left = chart.valToPos(from, 'x');
+  const right = chart.valToPos(to, 'x');
+  chart.setSelect({ left, top: 0, width: right - left, height: chart.over.clientHeight }, true);
+  // Keep the user's exact seconds rather than the pixel round-trip approximation.
+  updateSelectedRange(from, to);
+  const details = (event.currentTarget as HTMLFormElement).closest('details');
+  if (details) details.open = false;
 }
 
 function toggleSeries(idx: number) {
@@ -401,6 +436,8 @@ function handleWheel(e: WheelEvent) {
 
 // 双击或点击按钮重置缩放与平移 (恢复实时流跟随态)
 function resetView() {
+  selectedRawRange.value = null;
+  selectionEvidenceMessage.value = '';
   if (!uplotInstance.value) return;
   isLiveFollowing.value = true;
   selectionStats.value = null;
@@ -426,6 +463,41 @@ function resetView() {
 
   if (xData.length > 0) {
     onRenderFrame();
+  }
+}
+
+function captureSelectionForAssistant() {
+  try {
+    if (!evidenceContext.value.canReview) throw new Error(evidenceContext.value.disabledReason);
+    const range = selectedRawRange.value;
+    const context = globalChannelStore.getSessionContext();
+    if (!range) throw new Error('先在波形上拖动选择时间区间。');
+    if (range.generation !== globalChannelStore.getGeneration() || range.sessionId !== context.sessionId || range.epoch !== context.epoch) {
+      throw new Error('选区的设备或解析会话已变化，请重新选择。');
+    }
+    const canonicalIds = globalChannelStore.listChannels();
+    const channels = new Map<string, { canonicalId: string; snapshot: ReturnType<typeof globalChannelStore.snapshot>; metadata: ReturnType<typeof store.getChannelMeta> }>();
+    for (const series of localSeries.value) {
+      if (!series.visible || !store.getChannelMeta(series.channel).visible) continue;
+      const buffer = globalChannelStore.getBuffer(series.channel, false);
+      if (!buffer || buffer.getSize() === 0) continue;
+      const canonicalId = canonicalIds.find(id => globalChannelStore.getBuffer(id, false) === buffer);
+      if (!canonicalId) throw new Error('曲线没有可追溯的原始通道 ID，请重新绑定。');
+      const snapshot = globalChannelStore.snapshot(canonicalId, range.from, range.to);
+      if (snapshot.count === 0) continue;
+      channels.set(canonicalId, { canonicalId, snapshot, metadata: store.getChannelMeta(canonicalId) });
+    }
+    if (!channels.size) throw new Error('选区已不在当前原始缓存中，或可见曲线没有区间样本，请重新选择。');
+    const selection = createFrozenSelection({
+      context: { ...context, generation: range.generation, source: evidenceContext.value.source, timeSource: evidenceContext.value.timeSource },
+      range: { from: range.from, to: range.to },
+      sourceWidget: { id: props.widgetId || 'unidentified-chart', title: '波形图选区' },
+      channels: [...channels.values()],
+    });
+    publishEvidenceSelection(selection);
+    selectionEvidenceMessage.value = '已冻结选区原始值。到 AI 辅助中预览并勾选后分析。';
+  } catch (error) {
+    selectionEvidenceMessage.value = error instanceof Error ? error.message : String(error);
   }
 }
 
@@ -761,6 +833,8 @@ function clearRenderedData() {
   ySeriesData = [];
   pointCount.value = 0;
   selectionStats.value = null;
+  selectedRawRange.value = null;
+  selectionEvidenceMessage.value = '';
   isLiveFollowing.value = true;
   uplotInstance.value?.destroy();
   uplotInstance.value = null;
@@ -874,8 +948,9 @@ onUnmounted(() => {
         <!-- 测距提示小胶囊 (含占空比估算) -->
         <div v-if="selectionStats" class="stat-badge" title="选中区间测距与占空比分析">
           <span>Δt: {{ (selectionStats.dt * 1000).toFixed(1) }}ms</span>
-          <span>Δy: {{ selectionStats.dy.toFixed(2) }}</span>
+          <span>Δy: {{ selectionStats.dy === null ? '无有效显示点' : selectionStats.dy.toFixed(2) }}</span>
           <span v-if="selectionStats.dutyCycle != null">占空比: {{ selectionStats.dutyCycle.toFixed(1) }}%</span>
+          <button type="button" class="btn-selection-assistant" :disabled="!evidenceContext.canReview" :title="evidenceContext.disabledReason || '冻结选区原始样本；在助手中预览后决定是否发送'" @click="captureSelectionForAssistant">选区交给 AI</button>
           <button class="btn-clear-stat" @click="handleDoubleClick" title="重置测距缩放">✕</button>
         </div>
 
@@ -900,7 +975,7 @@ onUnmounted(() => {
           回到实时
         </button>
 
-<details class="chart-more"><summary>分析与导出</summary><div class="chart-more-items">        <!-- FFT 频谱分析按钮 -->
+<details class="chart-more"><summary>分析与导出</summary><div class="chart-more-menu"><div class="chart-more-items">        <!-- FFT 频谱分析按钮 -->
         <button
           type="button"
           class="btn-chart-tool"
@@ -934,7 +1009,14 @@ onUnmounted(() => {
           导出 CSV
         </button>
 
-</div></details>
+</div>
+          <form class="chart-selection-form" @submit.prevent="selectTypedRange">
+            <label>选区起点（秒）<input v-model="selectionFrom" type="number" step="any" placeholder="起点" /></label>
+            <label>选区终点（秒）<input v-model="selectionTo" type="number" step="any" placeholder="终点" /></label>
+            <button type="submit" class="btn-chart-tool">选定区间</button>
+          </form>
+          </div>
+        </details>
 
         <!-- 暂停/继续 -->
         <button
@@ -958,6 +1040,8 @@ onUnmounted(() => {
         </button>
       </div>
     </header>
+
+    <p v-if="selectionEvidenceMessage" class="selection-evidence-message" role="status">{{ selectionEvidenceMessage }}</p>
 
     <!-- uPlot 渲染视口 (波形模式) -->
     <div v-show="viewMode === 'waveform'" class="chart-viewport" ref="chartContainer">
@@ -1114,7 +1198,15 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.chart-more { position:relative; flex-shrink:0; font-size:12px; }.chart-more summary { cursor:pointer; padding:6px 8px; min-height:32px; white-space:nowrap; box-sizing:border-box; border:1px solid var(--border-subtle); border-radius:5px; }.chart-more-items { position:absolute; right:0; top:100%; min-width:160px; background:var(--bg-surface); border:1px solid var(--border-strong); border-radius:6px; padding:6px; display:flex; flex-direction:column; gap:6px; z-index:20; box-shadow:var(--card-shadow); }.chart-more-items .btn-chart-tool { justify-content:flex-start; min-height:32px; font-size:12px; }
+.chart-more { position:relative; flex-shrink:0; font-size:12px; }
+.chart-more summary { cursor:pointer; padding:6px 8px; min-height:32px; white-space:nowrap; box-sizing:border-box; border:1px solid var(--border-subtle); border-radius:5px; }
+.chart-more-menu { position:absolute; right:0; top:100%; width:252px; max-width:calc(100vw - 40px); background:var(--bg-surface); border:1px solid var(--border-strong); border-radius:6px; padding:8px; z-index:20; box-shadow:var(--card-shadow); }
+.chart-more-items { display:flex; flex-direction:column; gap:6px; }
+.chart-more-items .btn-chart-tool { justify-content:flex-start; min-height:32px; font-size:12px; }
+.chart-selection-form { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; padding-top:12px; border-top:1px solid var(--border-subtle); }
+.chart-selection-form label { display:flex; flex:1 1 100px; flex-direction:column; gap:4px; color:var(--text-secondary); font-size:12px; }
+.chart-selection-form input { width:100%; min-width:0; min-height:32px; box-sizing:border-box; padding:4px 6px; color:var(--text-primary); background:var(--bg-base); border:1px solid var(--border-strong); border-radius:4px; font:inherit; font-variant-numeric:tabular-nums; }
+.chart-selection-form input:focus-visible { outline:2px solid var(--accent-primary); outline-offset:2px; }
 
 .flagship-chart-widget {
   width: 100%;
@@ -1227,6 +1319,27 @@ onUnmounted(() => {
   font-family: monospace;
   padding: 2px 6px;
   border-radius: 4px;
+}
+
+.btn-selection-assistant {
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg-surface);
+  color: var(--text-main);
+  font: 12px var(--font-sans);
+  cursor: pointer;
+}
+.btn-selection-assistant:hover:not(:disabled) { background: var(--bg-elevated); }
+.btn-selection-assistant:disabled { opacity: .5; cursor: not-allowed; }
+.selection-evidence-message {
+  margin: 0;
+  padding: 6px 12px;
+  color: var(--text-main);
+  background: var(--bg-surface);
+  font: 12px/1.5 var(--font-sans);
+  overflow-wrap: anywhere;
 }
 
 .btn-clear-stat {

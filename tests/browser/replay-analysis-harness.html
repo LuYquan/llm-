@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>回放 FFT 结果归属 · 独立合成夹具</title>
+  <style>
+    :root{--bg-base:#15191f;--bg-elevated:#252d38;--text-main:#eef2f5;--text-muted:#aab5c3;--border-subtle:#344152;--border-strong:#506074;--accent-terracotta:#eab18c;--accent-rose:#fb8292;color-scheme:dark;font:14px system-ui;background:var(--bg-base);color:var(--text-main)}
+    body{max-width:1000px;margin:28px auto;padding:0 20px}h1{font-size:23px}p{line-height:1.7}button{font:inherit;padding:8px 14px;margin:0 8px 12px 0;background:var(--bg-elevated);border:1px solid var(--border-strong);border-radius:5px;color:var(--text-main);cursor:pointer}button:disabled{opacity:.5}#component-host{max-width:620px;margin-bottom:20px}pre{padding:14px;border:1px solid var(--border-subtle);font:12px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:650px;overflow:auto}.passed{color:#8cddb9}.failed{color:var(--accent-rose)}
+  </style>
+</head>
+<body>
+  <h1>回放 FFT 结果归属 · 独立合成夹具</h1>
+  <p>真实 Vue 组件与 module Worker，合成 A=5 Hz / B=11 Hz。异步反例仅延迟真实计算结果的交付，并故意允许取消后的迟到交付；不替换 FFT 数值算法。此页仅使用独立 127.0.0.1:5192 来源的合成数据，不读取用户记录，不调用 AI，不构成原生或硬件验收。</p>
+  <button id="reproduce">复现：计算 A 后选择 B</button><button id="run-all">运行归属与异步边界验证</button>
+  <p id="status" role="status">正在挂载组件…</p>
+  <main id="component-host"></main>
+  <details open><summary>机器可读结果</summary><pre id="results">尚未运行</pre></details>
+  <details><summary>真实 Worker 与交付事件</summary><pre id="events">[]</pre></details>
+  <script type="module" src="./replay-analysis-harness.ts"></script>
+</body>
+</html>

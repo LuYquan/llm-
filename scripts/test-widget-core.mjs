@@ -297,6 +297,9 @@ console.log('====================================================\n');
 const { runUiStreamliningTests } = await import('../tests/ui-streamlining.test.ts');
 await runUiStreamliningTests();
 await runSendGateTests();
+const { runChannelPresentationTests } = await import('../tests/channel-presentation.test.ts');
+await runChannelPresentationTests();
+await import('../tests/assistant-evidence-selection.test.ts');
 
 console.log('====================================================');
 console.log('🎉 界面与操作极简重构 (UI Streamlining) 测试 100% 全部通过！');

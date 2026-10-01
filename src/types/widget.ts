@@ -205,6 +205,8 @@ export interface CanvasTab {
 export interface ChannelMeta {
   id: string;               // 内部通道标识 (如 "0", "1", "speed", "!0")
   name: string;             // 显示别名 (默认 "!0", "!1", 支持双击就地重命名)
+  unit?: string;            // 用户确认的原始数据单位；不随显示缩放推断或换算
+  unitSource?: 'user';      // 必须与非空 unit 配对；不代表固件或硬件验收
   color: string;            // 通道专属曲线与标牌色彩
   visible: boolean;         // 全局曲线可见性
   scale: number;            // 线性缩放倍率 (默认 1.0)
