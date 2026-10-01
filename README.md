@@ -4,6 +4,8 @@
 
 ## 试用
 
+GitHub 仓库提供源码，`output/` 内的本机构建和验收材料不随源码提交。首次使用可按下方开发步骤生成测试包；已有本地测试包时按以下流程试用。
+
 1. 解压 `output/releases/` 内最新的 Windows x64 便携 ZIP 到可写目录，保留 EXE、`portable.flag`、说明和构建清单。
 2. 启动 `LLM串口.exe`；需要 Microsoft Edge WebView2 Runtime。
 3. 没有设备时点顶部“演示”。真实设备请选择串口、波特率，并在协议设置中配置解析格式。
@@ -19,7 +21,8 @@
 - 每个场景套组包含提示词、物理字段、模型假设和声明式技能。质量、半径等参数不能独自确定 PID；模型还需要输入输出关系、采样周期与设计目标。自定义传递函数按 s 的降幂系数输入；AI 推导只生成待审核模型与物理输入表单。
 - 软件停止锁定发送并可排队停止命令，不代表设备已经收到或停机，也不替代硬件急停。画布空白处可用 Space；按钮和输入框保留自身键盘操作。
 - 本版未签名。真实串口、拔插、ACK、设备停机、长时间硬件采集、云端 AI 服务和纯净 Windows 环境仍待验收。
-- 前端依赖审计由构建检查执行；Rust 依赖公告审计目前未配置，不能据此宣称所有依赖均无漏洞。
+- 串级连续模型合成使用完整 PID 和反馈方向；反馈中的纯滞后需要已核对的内环闭环等效模型。环路向导使用已提供对象、PID 和采样周期计算模型带宽，缺少输入时显示待提供。分层比及采样检查属于设计经验，不证明整组闭环稳定、离散固件一致性或硬件安全。
+- 前端依赖审计由构建检查执行。Rust 公告工具支持固定数据库与锁文件扫描，并保留维护/不健全实现告警；本轮结果与范围见[控制计算与依赖审计记录](docs/CONTROL_AND_DEPENDENCY_HARDENING_2026-10-01.md)。已知条目扫描不能证明依赖没有未知漏洞。
 
 ## 开发与验证
 
@@ -33,8 +36,23 @@ npm run check:release
 npm run build:beta
 ```
 
-`npm test` 运行传输/协议、控件/记录/回放和调参引擎三组前端测试。`check:release` 再运行 Rust 锁定依赖测试与 npm 审计。`build:beta` 完成全部检查、类型检查、前端及原生编译，并生成独立便携包和 ZIP 校验文件；任一失败会阻止发布。
+`npm test` 运行传输/协议、控件/记录/回放、调参引擎及证据工具测试。`check:release` 再运行 Rust 锁定依赖测试与 npm 审计，名称沿用历史，表示软件构建检查。`build:beta` 完成这些检查、类型检查、前端及原生编译，并生成独立测试包和 ZIP 校验文件；任一失败会停止打包。
+
+依赖证据工具可独立复现：
+
+```powershell
+$reviewRun = 'output/dependency-review/' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+npm run check:dependencies -- --capture-cargo --output $reviewRun
+npm run check:license -- --metadata "$reviewRun/cargo-metadata.json" --metadata-result "$reviewRun/cargo-metadata.result.json" --output "$reviewRun/strict"
+# 使用已核对来源的 cargo-audit 可执行文件和干净的本地 RustSec 数据库；工具不自动安装或拉取。
+$env:LLM_SERIAL_AUDIT_TOOL = 'C:\path\cargo-audit.exe'
+$env:LLM_SERIAL_AUDIT_DB = 'C:\path\advisory-db'
+npm run check:advisories
+npm run check:advisories:strict
+```
+
+设置两个审计变量后，`check:release` 和 `build:beta` 会把该次 Rust 公告报告绑定到日志/构建清单；未设置时清单写明未运行。普通公告模式保留告警，严格模式因告警返回非零。普通许可清单仅收集事实，`check:license` 对未知与待审核项目返回非零。未指定输出时，每轮生成独立证据目录；严格复核应显式传入同次捕获的两个 metadata 文件，避免丢失目标图证据。详细采集范围见[依赖许可清单](docs/DEPENDENCY_REVIEW_2026-10-01.md)。`npm run release` 增加许可证据和严格 Rust 公告门槛，当前因待审核状态不能通过；这两个门槛也不能代替原生、硬件和正式发行验收。
 
 构建证据位于 `output/builds/<构建编号>/`，包含检查结果、日志、输入文件摘要与最终产物哈希。程序清单位于便携包的 `build-manifest.json`。源码测试、浏览器运行、原生启动与硬件验收是不同证据层级，请以本次验收报告为准。
 
-产品定位见 [PRODUCT.md](PRODUCT.md)，界面规范见 [DESIGN.md](DESIGN.md)，本次场景 AI 需求、实施与验收见 [实施方案](docs/SCENARIO_AI_IMPLEMENTATION_2026-09-30.md)。此前参考项目和问题台账见 [产品体验审查](docs/PRODUCT_REVIEW_2026-09-30.md)，历史变更见 [变更记录](docs/CHANGELOG.md)。贡献入口见 [CONTRIBUTING.md](CONTRIBUTING.md)。当前尚未确定开源许可证，发布源码前需要所有者确认权属与许可。
+产品定位见 [PRODUCT.md](PRODUCT.md)，界面规范见 [DESIGN.md](DESIGN.md)，本次场景 AI 需求、实施与验收见 [实施方案](docs/SCENARIO_AI_IMPLEMENTATION_2026-09-30.md)。此前参考项目和问题台账见 [产品体验审查](docs/PRODUCT_REVIEW_2026-09-30.md)，历史变更见 [变更记录](docs/CHANGELOG.md)。贡献入口见 [CONTRIBUTING.md](CONTRIBUTING.md)。源码已按所有者要求提交 GitHub，产品许可证与资源权属仍待所有者确认，当前提交不构成开源许可授予。

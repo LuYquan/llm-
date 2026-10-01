@@ -521,7 +521,7 @@ onUnmounted(() => { themeObserver?.disconnect(); sizeObserver?.disconnect(); });
           剪切频率 ωc: <strong>{{ bodeResult.omega_c !== null ? `${bodeResult.omega_c.toFixed(2)} rad/s` : '--' }}</strong>
         </span>
         <span class="badge-item badge-gm">
-          幅值裕度 GM: <strong>{{ bodeResult.gain_margin_db !== null ? `${bodeResult.gain_margin_db} dB` : '未知' }}</strong>
+          幅值裕度 GM: <strong>{{ bodeResult.gain_margin_db === Infinity ? '扫描范围内未找到相位交越' : bodeResult.gain_margin_db !== null && Number.isFinite(bodeResult.gain_margin_db) ? `${bodeResult.gain_margin_db.toFixed(2)} dB` : '未知' }}</strong>
         </span>
       </div>
 

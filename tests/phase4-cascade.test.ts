@@ -3,7 +3,7 @@
  * 涵盖：
  * 1. 串级整定状态机 (CascadeStateMachine) 先内后外铁律与级联失效
  * 2. 外环等效受控对象模型复合生成 (composeOuterPlant)
- * 3. 带宽分层检查器 (BandwidthChecker) 与采样定理香农上限
+ * 3. 带宽分层检查器 (BandwidthChecker) 与配置的采样设计上限
  * 4. 高级控制器结构生成器 (AdvancedControllerGenerator) C 语言固件驱动与拓扑智能推荐
  * 5. BodeWidget 注册表与尺寸配置验证
  */
@@ -14,7 +14,7 @@ import { BandwidthChecker } from '../src/core/control/bandwidthChecker.ts';
 import { AdvancedControllerGenerator } from '../src/core/control/advancedController.ts';
 import { globalWidgetRegistry } from '../src/core/widget/registry.ts';
 import type { ControlLoop } from '../src/core/project/types.ts';
-import type { PlantModel } from '../src/core/control/types.ts';
+import { runCascadeModelTests } from './cascade-model.test.ts';
 
 export async function runPhase4CascadeTests(): Promise<void> {
   console.log('--- [Phase 4: Cascade & Templates] 开始执行串级多环与模板测试套件 ---');
@@ -102,29 +102,7 @@ export async function runPhase4CascadeTests(): Promise<void> {
   // 2. 外环等效受控对象模型复合生成测试
   console.log('  2. 测试 composeOuterPlant 外环广义受控对象模型合成');
 
-  const innerPlant: PlantModel = { family: 'fopdt', k: 2.0, t: 0.05, tau: 0.001 };
-  const innerPid = { kp: 1.5, ki: 20.0, kd: 0.0 };
-
-  // 2.1 位置外环复合位置积分 (1/s)
-  const outerPlantPos = sm.composeOuterPlant(innerPlant, innerPid, {
-    addition: 'integrator',
-    extraGain: 1.0,
-    delay: 0.002,
-  });
-  assert.strictEqual(outerPlantPos.family, 'integral_lag', '位置外环合成应为积分惯性模型');
-  assert.ok(outerPlantPos.t > 0, '等效时间常数应大于0');
-  assert.ok(outerPlantPos.tau >= 0.002, '延迟应叠加');
-
-  // 2.2 温度多容复合惯性延时
-  const outerPlantTemp = sm.composeOuterPlant(innerPlant, innerPid, {
-    addition: 'lag',
-    extraGain: 2.5,
-    lagT: 0.2,
-  });
-  assert.strictEqual(outerPlantTemp.family, 'sopdt', '多容惯性串联应为二阶振荡模型');
-  assert.strictEqual(outerPlantTemp.k, 2.5);
-  assert.ok(outerPlantTemp.wn > 0);
-  assert.ok(outerPlantTemp.zeta > 0);
+  runCascadeModelTests();
 
   // 2.3 管道全景状态概要生成
   const pipeline = sm.getPipelineStatus('current');
@@ -132,7 +110,7 @@ export async function runPhase4CascadeTests(): Promise<void> {
   assert.ok(pipeline.formattedBadge.includes('[环路:'));
 
   // 3. 带宽分层检查器测试
-  console.log('  3. 测试 BandwidthChecker 带宽分层准则与采样定理安全上限');
+  console.log('  3. 测试 BandwidthChecker 经验分层准则与采样设计上限');
 
   // 3.1 正常合格分层 (内环 300 rad/s, 外环 50 rad/s, 隔离比 6.0x)
   const pairNormal = BandwidthChecker.checkPair(
@@ -159,9 +137,9 @@ export async function runPhase4CascadeTests(): Promise<void> {
   );
   assert.strictEqual(pairOverlap.passed, false);
   assert.strictEqual(pairOverlap.risk_level, 'high');
-  assert.ok(pairOverlap.message.includes('低于工业安全底线 3.0x'));
+  assert.ok(pairOverlap.message.includes('低于配置的带宽分层阈值 3x'));
 
-  // 3.4 全系统多环拓扑检查与香农采样定理上限测试
+  // 3.4 全系统多环拓扑与采样设计门槛检查（不证明闭环稳定）
   const hierarchyReport = BandwidthChecker.checkHierarchy([
     { id: 'current', order: 0, omega_c: 600, sampleTime: 0.0005 }, // fs = 2000Hz, maxWc = 1256 rad/s -> safe
     { id: 'speed', order: 1, omega_c: 100, sampleTime: 0.001 },    // fs = 1000Hz, maxWc = 628 rad/s -> safe
@@ -171,13 +149,13 @@ export async function runPhase4CascadeTests(): Promise<void> {
   assert.strictEqual(hierarchyReport.overall_risk, 'safe');
   assert.strictEqual(hierarchyReport.pairs.length, 2);
 
-  // 3.5 触发奈奎斯特采样违例
+  // 3.5 超出配置的采样设计门槛
   const nyquistViolation = BandwidthChecker.checkHierarchy([
     { id: 'fast', order: 0, omega_c: 800, sampleTime: 0.005 }, // fs = 200Hz, max allowed Wc = 125.6 rad/s < 800
   ]);
   assert.strictEqual(nyquistViolation.passed, false);
   assert.ok(nyquistViolation.nyquist_warnings.length > 0);
-  assert.ok(nyquistViolation.nyquist_warnings[0].includes('采样定理安全上限'));
+  assert.ok(nyquistViolation.nyquist_warnings[0].includes('采样设计上限'));
 
   // 4. 高级控制器结构生成器测试
   console.log('  4. 测试 AdvancedControllerGenerator 工业级固件驱动生成');

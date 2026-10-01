@@ -5,6 +5,7 @@ import type { ControlLoop, LoopState } from '../core/project/types';
 import { globalChannelStore } from '../core/channel/ChannelStore';
 import { CascadeStateMachine } from '../core/control/cascadeStateMachine';
 import { BandwidthChecker, type BandwidthHierarchyReport } from '../core/control/bandwidthChecker';
+import { estimateLoopBandwidth } from '../core/control/loopBandwidth';
 
 const props = defineProps<{
   isOpen: boolean;
@@ -145,29 +146,9 @@ function handleFieldChange(field: string, val: any) {
   globalProjectModel.updateLoop(id, partial);
 }
 
-// 带宽分层检查分析
-const bandwidthReport = computed<BandwidthHierarchyReport>(() => {
-  const currentLoops = loops.value;
-  const infos = currentLoops.map((l) => {
-    // 粗估剪切频率 ωc: 若有 params 则根据 Kp, Ki 估计，否则使用经验带宽
-    let wc = 50;
-    if (l.current_params && l.current_params.kp > 0) {
-      if (l.order === 0) wc = 1000; // 电流内环默认典型 1000 rad/s
-      else if (l.order === 1) wc = 150; // 速度中环典型 150 rad/s
-      else if (l.order === 2) wc = 25; // 位置外环典型 25 rad/s
-      else wc = 50 / (l.order + 1);
-    }
-    return {
-      id: l.id,
-      name: l.name || l.id,
-      order: l.order,
-      omega_c: wc,
-      sampleTime: l.sample_period_s || l.sample_time || 0.001,
-    };
-  });
-
-  return BandwidthChecker.checkHierarchy(infos);
-});
+const bandwidthEvidence = computed(() => loops.value.map(estimateLoopBandwidth));
+const bandwidthReport = computed<BandwidthHierarchyReport>(() => BandwidthChecker.checkHierarchy(bandwidthEvidence.value.map(item => item.info)));
+const displayBandwidth = (value: number | null | undefined) => value != null && Number.isFinite(value) ? Number(value.toPrecision(6)).toString() : '待提供';
 
 // 提示消息辅助
 function showAlert(type: 'success' | 'warn' | 'error', text: string) {
@@ -189,7 +170,7 @@ function showAlert(type: 'success' | 'warn' | 'error', text: string) {
           <span class="icon">🧭</span>
           <div>
             <h3>环路拓扑与串级整定向导</h3>
-            <span class="sub">严格遵循工业级“先内后外”整定铁律与带宽分层解耦规范</span>
+            <span class="sub">从内到外配置；模型检查与设备验收分别记录</span>
           </div>
         </div>
         <button class="btn-close" @click="emit('close')" title="关闭向导">✕</button>
@@ -469,15 +450,21 @@ function showAlert(type: 'success' | 'warn' | 'error', text: string) {
 
           <!-- 右栏: 工业级带宽分层实时诊断 -->
           <div class="col-bandwidth">
-            <h4 class="col-title">工业带宽分层解耦诊断 (Bandwidth Hierarchy)</h4>
+            <h4 class="col-title">模型带宽与采样设计检查</h4>
             
             <div class="bandwidth-summary-card" :class="`risk-${bandwidthReport.overall_risk}`">
               <div class="summary-status">
                 <span class="badge-status">
-                  {{ bandwidthReport.overall_risk === 'safe' ? '🟢 优良解耦' : bandwidthReport.overall_risk === 'medium' ? '🟡 满足标准' : '🔴 存在风险' }}
+                  {{ bandwidthReport.passed ? '经验检查通过' : '检查尚未通过' }}
                 </span>
                 <span class="summary-text">{{ bandwidthReport.summary }}</span>
               </div>
+            </div>
+
+            <div class="bandwidth-evidence" aria-label="带宽数据来源">
+              <p v-for="entry in bandwidthEvidence" :key="entry.info.id"><strong>{{ entry.info.name || entry.info.id }}</strong> · {{ displayBandwidth(entry.info.omega_c) }}{{ entry.source === 'model-estimate' ? ' rad/s · 模型估计' : '' }}<br>{{ entry.explanation }}</p>
+              <p v-for="message in [...bandwidthReport.input_errors,...bandwidthReport.nyquist_warnings]" :key="message" class="pair-msg">{{ message }}</p>
+              <p v-for="message in bandwidthReport.limitations" :key="message">{{ message }}</p>
             </div>
 
             <!-- 相邻环路频率隔离比检测列表 -->
@@ -491,7 +478,7 @@ function showAlert(type: 'success' | 'warn' | 'error', text: string) {
                 <div class="pair-header">
                   <strong class="pair-names">{{ pair.innerName }} ➔ {{ pair.outerName }}</strong>
                   <span class="ratio-badge font-mono">
-                    隔离比: {{ pair.ratio }}x (基准 ≥ 3.0x)
+                    隔离比: {{ displayBandwidth(pair.ratio) }}{{ pair.ratio != null ? 'x' : '' }} (经验阈值 ≥ 3x)
                   </span>
                 </div>
                 <p class="pair-msg">{{ pair.message }}</p>
@@ -520,6 +507,8 @@ function showAlert(type: 'success' | 'warn' | 'error', text: string) {
 </template>
 
 <style scoped>
+.bandwidth-evidence { color:var(--text-muted); font-size:12px; line-height:1.6; overflow-wrap:anywhere; }
+.bandwidth-evidence p { margin:10px 0; }
 .modal-overlay {
   position: fixed;
   inset: 0;

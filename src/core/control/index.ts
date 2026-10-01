@@ -12,5 +12,7 @@ export * from './simulateClosedLoop';
 export * from './discretize';
 export * from './silTestbench';
 export * from './cascadeStateMachine';
+export * from './cascadeModel';
 export * from './bandwidthChecker';
+export * from './loopBandwidth';
 export * from './advancedController';

@@ -2,6 +2,8 @@ import assert from 'node:assert';
 import '../tests/debug-assistant.test.ts';
 import '../tests/simulation-comparison.test.ts';
 import '../tests/tuning-scenarios.test.ts';
+import '../tests/bandwidth-policy.test.ts';
+import '../tests/bode-precision.test.ts';
 import {
   parseEscapeSequences,
   encodeNumberToHex,

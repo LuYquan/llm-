@@ -9,10 +9,8 @@ import type { ProjectModelManager } from '../project/ProjectModel';
 import type {
   PlantModel,
   ControllerParams,
-  FopdtModel,
-  SopdtModel,
-  IntegralLagModel,
 } from './types';
+import { cascadeSeriesProduct, checkedInnerClosedLoopModel, composeContinuousInnerLoop } from './cascadeModel';
 
 export interface TransitionCheckResult {
   allowed: boolean;
@@ -42,13 +40,21 @@ export type OuterAdditionLink = 'integrator' | 'lag' | 'none';
 export interface ComposeOuterPlantOptions {
   /** 附加外环环节类型: 'integrator' (位置积分 1/s) | 'lag' (惯性延迟 1/(Ts+1)) | 'none' (纯增益) */
   addition: OuterAdditionLink;
-  /** 外环节比例增益或传动比 K_ext (默认 1.0) */
+  /** 外环节增益或传动比；integrator/lag 必须明确提供，none 缺省为已选恒等环节。 */
   extraGain?: number;
-  /** 附加环节时间常数 T_ext (秒，用于 'lag' 模式，默认 0.1) */
+  /** 附加 lag 环节的时间常数 T_ext（秒），必须明确提供。 */
   lagT?: number;
-  /** 附加环节纯滞后延时 τ_ext (秒，默认 0) */
+  /** 附加物理环节自身的纯滞后（秒）；integrator/lag 必须提供，无滞后明确填 0。 */
   delay?: number;
-  /** 内环实测/估计等效闭环剪切角频率 ωc_in (rad/s，若未提供则从模型与PID解析估算) */
+  /** 常数反馈增益 H，默认单位负反馈；保留符号，不用绝对值修复控制方向。 */
+  feedbackGain?: number;
+  /**
+   * 已核对来源、内环控制器、单位与工况的闭环输入→输出等效模型。
+   * 原内环反馈含纯滞后时必须提供；此处仅检查数值形状和模型分母，
+   * 不能代替实测来源、固件参数一致性或设备稳定性证据。
+   */
+  innerClosedLoopModel?: PlantModel;
+  /** 旧选项仅保留 API 兼容；单个带宽数值不足以建立闭环对象，不能据此近似。 */
   effectiveInnerBandwidth?: number;
 }
 
@@ -218,98 +224,37 @@ export class CascadeStateMachine {
   }
 
   /**
-   * 外环被控对象模型复合生成 (composeOuterPlant)
-   * 严格依据经典串级控制理论：
-   * 外环广义受控对象 = 已闭合的内环传递函数 T_inner(s) × 附加物理环节 H_ext(s)
-   * 
-   * 设已闭合的内环等效为一阶惯性滞后环节: T_inner(s) ≈ 1 / (T_eq * s + 1) * e^(-τ_in * s)
-   * 其中 T_eq ≈ 1 / ωc_inner
-   * 
-   * 1. 当 addition 为 'integrator' (如位置外环 = 速度中环 × 积分环节 1/s):
-   *    G_outer(s) = K_ext / (s * (T_eq * s + 1)) * e^(-τ * s) -> 属于 IntegralLagModel
-   * 2. 当 addition 为 'lag' (如温度多容延迟或二次滤波环节):
-   *    G_outer(s) = K_ext / ((T_eq * s + 1)(T_ext * s + 1)) -> 属于 SopdtModel (二阶系统)
-   * 3. 当 addition 为 'none' (纯比例驱动):
-   *    G_outer(s) = K_ext / (T_eq * s + 1) -> 属于 FopdtModel
+   * G_outer = T_inner × H_ext。无反馈延迟时，T_inner 使用完整连续
+   * 1DOF PID（微分作用于误差）和常数反馈增益进行有理函数代数合成。
+   * 含内环纯滞后时必须使用调用方已核对的闭环等效输入输出模型，
+   * 不能把反馈中的延迟移到分母外或用单个带宽强行近似一阶对象。
+   * 返回的是模型计算，不验证 sampleTime、离散固件实现或硬件表现。
    */
   public composeOuterPlant(
     innerPlant: PlantModel,
     innerPid: ControllerParams,
     options: ComposeOuterPlantOptions
   ): PlantModel {
-    const kExt = options.extraGain ?? 1.0;
-    const addition = options.addition;
-    const lagT = Math.max(1e-4, options.lagT ?? 0.1);
+    if (!options || !['none', 'integrator', 'lag'].includes(options.addition)) throw new Error('附加环节必须明确选择 none、integrator 或 lag。');
+    const physicalAddition = options.addition !== 'none';
+    if (physicalAddition && options.extraGain === undefined) throw new Error('附加物理环节增益必须明确提供，不能默认猜测传动比。');
+    if (physicalAddition && options.delay === undefined) throw new Error('附加物理环节纯滞后必须明确提供，无滞后请填 0。');
+    const kExt = options.extraGain ?? 1;
     const delay = options.delay ?? 0;
-
-    // 估算已闭合内环的等效闭环时间常数 T_eq 与延迟
-    let tEq = 0.01; // 默认 10ms (100 rad/s)
-    let innerDelay = 0;
-
-    if (options.effectiveInnerBandwidth && options.effectiveInnerBandwidth > 0) {
-      tEq = 1.0 / options.effectiveInnerBandwidth;
-    } else {
-      // 从内环受控对象与 PID 参数解析估算等效闭环带宽
-      if (innerPlant.family === 'transfer_function') throw new Error('自定义内环需要已验证的有效闭环带宽，不能默认采用 10ms 等效模型。');
-      const kp = Math.max(1e-4, innerPid.kp);
-      if (innerPlant.family === 'fopdt') {
-        // 内环一阶惯性 K / (Ts + 1)，配合 PI 闭环:
-        // 开环增益 ≈ K * Kp / T => 等效闭环时间常数 T_cl ≈ T / (1 + K * Kp)
-        const kPlant = Math.max(1e-4, Math.abs(innerPlant.k));
-        tEq = innerPlant.t / (1.0 + kPlant * kp);
-        innerDelay = innerPlant.tau;
-      } else if (innerPlant.family === 'sopdt') {
-        // 二阶系统闭环带宽与自然频率 ωn 相当
-        tEq = 1.0 / Math.max(0.1, innerPlant.wn);
-        innerDelay = innerPlant.tau;
-      } else if (innerPlant.family === 'integral_lag') {
-        tEq = innerPlant.t / (1.0 + innerPlant.k * kp);
-        innerDelay = innerPlant.tau;
-      }
+    if (!Number.isFinite(kExt) || kExt === 0) throw new Error('附加环节增益必须是非零有限数值。');
+    if (!Number.isFinite(delay) || delay < 0) throw new Error('附加环节纯滞后必须是非负有限数值。');
+    if (options.addition === 'lag' && (options.lagT === undefined || !Number.isFinite(options.lagT) || options.lagT <= 0)) throw new Error('附加 lag 环节时间常数必须明确提供正有限数值。');
+    if (options.effectiveInnerBandwidth !== undefined) {
+      if (!Number.isFinite(options.effectiveInnerBandwidth) || options.effectiveInnerBandwidth <= 0) throw new Error('旧选项内环带宽必须为正有限数值。');
+      if (!options.innerClosedLoopModel) throw new Error('单个内环带宽不能确定闭环对象；请使用完整模型与 PID，或提供已核对的内环闭环等效模型。');
     }
-
-    tEq = Math.max(1e-4, tEq);
-    const totalDelay = innerDelay + delay;
-
-    if (addition === 'integrator') {
-      const model: IntegralLagModel = {
-        family: 'integral_lag',
-        k: kExt,
-        t: Number(tEq.toFixed(6)),
-        tau: Number(totalDelay.toFixed(6)),
-      };
-      return model;
-    }
-
-    if (addition === 'lag') {
-      // 两个一阶环节串联: 1 / ((T_eq * s + 1)(T_ext * s + 1))
-      // 分母展开: T_eq * T_ext * s^2 + (T_eq + T_ext) * s + 1
-      // 标准二阶形式: s^2 / wn^2 + 2*zeta*s / wn + 1
-      // wn = 1 / sqrt(T_eq * T_ext)
-      // zeta = (T_eq + T_ext) / (2 * sqrt(T_eq * T_ext))
-      const wn = 1.0 / Math.sqrt(tEq * lagT);
-      const zeta = (tEq + lagT) / (2.0 * Math.sqrt(tEq * lagT));
-
-      const model: SopdtModel = {
-        family: 'sopdt',
-        k: kExt,
-        wn: Number(wn.toFixed(4)),
-        zeta: Number(zeta.toFixed(4)),
-        tau: Number(totalDelay.toFixed(6)),
-      };
-      return model;
-    }
-
-    // 默认 addition === 'none': 一阶惯性
-    const model: FopdtModel = {
-      family: 'fopdt',
-      k: kExt,
-      t: Number(tEq.toFixed(6)),
-      tau: Number(totalDelay.toFixed(6)),
-    };
-    return model;
+    const innerClosed = options.innerClosedLoopModel
+      ? checkedInnerClosedLoopModel(options.innerClosedLoopModel)
+      : composeContinuousInnerLoop(innerPlant, innerPid, options.feedbackGain);
+    const denominator = options.addition === 'integrator' ? [1, 0]
+      : options.addition === 'lag' ? [options.lagT!, 1] : [1];
+    return cascadeSeriesProduct(innerClosed, { family: 'transfer_function', numerator: [kExt], denominator, tau: delay });
   }
-
   /**
    * 获取串级整定管道全景状态概要 (供 UI 状态条与向导渲染)
    */

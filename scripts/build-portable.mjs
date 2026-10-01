@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync, execSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { verifyBoundAuditEvidence } from './rust-advisory-audit.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,7 +15,15 @@ const args = process.argv.slice(2);
 const forceRebuild = !args.includes('--skip-build');
 const checkStatus = forceRebuild ? 'passed' : 'not-run (--skip-build)';
 const beta = args.includes('--beta');
+const formalRelease = args.includes('--release');
 if (beta && !forceRebuild) throw new Error('Beta 构建必须重新验证和编译，不能使用 --skip-build。');
+if (formalRelease && (beta || !forceRebuild)) throw new Error('正式发行必须完整构建，不能同时使用 --beta 或 --skip-build。');
+if (formalRelease) {
+  // These checks currently fail while owner/dependency review is pending.
+  // A test package cannot waive the publication gates.
+  runRequired('正式发行许可证据门槛', 'npm run check:license');
+  runRequired('正式发行 Rust 公告门槛', 'npm run check:advisories:strict');
+}
 
 function sha256(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex').toUpperCase();
@@ -169,7 +178,7 @@ if (previousReleaseHash && sha256(previousRelease) !== previousReleaseHash) {
 let sourceDirty = false;
 let sourceStatus = '';
 try {
-  sourceStatus = execSync('git status --porcelain --untracked-files=all', {
+  sourceStatus = execFileSync('git', ['status', '--porcelain', '--untracked-files=all', '--', 'src', 'src-tauri/src', 'src-tauri/tests', 'src-tauri/icons', 'src-tauri/capabilities', 'src-tauri/Cargo.toml', 'src-tauri/Cargo.lock', 'src-tauri/build.rs', 'src-tauri/tauri.conf.json', 'tests', 'scripts', 'docs', '.github', 'README.md', 'PRODUCT.md', 'DESIGN.md', 'CONTRIBUTING.md', 'LICENSE', 'package.json', 'package-lock.json', 'vite.config.ts', 'tsconfig.json', 'tsconfig.node.json', 'index.html', '.gitignore', '.gitattributes'], {
     cwd: projectRoot,
     encoding: 'utf8',
     windowsHide: true,
@@ -183,6 +192,10 @@ const dependencyLockfiles = Object.fromEntries(
     .filter((relativePath) => fs.existsSync(path.join(projectRoot, relativePath)))
     .map((relativePath) => [relativePath, sha256(path.join(projectRoot, relativePath))]),
 );
+const advisorySummaryPath = path.join(evidenceDir, 'checks', 'rust-advisories', 'summary.json');
+const rustAdvisoryAudit = fs.existsSync(advisorySummaryPath)
+  ? verifyBoundAuditEvidence(path.dirname(advisorySummaryPath), dependencyLockfiles['src-tauri/Cargo.lock'])
+  : { status: 'not-run', limits: ['Set LLM_SERIAL_AUDIT_TOOL and LLM_SERIAL_AUDIT_DB to bind a pinned scan to this build.'] };
 const manifest = {
   formatVersion: 2,
   product: 'LLM 串口可靠串口与波形工作台',
@@ -209,6 +222,7 @@ const manifest = {
     sha256: sha256(targetExeB),
   },
   checks: {
+    evidenceTools: checkStatus,
     transport: checkStatus,
     widgetAndReplay: checkStatus,
     tuning: checkStatus,
@@ -217,7 +231,9 @@ const manifest = {
     nativeBuild: checkStatus,
     npmAudit: checkStatus,
   },
-  validationLimits: ['No hardware serial/unplug/ACK validation', 'No live cloud AI request validation', 'No clean Windows compatibility validation', 'Full native interactive acceptance pending', 'Tuning execution requires configured device protocol and explicit per-session authorization', 'Rust dependency advisory audit not run'],
+  rustAdvisoryAudit,
+  licenseReview: 'pending-owner-decision-and-dependency-review',
+  validationLimits: ['No hardware serial/unplug/ACK validation', 'No live cloud AI request validation', 'No clean Windows compatibility validation', 'Full native interactive acceptance pending', 'Tuning execution requires configured device protocol and explicit per-session authorization', ...(rustAdvisoryAudit.status === 'not-run' ? ['Rust dependency advisory audit not bound to this build'] : ['Rust advisory findings and scope are recorded separately; no blanket dependency approval']), 'Product and dependency licensing review pending'],
   userDataIncluded: false,
   signature: 'unsigned test distribution',
 };
