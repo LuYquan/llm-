@@ -11,6 +11,7 @@ import type { FftInputQuality, FftResult } from '../../core/analysis/fft';
 import { analysisWorker, type CancellableAnalysis } from '../../services/analysis/analysis-worker-client';
 import { useWidgetStore, DEFAULT_CHANNEL_PALETTE } from '../../stores/widgetStore';
 import { alignSnapshotsByTimestamp } from '../../core/channel/alignment';
+import { toUPlotValues, transformPlotValues } from '../../core/channel/plotValues';
 import { CHART_EVIDENCE_CONTEXT, UNKNOWN_CHART_EVIDENCE_CONTEXT } from '../../core/assistant/chartEvidenceContext';
 import { createFrozenSelection } from '../../core/assistant/evidenceSelection';
 import { publishEvidenceSelection } from '../../core/assistant/evidenceSelectionStore';
@@ -108,9 +109,11 @@ watch(
       for (let idx = 0; idx < localSeries.value.length; idx++) {
         const s = localSeries.value[idx];
         const meta = store.getChannelMeta(s.channel);
-        const targetSeries = (uplotInstance.value.series as any)?.[idx + 1];
+        const targetSeries = uplotInstance.value.series[idx + 1];
         if (targetSeries) {
-          targetSeries.stroke = meta.color || s.color;
+          // uPlot normalizes stroke into a function during initialization.
+          // Keep that runtime contract when applying later metadata changes.
+          targetSeries.stroke = () => meta.color || s.color || '#DA7756';
         }
         uplotInstance.value.setSeries(idx + 1, {
           show: s.visible && meta.visible,
@@ -250,18 +253,18 @@ function initChart() {
     },
   };
 
-  const initialData: uPlot.AlignedData = [xData];
+  const initialSeries: (uPlot.TypedArray | (number | null)[])[] = [];
   for (let i = 0; i < localSeries.value.length; i++) {
     const series = ySeriesData[i];
     if (series && series.length === xData.length) {
-      initialData.push(series);
+      initialSeries.push(toUPlotValues(series));
     } else {
-      const empty = new Float64Array(xData.length);
-      empty.fill(NaN);
-      initialData.push(empty);
+      const empty = new Array<number | null>(xData.length).fill(null);
+      initialSeries.push(empty);
     }
   }
 
+  const initialData: uPlot.AlignedData = [xData, ...initialSeries];
   uplotInstance.value = new uPlot(opts, initialData, chartContainer.value);
 }
 
@@ -368,17 +371,11 @@ function onRenderFrame() {
   xData = aligned.timestamps;
   ySeriesData = aligned.values.map((rawValues, index) => {
     const meta = store.getChannelMeta(seriesList[index].channel);
-    if (meta.scale === 1.0 && meta.yOffset === 0.0) return rawValues;
-    const transformed = new Float64Array(rawValues.length);
-    for (let i = 0; i < rawValues.length; i++) {
-      const value = rawValues[i];
-      transformed[i] = Number.isNaN(value) ? Number.NaN : value * meta.scale + meta.yOffset;
-    }
-    return transformed;
+    return transformPlotValues(rawValues, meta.scale, meta.yOffset);
   });
 
   const targetLen = xData.length;
-  const alignedData: uPlot.AlignedData = [xData, ...ySeriesData];
+  const alignedData: uPlot.AlignedData = [xData, ...ySeriesData.map((values) => toUPlotValues(values))];
 
   pointCount.value = targetLen;
   // uPlot cannot calculate ranges from empty or single-sample data. Keep the

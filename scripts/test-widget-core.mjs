@@ -299,6 +299,12 @@ await runUiStreamliningTests();
 await runSendGateTests();
 const { runChannelPresentationTests } = await import('../tests/channel-presentation.test.ts');
 await runChannelPresentationTests();
+const { runSidebarProjectionTests } = await import('../tests/sidebar-projection.test.ts');
+runSidebarProjectionTests();
+const { runPlotValuesTests } = await import('../tests/plot-values.test.ts');
+runPlotValuesTests();
+const { runChannelAliasPersistenceTests } = await import('../tests/channel-alias-persistence.test.ts');
+await runChannelAliasPersistenceTests();
 await import('../tests/assistant-evidence-selection.test.ts');
 
 console.log('====================================================');

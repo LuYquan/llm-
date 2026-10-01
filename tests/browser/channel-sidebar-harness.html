@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>实际 App 数据侧栏 · 独立合成夹具</title></head>
+<body><div id="app"></div><section id="fixture-bar" aria-label="数据侧栏合成夹具">
+  <strong>合成传输 · 无硬件 / 无在线 AI</strong>
+  <button id="first-batch">首个合成批次</button><button id="zero-batch">合成真实零值</button><button id="nonfinite-batch">合成非有限值</button><button id="unconfigured-batch">合成未配置通道</button>
+  <button id="clear-one">清 actual 显示缓存</button><button id="clear-all">清全部显示缓存</button><button id="new-session">新身份批次</button><button id="driver-disconnect">合成驱动断开</button>
+  <button id="capture-proof">记录侧栏证据</button><button id="reset-fixture">重置夹具配置并重载</button>
+  <span id="fixture-status" role="status">挂载实际 App；先点击顶部“演示”，再发合成批次。</span>
+  <details><summary>夹具机器证据</summary><output id="fixture-proof" aria-label="夹具机器证据"></output></details>
+</section><script type="module" src="./channel-sidebar-harness.ts"></script></body></html>

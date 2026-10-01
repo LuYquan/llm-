@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, nextTick } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue';
 import { useWidgetStore, DEFAULT_CHANNEL_PALETTE } from '../stores/widgetStore';
 import { globalChannelStore } from '../core/channel/ChannelStore';
 import type { ChannelMeta } from '../types/widget';
 import { CHANNEL_UNIT_MAX_LENGTH, normalizeChannelUnitMetadata, presentChannel } from '../core/channel/channelPresentation';
+import { formatSidebarValue, projectSidebarChannels, sidebarSampleStatus, widgetChannelBindings, type SidebarChannelRow } from '../core/channel/sidebarProjection';
 
-defineProps<{
+const props = defineProps<{
   isRunning: boolean;
 }>();
 
@@ -17,10 +18,13 @@ const emit = defineEmits<{
 const store = useWidgetStore();
 const isCollapsed = ref(true);
 
-// 通道列表与实时读数
-const knownChannels = ref<string[]>([]);
-const latestValues = ref<Record<string, number>>({});
-const pulseMap = ref<Record<string, boolean>>({});
+const channelRows = ref<SidebarChannelRow[]>([]);
+const waitingExpanded = ref(false);
+const rowGroups = computed(() => [
+  { key: 'received', rows: channelRows.value.filter((row) => row.hasSamples) },
+  { key: 'waiting', rows: channelRows.value.filter((row) => !row.hasSamples) },
+]);
+const knownChannels = computed(() => channelRows.value.filter((row) => row.hasSamples).map((row) => row.id));
 
 // 就地重命名状态
 const editingChannelId = ref<string | null>(null);
@@ -36,62 +40,47 @@ const configDialog = ref<HTMLDivElement | null>(null);
 const rawUnitField = ref<HTMLInputElement | null>(null);
 let configReturnFocus: HTMLElement | null = null;
 
-// 头部更多操作菜单
-const isMenuOpen = ref(false);
-
 // 拾色器弹窗
 const activeColorPickerChannel = ref<string | null>(null);
 
 // 监听 ChannelStore 中的通道发现
 let unsubChannels: (() => void) | null = null;
+let unsubCleared: (() => void) | null = null;
 let pollTimer: number | null = null;
 
 function refreshChannels() {
-  const list = globalChannelStore.listChannels();
-  if (list.length === 0) {
-    // 默认展示至少 !0 ~ !7 供开箱即用观察与拖拽
-    knownChannels.value = ['0', '1', '2', '3', '4', '5', '6', '7'];
-  } else {
-    knownChannels.value = list;
-  }
-
-  // 保证 store 中元数据初始化
-  for (const ch of knownChannels.value) {
-    store.getChannelMeta(ch);
+  const dashboard = store.dashboardState.value;
+  const tab = dashboard.tabs.find((entry) => entry.id === dashboard.active_tab_id);
+  const rows = projectSidebarChannels(globalChannelStore, widgetChannelBindings(tab?.widgets ?? []), dashboard.channels);
+  const previous = channelRows.value;
+  if (rows.length !== previous.length || rows.some((row, index) =>
+    row.id !== previous[index].id || row.hasSamples !== previous[index].hasSamples || !Object.is(row.value, previous[index].value))) {
+    channelRows.value = rows;
   }
 }
 
-function updateLatestValues() {
-  for (const ch of knownChannels.value) {
-    const pt = globalChannelStore.latest(ch);
-    if (pt) {
-      const meta = store.getChannelMeta(ch);
-      const transformed = pt.v * meta.scale + meta.yOffset;
-      if (latestValues.value[ch] !== transformed) {
-        latestValues.value[ch] = transformed;
-        // 触发微脉冲动效
-        pulseMap.value[ch] = true;
-        setTimeout(() => {
-          pulseMap.value[ch] = false;
-        }, 150);
-      }
-    }
-  }
+// Rendering must not create persisted metadata or register aliases.
+function channelMeta(id: string): ChannelMeta {
+  const metadata = store.dashboardState.value.channels;
+  const saved = metadata && Object.prototype.hasOwnProperty.call(metadata, id) ? metadata[id] : undefined;
+  if (saved) return saved;
+  let colorIndex = 0;
+  for (const char of id) colorIndex = (colorIndex + char.charCodeAt(0)) % DEFAULT_CHANNEL_PALETTE.length;
+  return { id, name: id, color: DEFAULT_CHANNEL_PALETTE[colorIndex], visible: true, scale: 1, yOffset: 0, xOffset: 0, decimal: 6 };
 }
 
+watch(() => store.dashboardState.value, refreshChannels, { deep: true });
 onMounted(() => {
   refreshChannels();
-  unsubChannels = globalChannelStore.onChannelsChanged(() => {
-    refreshChannels();
-  });
-  // 30Hz 刷新侧边栏实时翻滚数值
-  pollTimer = window.setInterval(() => {
-    updateLatestValues();
-  }, 33);
+  unsubChannels = globalChannelStore.onChannelsChanged(refreshChannels);
+  unsubCleared = globalChannelStore.onCleared(refreshChannels);
+  // Discovery runs before insertion; this bounded refresh sees even a single batch.
+  pollTimer = window.setInterval(refreshChannels, 33);
 });
 
 onUnmounted(() => {
   if (unsubChannels) unsubChannels();
+  if (unsubCleared) unsubCleared();
   if (pollTimer) clearInterval(pollTimer);
   removeConfigFocusGuard();
 });
@@ -101,6 +90,8 @@ function toggleCollapse() {
 }
 
 function handleGlobalEyeClick() {
+  // This is an explicit edit gesture; rendering and polling stay read-only.
+  for (const row of channelRows.value) store.getChannelMeta(row.id);
   store.toggleChannelVisibility();
 }
 
@@ -198,15 +189,22 @@ function unitInputChanged() {
 }
 
 function channelLabel(id: string): string {
-  return presentChannel(id, store.getChannelMeta(id)).label;
+  return presentChannel(id, channelMeta(id)).label;
 }
 
 function saveChannelConfig() {
   if (!activeConfigChannel.value) return;
   try {
     const unitMetadata = rawUnitInput.value === '' ? {} : normalizeChannelUnitMetadata({ unit: rawUnitInput.value, unitSource: 'user' });
+    const name = activeConfigChannel.value.name.trim();
+    if (!name || name.length > 128 || /[\p{Cc}\p{Cf}\u2028\u2029]/u.test(name)) throw new Error('请输入不超过 128 个字符、无控制字符的通道名称。');
+    if (![activeConfigChannel.value.scale, activeConfigChannel.value.yOffset, activeConfigChannel.value.xOffset].every(Number.isFinite)
+      || !Number.isInteger(activeConfigChannel.value.decimal) || activeConfigChannel.value.decimal < 0 || activeConfigChannel.value.decimal > 6) {
+      throw new Error('倍率和偏置必须是有限数值；显示精度必须是 0–6 的整数。');
+    }
     if (unitMetadata.unit && !rawUnitConfirmed.value) throw new Error('保存前请确认这是固件原始数据的单位，尚未进行显示缩放。');
     store.updateChannelMeta(activeConfigChannel.value.id, {
+      name,
       scale: activeConfigChannel.value.scale,
       yOffset: activeConfigChannel.value.yOffset,
       xOffset: activeConfigChannel.value.xOffset,
@@ -233,11 +231,7 @@ function selectColor(ch: string, color: string) {
 
 // 格式化输出浮点数值
 function formatChannelValue(ch: string): string {
-  const v = latestValues.value[ch];
-  if (v == null || isNaN(v)) return '0.000000';
-  const meta = store.getChannelMeta(ch);
-  const dec = meta.decimal != null ? meta.decimal : 6;
-  return v.toFixed(dec);
+  return formatSidebarValue(channelRows.value.find((row) => row.id === ch)?.value, channelMeta(ch).decimal);
 }
 
 // 拖拽发起：传递通道 ID 与元信息
@@ -258,68 +252,6 @@ function onDragEnd() {
   emit('channel-drag-end');
 }
 
-// 菜单功能
-function addVirtualChannel() {
-  const nextIdx = knownChannels.value.length;
-  const newId = `v_${nextIdx}`;
-  globalChannelStore.push(newId, Date.now() / 1000, 0);
-  refreshChannels();
-  isMenuOpen.value = false;
-}
-
-function clearInactiveChannels() {
-  const list = globalChannelStore.listChannels();
-  for (const ch of list) {
-    const pt = globalChannelStore.latest(ch);
-    if (!pt) {
-      globalChannelStore.clear(ch);
-    }
-  }
-  refreshChannels();
-  isMenuOpen.value = false;
-}
-
-function exportAllChannelsCsv() {
-  const channels = knownChannels.value;
-  if (channels.length === 0) return;
-
-  const header = ['Timestamp(s)', ...channels.map((c) => store.getChannelMeta(c).name)];
-  const rows: string[] = [header.join(',')];
-
-  // 找参考通道取时间
-  let refSnap = null;
-  for (const ch of channels) {
-    const s = globalChannelStore.snapshot(ch);
-    if (s.count > 0) {
-      refSnap = s;
-      break;
-    }
-  }
-
-  if (refSnap && refSnap.count > 0) {
-    const count = refSnap.count;
-    for (let i = 0; i < count; i++) {
-      const t = refSnap.timestamps[i];
-      const r = [t.toFixed(4)];
-      for (const ch of channels) {
-        const snap = globalChannelStore.snapshot(ch);
-        const val = snap.values[i];
-        r.push(val != null && !isNaN(val) ? val.toFixed(4) : '');
-      }
-      rows.push(r.join(','));
-    }
-  }
-
-  const csvContent = 'data:text/csv;charset=utf-8,\uFEFF' + encodeURIComponent(rows.join('\n'));
-  const link = document.createElement('a');
-  link.setAttribute('href', csvContent);
-  link.setAttribute('download', `channels_${Date.now()}.csv`);
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  isMenuOpen.value = false;
-}
-
 function resetAllChannelScales() {
   for (const ch of knownChannels.value) {
     store.updateChannelMeta(ch, {
@@ -329,7 +261,6 @@ function resetAllChannelScales() {
       decimal: 6,
     });
   }
-  isMenuOpen.value = false;
 }
 
 function collapse() {
@@ -358,8 +289,10 @@ defineExpose({
       class="sidebar-collapse-toggle"
       @click="toggleCollapse"
       :title="isCollapsed ? '展开数据通道栏' : '折叠数据通道栏'"
+      :aria-label="isCollapsed ? '展开数据通道栏' : '折叠数据通道栏'"
+      :aria-expanded="!isCollapsed"
     >
-      <span class="toggle-icon">{{ isCollapsed ? '◀' : '▶' }}</span>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path :d="isCollapsed ? 'm15 5-7 7 7 7' : 'm9 5 7 7-7 7'" /></svg>
     </button>
 
     <div v-show="!isCollapsed" class="sidebar-inner">
@@ -378,45 +311,37 @@ defineExpose({
 
         <h3 class="sidebar-title">数据</h3>
 
-        <div class="header-menu-anchor">
-          <button
-            class="btn-menu-trigger"
-            @click="isMenuOpen = !isMenuOpen"
-            title="数据通道高级操作"
-          >
-            ···
-          </button>
-
-          <!-- 头部下拉菜单 -->
-          <div v-if="isMenuOpen" class="dropdown-menu">
-            <button class="menu-item" @click="addVirtualChannel">➕ 手动添加通道</button>
-            <button class="menu-item" @click="clearInactiveChannels">🧹 清理无数据通道</button>
-            <button class="menu-item" @click="exportAllChannelsCsv">💾 批量导出 CSV</button>
-            <button class="menu-item" @click="resetAllChannelScales">⟲ 重置比例/偏置</button>
-          </div>
-        </div>
+        <button class="btn-reset-display" :disabled="knownChannels.length === 0" @click="resetAllChannelScales" title="将已收到样本的通道恢复为倍率 1、偏置 0 和六位小数">重置显示</button>
       </header>
 
-      <!-- 通道列表 (带拖拽手柄与 6 位浮点实时翻滚数值) -->
+      <p class="sidebar-note">读数来自本机缓冲区；缩放只影响显示。</p>
+      <p v-if="store.channelAliasConflicts.value.length" class="alias-warning" role="status">{{ store.channelAliasConflicts.value.length }} 个名称存在绑定冲突。请在通道配置中使用唯一名称，或按原始通道 ID 绑定。</p>
       <div class="channel-list custom-scrollbar">
+        <p v-if="knownChannels.length === 0" class="channel-empty">尚未收到通道样本。连接设备或体验演示后，核对协议与通道绑定。</p>
+        <section v-for="group in rowGroups" :key="group.key" class="channel-group">
+        <button v-if="group.key === 'waiting' && group.rows.length" class="waiting-toggle" :aria-expanded="waitingExpanded" @click="waitingExpanded = !waitingExpanded">已配置，等待数据（{{ group.rows.length }}）<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path :d="waitingExpanded ? 'm5 15 7-7 7 7' : 'm5 9 7 7 7-7'" /></svg></button>
+        <div v-if="group.key !== 'waiting' || waitingExpanded" class="group-rows">
         <div
-          v-for="ch in knownChannels"
-          :key="ch"
+          v-for="row in group.rows"
+          :key="row.id"
           class="channel-item"
-          :class="{ 'is-hidden': !store.getChannelMeta(ch).visible, 'is-pulsing': pulseMap[ch] }"
+          :class="{ 'is-hidden': !channelMeta(row.id).visible, 'is-waiting': !row.hasSamples }"
+          :data-channel-id="row.id"
+          :data-sample-state="row.hasSamples ? row.value === null ? 'invalid' : 'received' : 'waiting'"
           draggable="true"
-          @dragstart="onDragStart($event, ch)"
+          @dragstart="onDragStart($event, row.id)"
           @dragend="onDragEnd"
-          :title="`按住向左拖拽至画布控件绑定通道 [${channelLabel(ch)}]；双击重命名`"
+          :title="`拖拽至画布绑定 [${channelLabel(row.id)}]；双击名称重命名`"
         >
           <!-- 1. 眼睛可见性切换 -->
           <button
             class="btn-channel-eye"
-            @click="handleEyeClick(ch, $event)"
-            :title="store.getChannelMeta(ch).visible ? '隐藏该通道曲线' : '显示该通道曲线'"
+            @click="handleEyeClick(row.id, $event)"
+            :title="channelMeta(row.id).visible ? '隐藏该通道曲线' : '显示该通道曲线'"
+            :aria-label="`${channelLabel(row.id)}：${channelMeta(row.id).visible ? '隐藏' : '显示'}曲线`"
           >
             <svg
-              v-if="store.getChannelMeta(ch).visible"
+              v-if="channelMeta(row.id).visible"
               class="w-3.5 h-3.5"
               width="14"
               height="14"
@@ -445,16 +370,17 @@ defineExpose({
 
           <!-- 2. 色块标牌 (点击弹出调色板) -->
           <div class="color-badge-wrapper">
-            <span
+            <button
               class="channel-color-badge"
-              :style="{ backgroundColor: store.getChannelMeta(ch).color }"
-              @click="openColorPicker(ch, $event)"
+              :style="{ '--channel-color': channelMeta(row.id).color }"
+              @click="openColorPicker(row.id, $event)"
               title="点击自定义曲线与标牌色彩"
-            ></span>
+              :aria-label="`${channelLabel(row.id)}：修改曲线颜色`"
+            ></button>
 
             <!-- 拾色浮窗 -->
             <div
-              v-if="activeColorPickerChannel === ch"
+              v-if="activeColorPickerChannel === row.id"
               class="color-palette-popover"
               @click.stop
             >
@@ -463,49 +389,44 @@ defineExpose({
                 :key="color"
                 class="palette-item"
                 :style="{ backgroundColor: color }"
-                @click="selectColor(ch, color)"
+                @click="selectColor(row.id, color)"
+                :aria-label="`曲线颜色 ${color}`"
               ></button>
             </div>
           </div>
 
           <!-- 3. 通道标识/名称 (双击就地重命名) -->
-          <div class="channel-name-wrapper" @dblclick="startRename(ch, $event)">
+          <div class="channel-name-wrapper" @dblclick="startRename(row.id, $event)">
             <input
-              v-if="editingChannelId === ch"
-              :id="`rename-input-${ch}`"
+              v-if="editingChannelId === row.id"
+              :id="`rename-input-${row.id}`"
               v-model="editingChannelName"
               type="text"
               class="rename-input"
-              @blur="commitRename(ch)"
-              @keydown.enter="commitRename(ch)"
+              @blur="commitRename(row.id)"
+              @keydown.enter="commitRename(row.id)"
               @keydown.esc="cancelRename"
               @click.stop
             />
-            <span v-else class="channel-name font-mono">
-              {{ channelLabel(ch) }}
+            <span v-else class="channel-name" :title="channelLabel(row.id)">
+              {{ channelLabel(row.id) }}
             </span>
-          </div>
-
-          <!-- 4. 6 位高精浮点实时翻滚数值 -->
-          <div class="channel-value-wrapper">
-            <span
-              class="channel-value font-mono"
-              :style="{ color: store.getChannelMeta(ch).visible ? store.getChannelMeta(ch).color : '#64748b' }"
-            >
-              {{ formatChannelValue(ch) }}
-            </span>
+            <div class="channel-value-wrapper"><span class="channel-value font-mono">{{ formatChannelValue(row.id) }}</span></div>
+            <span class="channel-sample-status">{{ sidebarSampleStatus(row, props.isRunning) }}</span>
           </div>
 
           <!-- 5. 拖拽手柄与精细设置齿轮 -->
           <button
             class="btn-channel-gear"
-            @click="openChannelConfig(ch, $event)"
+            @click="openChannelConfig(row.id, $event)"
             title="原始单位与显示缩放配置"
-            :aria-label="`${channelLabel(ch)}：原始单位与显示缩放配置`"
+            :aria-label="`${channelLabel(row.id)}：原始单位与显示缩放配置`"
           >
-            ⚙️
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1z"/><circle cx="12" cy="12" r="3"/></svg>
           </button>
         </div>
+        </div>
+        </section>
       </div>
     </div>
 
@@ -520,6 +441,10 @@ defineExpose({
 
         <div class="modal-body">
           <div class="form-row">
+            <label for="channel-display-name">通道名称:</label>
+            <input id="channel-display-name" v-model="activeConfigChannel.name" type="text" maxlength="128" class="form-input" />
+          </div>
+          <div class="form-row">
             <label for="channel-raw-unit">原始数据单位（可留空）:</label>
             <input id="channel-raw-unit" ref="rawUnitField" v-model="rawUnitInput" type="text" :maxlength="CHANNEL_UNIT_MAX_LENGTH" class="form-input" placeholder="待用户确认" @input="unitInputChanged" />
           </div>
@@ -527,20 +452,20 @@ defineExpose({
           <p class="unit-note">单位描述收到的原始数值。下方缩放和偏置只影响显示，不修改原始数据、调参执行数值或单位；换设备或协议后应重新核对。</p>
           <p v-if="configError" class="unit-error" role="alert">{{ configError }}</p>
           <div class="form-row">
-            <label>Scale 线性缩放倍率:</label>
-            <input v-model.number="activeConfigChannel.scale" type="number" step="0.001" class="form-input" />
+            <label for="channel-display-scale">Scale 线性缩放倍率:</label>
+            <input id="channel-display-scale" v-model.number="activeConfigChannel.scale" type="number" step="0.001" class="form-input" />
           </div>
           <div class="form-row">
-            <label>Y-Offset 垂直偏置:</label>
-            <input v-model.number="activeConfigChannel.yOffset" type="number" step="0.1" class="form-input" />
+            <label for="channel-display-y-offset">Y-Offset 垂直偏置:</label>
+            <input id="channel-display-y-offset" v-model.number="activeConfigChannel.yOffset" type="number" step="0.1" class="form-input" />
           </div>
           <div class="form-row">
-            <label>X-Offset 相位时滞偏置:</label>
-            <input v-model.number="activeConfigChannel.xOffset" type="number" step="0.01" class="form-input" />
+            <label for="channel-display-x-offset">X-Offset 相位时滞偏置:</label>
+            <input id="channel-display-x-offset" v-model.number="activeConfigChannel.xOffset" type="number" step="0.01" class="form-input" />
           </div>
           <div class="form-row">
-            <label>Decimal 显示精度 (0~6位):</label>
-            <input v-model.number="activeConfigChannel.decimal" type="number" min="0" max="6" class="form-input" />
+            <label for="channel-display-decimal">Decimal 显示精度 (0~6位):</label>
+            <input id="channel-display-decimal" v-model.number="activeConfigChannel.decimal" type="number" min="0" max="6" class="form-input" />
           </div>
         </div>
 
@@ -556,8 +481,8 @@ defineExpose({
 
 <style scoped>
 .right-data-sidebar {
-  width: 210px;
-  min-width: 210px;
+  width: 270px;
+  min-width: 270px;
   height: 100%;
   background: var(--bg-surface, #272623);
   border-left: 1px solid var(--border-subtle, #383633);
@@ -577,10 +502,10 @@ defineExpose({
 
 .sidebar-collapse-toggle {
   position: absolute;
-  left: -14px;
+  left: -32px;
   top: 50%;
   transform: translateY(-50%);
-  width: 14px;
+  width: 32px;
   height: 54px;
   background: var(--bg-elevated, #2F2E2A);
   border: 1px solid var(--border-subtle, #383633);
@@ -601,7 +526,6 @@ defineExpose({
   background: var(--bg-surface, #272623);
   color: var(--accent-terracotta, #DA7756);
   border-color: var(--accent-terracotta, #DA7756);
-  box-shadow: -3px 0 12px var(--accent-terracotta-soft, rgba(218, 119, 86, 0.25));
 }
 
 .toggle-icon {
@@ -617,7 +541,7 @@ defineExpose({
 }
 
 .sidebar-header {
-  height: 38px;
+  min-height: 44px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -636,6 +560,9 @@ defineExpose({
   display: flex;
   align-items: center;
   border-radius: 3px;
+  min-width: 32px;
+  min-height: 32px;
+  justify-content: center;
 }
 
 .btn-global-eye:hover {
@@ -644,81 +571,56 @@ defineExpose({
 }
 
 .sidebar-title {
-  font-size: 13px;
+  font-size: 16px;
   font-weight: 600;
   color: var(--text-main, #ECEAE4);
   margin: 0;
 }
 
-.header-menu-anchor {
-  position: relative;
-}
-
-.btn-menu-trigger {
-  background: transparent;
-  border: none;
-  color: var(--text-muted, #9E9C94);
-  font-size: 16px;
-  font-weight: bold;
-  cursor: pointer;
-  padding: 0 4px;
-  border-radius: 3px;
-}
-
-.btn-menu-trigger:hover {
-  color: var(--text-main, #ECEAE4);
-  background: var(--bg-surface, #272623);
-}
-
-.dropdown-menu {
-  position: absolute;
-  right: 0;
-  top: 24px;
-  width: 140px;
-  background: var(--bg-surface, #272623);
-  border: 1px solid var(--border-subtle, #383633);
-  border-radius: 6px;
-  box-shadow: var(--card-shadow, 0 10px 25px rgba(0, 0, 0, 0.35));
-  display: flex;
-  flex-direction: column;
-  padding: 4px;
-  z-index: 50;
-}
-
-.menu-item {
+.btn-reset-display {
   background: transparent;
   border: none;
   color: var(--text-main, #ECEAE4);
-  text-align: left;
-  font-size: 11px;
+  font: inherit;
+  font-size: 12px;
+  min-height: 32px;
   padding: 6px 8px;
   cursor: pointer;
   border-radius: 4px;
 }
 
-.menu-item:hover {
+.btn-reset-display:hover:not(:disabled) {
   background: var(--bg-elevated, #2F2E2A);
   color: var(--accent-terracotta, #DA7756);
 }
+.btn-reset-display:disabled { color: var(--text-muted); cursor: default; }
+.sidebar-note, .channel-empty { font-size: 12px; line-height: 1.5; color: var(--text-muted); }
+.sidebar-note { margin: 12px 12px 4px; }
+.alias-warning { margin: 8px 12px; font-size: 12px; line-height: 1.5; color: var(--text-main); overflow-wrap: anywhere; }
+.channel-empty { margin: 8px 4px 16px; }
+.channel-group { min-width: 0; }
+.group-rows { display: flex; flex-direction: column; }
+.waiting-toggle { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 4px; min-height: 40px; padding: 8px 4px; margin-top: 8px; background: transparent; border: none; border-top: 1px solid var(--border-subtle); color: var(--text-main); font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
+.channel-sample-status { display: block; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
+button:focus-visible { outline: 2px solid var(--accent-terracotta); outline-offset: 2px; }
 
 .channel-list {
   flex: 1;
   overflow-y: auto;
-  padding: 4px;
+  padding: 4px 8px 12px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 0;
 }
 
 .channel-item {
   display: flex;
   align-items: center;
   gap: 6px;
-  height: 30px;
-  padding: 0 6px;
-  background: var(--bg-elevated, #2F2E2A);
-  border: 1px solid var(--border-subtle, #383633);
-  border-radius: 4px;
+  min-height: 76px;
+  flex-shrink: 0;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-subtle, #383633);
   cursor: grab;
   transition: background 0.15s, border-color 0.15s;
 }
@@ -733,11 +635,7 @@ defineExpose({
 }
 
 .channel-item.is-hidden {
-  opacity: 0.45;
-}
-
-.channel-item.is-pulsing {
-  background: var(--accent-terracotta-soft, rgba(218, 119, 86, 0.18));
+  color: var(--text-muted);
 }
 
 .btn-channel-eye {
@@ -748,6 +646,9 @@ defineExpose({
   padding: 0;
   display: flex;
   align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  min-height: 32px;
 }
 
 .btn-channel-eye .eye-off {
@@ -761,18 +662,22 @@ defineExpose({
 }
 
 .channel-color-badge {
-  width: 10px;
-  height: 10px;
-  border-radius: 2px;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
   cursor: pointer;
-  border: 1px solid rgba(255, 255, 255, 0.2);
+  border: none;
+  background: transparent;
+  display: grid;
+  place-items: center;
 }
+.channel-color-badge::after { content: ''; width: 12px; height: 12px; border-radius: 2px; background: var(--channel-color); }
 
 .color-palette-popover {
   position: absolute;
   left: 14px;
   top: -10px;
-  width: 96px;
+  width: 140px;
   background: var(--bg-surface, #272623);
   border: 1px solid var(--border-subtle, #383633);
   border-radius: 6px;
@@ -785,8 +690,8 @@ defineExpose({
 }
 
 .palette-item {
-  width: 16px;
-  height: 16px;
+  width: 32px;
+  height: 32px;
   border-radius: 2px;
   border: 1px solid rgba(255, 255, 255, 0.3);
   cursor: pointer;
@@ -797,51 +702,58 @@ defineExpose({
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .channel-name {
-  font-size: 11px;
+  display: block;
+  font-size: 13px;
+  line-height: 1.5;
   font-weight: 600;
   color: var(--text-main, #ECEAE4);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .rename-input {
   width: 100%;
-  height: 20px;
+  height: 32px;
   background: var(--bg-elevated, #2F2E2A);
   border: 1px solid var(--accent-terracotta, #DA7756);
   border-radius: 2px;
   color: var(--text-main, #ECEAE4);
-  font-size: 11px;
+  font-size: 13px;
   padding: 0 4px;
   outline: none;
 }
 
 .channel-value-wrapper {
-  width: 72px;
-  text-align: right;
-  flex-shrink: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .channel-value {
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 500;
-  letter-spacing: -0.2px;
+  color: var(--text-main);
+  font-variant-numeric: tabular-nums;
+  user-select: text;
 }
 
 .btn-channel-gear {
   background: transparent;
   border: none;
-  font-size: 10px;
+  color: var(--text-muted);
   cursor: pointer;
   padding: 0;
-  opacity: 0.4;
-  transition: opacity 0.2s;
+  min-width: 32px;
+  min-height: 32px;
+  display: grid;
+  place-items: center;
 }
 
 .channel-item:hover .btn-channel-gear {
-  opacity: 1;
+  color: var(--text-main);
 }
 
 /* 模态弹窗 */

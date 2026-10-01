@@ -34,7 +34,9 @@ export const DEFAULT_CHANNEL_PALETTE = [
 const STORAGE_KEY_V2 = 'llm-serial.vofa-dashboard.v2';
 const STORAGE_KEY_V1 = 'llm-serial.widgets.v1';
 
-import { globalChannelStore } from '../core/channel/ChannelStore';
+import { globalChannelStore, type ChannelAliasConflict } from '../core/channel/ChannelStore';
+const DASHBOARD_ALIAS_OWNER = Symbol('widget-dashboard-aliases');
+const channelAliasConflicts = ref<ChannelAliasConflict[]>([]);
 
 export interface PointerDragState {
   active: boolean;
@@ -49,6 +51,38 @@ export interface PointerDragState {
 
 // 核心全局响应式状态
 const dashboardState = ref<VofaDashboardState>(createDefaultVofaPreset());
+
+/** Migrate only explicit data fields whose current owner mapping is confirmed. */
+function canonicalizeOwnedWidgetBindings() {
+  const canonical = (value: unknown) => {
+    if (typeof value !== 'string') return value;
+    const target = globalChannelStore.getOwnedAliasTarget(DASHBOARD_ALIAS_OWNER, value);
+    return target && globalChannelStore.resolveChannelKey(value) === target ? target : value;
+  };
+  for (const tab of dashboardState.value.tabs) {
+    for (const widget of tab.widgets) {
+      const config = widget.config as unknown as Record<string, unknown>;
+      if (widget.type === 'chart' && Array.isArray(config.series)) {
+        for (const series of config.series) if (series && typeof series === 'object') series.channel = canonical(series.channel);
+      }
+      const fields = widget.type === 'chart' || widget.type === 'step_card' ? ['actual_channel', 'target_channel']
+        : ['gauge', 'number', 'led', 'stat_card'].includes(widget.type) ? ['channel']
+        : widget.type === 'slider' || widget.type === 'knob' ? ['feedback_channel'] : [];
+      for (const field of fields) if (Object.prototype.hasOwnProperty.call(config, field)) config[field] = canonical(config[field]);
+    }
+  }
+}
+
+function restoreDashboardAliases() {
+  const declarations = Object.entries(dashboardState.value.channels ?? {}).map(([targetId, meta]) => {
+    // The map key is the persisted canonical identity used by all channel lookups.
+    if (meta.id !== targetId) meta.id = targetId;
+    return { targetId, alias: typeof meta?.name === 'string' ? meta.name : targetId };
+  });
+  const result = globalChannelStore.replaceOwnedAliases(DASHBOARD_ALIAS_OWNER, declarations);
+  channelAliasConflicts.value = result.conflicts;
+  canonicalizeOwnedWidgetBindings();
+}
 const selectedWidgetId = ref<string | null>(null);
 const draggingWidgetType = ref<WidgetType | null>(null);
 const draggingChannelId = ref<string | null>(null);
@@ -106,6 +140,7 @@ export function loadDashboard(): VofaDashboardState {
       const res = validateAndMigrateDashboard(parsed);
       if (res.ok && res.data) {
         dashboardState.value = res.data;
+        restoreDashboardAliases();
         globalRenderScheduler.setActiveTab(dashboardState.value.active_tab_id);
         return dashboardState.value;
       }
@@ -119,6 +154,7 @@ export function loadDashboard(): VofaDashboardState {
       const res = validateAndMigrateDashboard(parsedV1);
       if (res.ok && res.data) {
         dashboardState.value = res.data;
+        restoreDashboardAliases();
         debouncedSave();
         globalRenderScheduler.setActiveTab(dashboardState.value.active_tab_id);
         return dashboardState.value;
@@ -133,6 +169,7 @@ export function loadDashboard(): VofaDashboardState {
     dashboardState.value = createDefaultVofaPreset();
   }
 
+  restoreDashboardAliases();
   globalRenderScheduler.setActiveTab(dashboardState.value.active_tab_id);
   return dashboardState.value;
 }
@@ -434,6 +471,7 @@ export function useWidgetStore() {
 
   function resetToDefault() {
     dashboardState.value = createDefaultVofaPreset();
+    restoreDashboardAliases();
     selectedWidgetId.value = null;
     globalRenderScheduler.setActiveTab(dashboardState.value.active_tab_id);
     debouncedSave();
@@ -457,6 +495,7 @@ export function useWidgetStore() {
         return { ok: false, error: res.error || '导入配置解析失败' };
       }
       dashboardState.value = res.data;
+      restoreDashboardAliases();
       selectedWidgetId.value = null;
       globalRenderScheduler.setActiveTab(dashboardState.value.active_tab_id);
       debouncedSave();
@@ -475,14 +514,13 @@ export function useWidgetStore() {
   });
 
   function getChannelMeta(id: string): ChannelMeta {
-    if (!dashboardState.value.channels) {
-      dashboardState.value.channels = {};
-    }
-    if (!dashboardState.value.channels[id]) {
-      const idx = Object.keys(dashboardState.value.channels).length;
+    const existing = ownChannelMeta(id);
+    if (!existing) {
+      const channels = { ...(dashboardState.value.channels ?? {}) };
+      const idx = Object.keys(channels).length;
       const defaultColor = DEFAULT_CHANNEL_PALETTE[idx % DEFAULT_CHANNEL_PALETTE.length];
       const displayName = id.startsWith('!') || isNaN(Number(id)) ? id : `!${id}`;
-      dashboardState.value.channels[id] = {
+      const meta: ChannelMeta = {
         id,
         name: displayName,
         color: defaultColor,
@@ -492,25 +530,32 @@ export function useWidgetStore() {
         xOffset: 0.0,
         decimal: 6,
       };
-      globalChannelStore.setAlias(displayName, id);
+      Object.defineProperty(channels, id, { value: meta, enumerable: true, configurable: true, writable: true });
+      // Replacement also notifies Vue when the new key is a prototype-like name.
+      dashboardState.value.channels = channels;
+      restoreDashboardAliases();
       debouncedSave();
     }
-    return dashboardState.value.channels[id];
+    return ownChannelMeta(id)!;
+  }
+
+  function ownChannelMeta(id: string): ChannelMeta | undefined {
+    const channels = dashboardState.value.channels;
+    return channels && Object.prototype.hasOwnProperty.call(channels, id) ? channels[id] : undefined;
   }
 
   function updateChannelMeta(id: string, partial: Partial<ChannelMeta>) {
     if (partial.id !== undefined && partial.id !== id) throw new Error('通道元数据不能改变真实通道 ID。');
     // Invalid edits must not initialize a channel or schedule persistence.
-    const current = dashboardState.value.channels?.[id];
+    const current = ownChannelMeta(id);
     const unitMetadata = normalizeChannelUnitMetadata({ ...current, ...partial });
     const meta = getChannelMeta(id);
+    if (partial.name !== undefined) canonicalizeOwnedWidgetBindings();
     Object.assign(meta, partial);
     delete meta.unit;
     delete meta.unitSource;
     Object.assign(meta, unitMetadata);
-    if (partial.name) {
-      globalChannelStore.setAlias(partial.name, id);
-    }
+    if (partial.name !== undefined) restoreDashboardAliases();
     debouncedSave();
   }
 
@@ -533,29 +578,9 @@ export function useWidgetStore() {
     const trimmed = newName.trim();
     if (!trimmed) return;
     const meta = getChannelMeta(id);
-    const oldName = meta.name;
+    canonicalizeOwnedWidgetBindings();
     meta.name = trimmed;
-
-    // 注册别名到数据中心，确保按别名或 ID 查询均能命中底层环形缓冲
-    globalChannelStore.setAlias(trimmed, id);
-    globalChannelStore.setAlias(oldName, id);
-
-    // 同步更新所有图表和控件中引用的通道名称
-    for (const tab of dashboardState.value.tabs) {
-      for (const w of tab.widgets) {
-        if (w.type === 'chart') {
-          for (const s of (w.config as any).series) {
-            if (s.channel === id || s.channel === oldName) {
-              s.channel = trimmed;
-            }
-          }
-        } else if ((w.config as any).channel === id || (w.config as any).channel === oldName) {
-          (w.config as any).channel = trimmed;
-        } else if ((w.config as any).feedback_channel === id || (w.config as any).feedback_channel === oldName) {
-          (w.config as any).feedback_channel = trimmed;
-        }
-      }
-    }
+    restoreDashboardAliases();
     debouncedSave();
   }
 
@@ -655,6 +680,7 @@ export function useWidgetStore() {
     cancelPointerDrag,
     registerDropTarget,
     channelMetaMap,
+    channelAliasConflicts: computed(() => channelAliasConflicts.value),
     channelMetas: channelMetaMap,
     channelMetaList: computed(() => Object.values(channelMetaMap.value)),
     getChannelMeta,

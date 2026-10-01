@@ -15,6 +15,16 @@ export type { ChannelViewBatch } from './types';
 
 export const MAX_ACTIVE_CHANNELS = 64;
 export const MAX_POINTS_PER_CHANNEL = 50_000;
+export const MAX_OWNED_ALIAS_DECLARATIONS = 512;
+
+export interface ChannelAliasBinding { alias: string; targetId: string }
+export interface ChannelAliasConflict extends ChannelAliasBinding {
+  reason: 'invalid-alias' | 'capacity' | 'duplicate-alias' | 'raw-channel-conflict' | 'canonical-key-conflict' | 'alias-conflict';
+}
+export interface ChannelAliasRestoreResult {
+  accepted: ChannelAliasBinding[];
+  conflicts: ChannelAliasConflict[];
+}
 
 interface SubscriptionRecord {
   id: number;
@@ -34,6 +44,7 @@ export class ChannelStore {
   private buffers: Map<string, RingBuffer> = new Map();
   private channelList: string[] = [];
   private aliases: Map<string, string> = new Map();
+  private aliasOwners = new Map<string, symbol>();
   private defaultCapacity: number;
   private channelListeners: Set<(names: string[]) => void> = new Set();
   private clearListeners: Set<(channelId?: string) => void> = new Set();
@@ -129,11 +140,68 @@ export class ChannelStore {
   public setAlias(alias: string, targetId: string): void {
     if (!alias || !targetId || alias === targetId) return;
     this.aliases.set(alias, targetId);
+    this.aliasOwners.delete(alias);
     if (alias.startsWith('!')) {
       this.aliases.set(alias.slice(1), targetId);
+      this.aliasOwners.delete(alias.slice(1));
     } else {
       this.aliases.set(`!${alias}`, targetId);
+      this.aliasOwners.delete(`!${alias}`);
     }
+  }
+
+  /** Replace only this workspace owner's declarations; never allocate or clear data. */
+  public replaceOwnedAliases(owner: symbol, declarations: readonly ChannelAliasBinding[]): ChannelAliasRestoreResult {
+    for (const [alias, aliasOwner] of this.aliasOwners) {
+      if (aliasOwner === owner) {
+        this.aliasOwners.delete(alias);
+        this.aliases.delete(alias);
+      }
+    }
+    const result: ChannelAliasRestoreResult = { accepted: [], conflicts: [] };
+    const variants = (alias: string) => [...new Set([alias, alias.startsWith('!') ? alias.slice(1) : `!${alias}`].filter(Boolean))];
+    const invalidText = /[\p{Cc}\p{Cf}\u2028\u2029]/u;
+    const sorted = [...declarations].sort((a, b) => a.targetId < b.targetId ? -1 : a.targetId > b.targetId ? 1 : a.alias < b.alias ? -1 : a.alias > b.alias ? 1 : 0);
+    const valid: ChannelAliasBinding[] = [];
+    const canonicalTargets = new Set(sorted.map(item => item.targetId));
+    for (const item of sorted) {
+      if (typeof item.alias !== 'string' || !item.alias.trim() || item.alias.length > 128 || invalidText.test(item.alias)
+        || typeof item.targetId !== 'string' || !item.targetId.trim() || item.targetId.length > 512 || invalidText.test(item.targetId)) {
+        result.conflicts.push({ ...item, reason: 'invalid-alias' });
+      } else if (valid.length >= MAX_OWNED_ALIAS_DECLARATIONS) {
+        result.conflicts.push({ ...item, reason: 'capacity' });
+      } else valid.push(item);
+    }
+    const claims = new Map<string, Set<string>>();
+    for (const item of valid) {
+      if (item.alias === item.targetId) continue;
+      for (const alias of variants(item.alias)) {
+        const targets = claims.get(alias) ?? new Set<string>();
+        targets.add(item.targetId);
+        claims.set(alias, targets);
+      }
+    }
+    for (const item of valid) {
+      if (item.alias === item.targetId) continue;
+      const keys = variants(item.alias);
+      const reason = keys.some(alias => (claims.get(alias)?.size ?? 0) > 1) ? 'duplicate-alias'
+        : keys.some(alias => this.buffers.has(alias) && alias !== item.targetId) ? 'raw-channel-conflict'
+        : keys.some(alias => canonicalTargets.has(alias) && alias !== item.targetId) ? 'canonical-key-conflict'
+        : keys.some(alias => this.aliases.has(alias) && this.aliases.get(alias) !== item.targetId) ? 'alias-conflict' : null;
+      if (reason) { result.conflicts.push({ ...item, reason }); continue; }
+      for (const alias of keys) {
+        if (alias === item.targetId || this.aliases.has(alias)) continue;
+        this.aliases.set(alias, item.targetId);
+        this.aliasOwners.set(alias, owner);
+      }
+      result.accepted.push({ ...item });
+    }
+    return result;
+  }
+
+  /** Exact registered ownership, suitable for migrating known data bindings only. */
+  public getOwnedAliasTarget(owner: symbol, alias: string): string | null {
+    return this.aliasOwners.get(alias) === owner ? this.aliases.get(alias) ?? null : null;
   }
 
   /**
@@ -143,8 +211,7 @@ export class ChannelStore {
     if (!nameOrId) return nameOrId;
     if (this.buffers.has(nameOrId)) return nameOrId;
     if (this.aliases.has(nameOrId)) {
-      const target = this.aliases.get(nameOrId)!;
-      if (this.buffers.has(target)) return target;
+      return this.aliases.get(nameOrId)!;
     }
     if (nameOrId.startsWith('!')) {
       const stripped = nameOrId.slice(1);
