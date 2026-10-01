@@ -11,6 +11,7 @@ export function validateFeedbackObservation(plan: TuningPlan, params: PidValues,
   if (!metrics || Object.keys(metrics).length !== metricKeys.length || !metricKeys.every(key => Object.prototype.hasOwnProperty.call(metrics, key))
     || !Object.entries(metrics).every(([key, value]) => key === 'overshootPercent' && value === null || typeof value === 'number' && Number.isFinite(value) && value >= 0)
     || !Number.isSafeInteger(metrics.sampleCount) || metrics.sampleCount < 10) throw new Error('实测指标无效或同步数据不足，没有请求 AI 候选。');
+  if (plan.goal.mode === 'step-response' && metrics.overshootPercent === null) throw new Error('缺少有效单次阶跃的超调指标，没有请求 AI 候选。');
   const signature = cascadeStageConfigurationSignature(plan).signature;
   if (!validTelemetryEvidenceShape(evidence) || evidence.configurationSignature !== signature
     || evidence.sampleCount !== metrics.sampleCount || !plan.baseline.confirmed || !plan.baseline.params

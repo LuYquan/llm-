@@ -244,7 +244,7 @@ const stepResponse = evaluateResponse(
   [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1],
   [0, 0, 0, 0, 0, 0.9, 1, 1, 1, 1, 1, 1],
   Array(12).fill(4),
-  { ...plan.goal, mode: 'step-response', maximumOvershootPct: 5 },
+  { ...plan.goal, mode: 'step-response', maximumOvershootPct: 5, stepSetpointTolerance: 0 },
   5,
 );
 assert.equal(stepResponse.passed, true);
@@ -376,3 +376,5 @@ try {
 }
 
 console.log('调参计划预检、候选约束、目标评价、回读确认、会话恢复与声明式套件检查通过。');
+const { runStepResponseTests } = await import('./tuning-step-response.test.ts');
+runStepResponseTests(createValidPlan());

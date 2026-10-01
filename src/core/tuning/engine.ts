@@ -3,6 +3,7 @@ import { solvePid } from '../control/solvePid';
 import { getPlantControlGain, validatePlantModel, withPlantGainMultiplier } from '../control/transferFunction';
 import { isCascadeDependencySnapshot } from './cascadeDependencies';
 import { isTuningCommandFormat } from './commandContract';
+import { identifyStepReference } from './stepResponse';
 import type { LoopStructure, PidValues } from '../project/types';
 import type {
   CandidateValidation,
@@ -126,8 +127,11 @@ export function validatePlan(plan: TuningPlan): string[] {
   if (plan.goal.mode === 'settle' && (!isPositive(plan.goal.maximumSteadyError) || !isPositive(plan.maximumOutputMagnitude))) {
     errors.push('稳定目标需要正的稳态误差限值及控制输出绝对上限。');
   }
-  if (plan.goal.mode === 'step-response' && (!isPositive(plan.goal.maximumSteadyError) || !isPositive(plan.goal.maximumOvershootPct) || !isPositive(plan.maximumOutputMagnitude))) {
+  if (plan.goal.mode === 'step-response' && (!isPositive(plan.goal.maximumSteadyError) || !isNonNegative(plan.goal.maximumOvershootPct) || !isPositive(plan.maximumOutputMagnitude))) {
     errors.push('阶跃目标需要稳态误差、超调与控制输出上限。');
+  }
+  if (plan.goal.mode === 'step-response' && (typeof plan.goal.stepSetpointTolerance !== 'number' || !Number.isFinite(plan.goal.stepSetpointTolerance) || plan.goal.stepSetpointTolerance < 0)) {
+    errors.push('阶跃目标需要明确的非负设定值容差，单位与设定值相同。');
   }
   if (plan.goal.mode === 'track' && (!isPositive(plan.goal.maximumTrackingError) || !isPositive(plan.maximumOutputMagnitude))) {
     errors.push('轨迹跟踪目标需要正的 RMS 跟踪误差限值及控制输出绝对上限。');
@@ -260,37 +264,66 @@ export function evaluateResponse(
   outputs: ArrayLike<number>,
   goal: TuningGoal,
   maximumOutputMagnitude: number,
-): { metrics: TuningMetrics | null; passed: boolean; message: string } {
+): { metrics: TuningMetrics | null; passed: boolean; message: string; outputLimitExceeded?: boolean } {
   const count = Math.min(setpoints.length, responses.length, outputs.length);
   if (setpoints.length !== responses.length || responses.length !== outputs.length) return { metrics: null, passed: false, message: '采样数组长度不一致，不能作为同步响应评价。' };
   if (count < 10) return { metrics: null, passed: false, message: '有效数据不足，至少需要 10 组同步采样。' };
-  if (![setpoints, responses, outputs].every((values) => Array.from(values).every(Number.isFinite))) return { metrics: null, passed: false, message: '响应窗口包含无效数字，不能计算或发送 AI 遥测指标。' };
+  for (let index = 0; index < count; index++) {
+    if (![setpoints[index], responses[index], outputs[index]].every(Number.isFinite)) return { metrics: null, passed: false, message: '响应窗口包含无效数字，不能计算或发送 AI 遥测指标。' };
+  }
   if (!Number.isFinite(maximumOutputMagnitude) || maximumOutputMagnitude <= 0) return { metrics: null, passed: false, message: '控制输出上限无效，不能评价响应。' };
+  for (let index = 0; index < count; index++) {
+    if (Math.abs(outputs[index]) > maximumOutputMagnitude) return { metrics: null, passed: false, outputLimitExceeded: true, message: '控制输出超过用户设置的上限，实验应停止并检查设备状态。' };
+  }
+  if (!goal || !['settle', 'step-response', 'track'].includes(goal.mode)
+    || (goal.mode === 'track' ? !isPositive(goal.maximumTrackingError) : !isPositive(goal.maximumSteadyError))
+    || goal.mode === 'step-response' && !isNonNegative(goal.maximumOvershootPct)) return { metrics: null, passed: false, message: '响应评价目标或误差上限无效。' };
+  const step = goal.mode === 'step-response' ? identifyStepReference(setpoints, goal.stepSetpointTolerance) : null;
+  if (step && !step.valid) return { metrics: null, passed: false, message: step.reason };
+  if (step?.valid) {
+    for (let index = 0; index < step.transitionIndex; index++) {
+      if (Math.abs(responses[index] - step.initialTarget) > goal.maximumSteadyError!) {
+        return { metrics: null, passed: false, message: '阶跃前反馈尚未稳定在初始目标的误差范围内；不能作为单次阶跃响应，请重新采集完整窗口。' };
+      }
+    }
+  }
   const finalTargetCount = Math.min(5, count);
   const finalTargetStart = count - finalTargetCount;
   const finalTargetSamples = Array.from({ length: finalTargetCount }, (_, i) => setpoints[finalTargetStart + i]);
-  const target = median(finalTargetSamples);
+  const target = step?.valid ? step.finalTarget : median(finalTargetSamples);
   if (!Number.isFinite(target)) return { metrics: null, passed: false, message: '目标通道包含无效数据。' };
   const tailStart = Math.max(0, count - Math.min(10, Math.floor(count / 5)));
-  const steadyError = Math.max(...Array.from({ length: count - tailStart }, (_, i) => Math.abs(responses[tailStart + i] - target)));
-  const peakError = Math.max(...Array.from({ length: count }, (_, i) => Math.abs(responses[i] - setpoints[i])));
-  const rmsTrackingError = Math.sqrt(Array.from({ length: count }, (_, i) => (responses[i] - setpoints[i]) ** 2).reduce((sum, value) => sum + value, 0) / count);
-  const initialTargetSamples = Array.from({ length: Math.min(5, count) }, (_, i) => setpoints[i]);
-  const initialTarget = median(initialTargetSamples);
-  const initialResponse = median(Array.from({ length: Math.min(5, count) }, (_, i) => responses[i]));
-  const direction = Math.sign(target - initialTarget);
-  const amplitude = Math.abs(target - initialTarget);
-  const valueRange = (values: number[]) => Math.max(...values) - Math.min(...values);
-  const targetPlateausValid = goal.mode === 'settle'
-    ? valueRange(Array.from({ length: count }, (_, i) => setpoints[i])) <= (goal.maximumSteadyError ?? 0)
-    : goal.mode === 'step-response'
-      ? valueRange(initialTargetSamples) <= (goal.maximumSteadyError ?? 0)
-        && valueRange(finalTargetSamples) <= (goal.maximumSteadyError ?? 0)
-      : true;
-  const overshootPercent = goal.mode === 'step-response' && amplitude > 1e-9 && direction !== 0
-    ? Math.max(0, ...Array.from({ length: count }, (_, i) => direction * (responses[i] - target))) / amplitude * 100
-    : null;
-  const maxOutput = Math.max(...Array.from({ length: count }, (_, i) => Math.abs(outputs[i])));
+  let steadyError = 0;
+  let peakError = 0;
+  let maxOutput = 0;
+  let maximumOvershoot = 0;
+  let minimumTarget = Infinity;
+  let maximumTarget = -Infinity;
+  let rmsScale = 0;
+  let scaledSquares = 0;
+  for (let index = 0; index < count; index++) {
+    const error = Math.abs(responses[index] - setpoints[index]);
+    const finalError = index >= tailStart ? Math.abs(responses[index] - target) : 0;
+    if (!Number.isFinite(error) || !Number.isFinite(finalError)) return { metrics: null, passed: false, message: '响应误差计算超出有限数值范围，不能作为评价或 AI 依据。' };
+    peakError = Math.max(peakError, error);
+    steadyError = Math.max(steadyError, finalError);
+    maxOutput = Math.max(maxOutput, Math.abs(outputs[index]));
+    minimumTarget = Math.min(minimumTarget, setpoints[index]);
+    maximumTarget = Math.max(maximumTarget, setpoints[index]);
+    if (step?.valid && index >= step.transitionIndex) maximumOvershoot = Math.max(maximumOvershoot, step.direction * (responses[index] - target));
+    // Scaled sum of squares avoids squaring finite large errors into Infinity.
+    if (error > 0) {
+      if (error > rmsScale) {
+        scaledSquares = 1 + scaledSquares * (rmsScale / error) ** 2;
+        rmsScale = error;
+      } else scaledSquares += (error / rmsScale) ** 2;
+    }
+  }
+  const rmsTrackingError = rmsScale * Math.sqrt(scaledSquares / count);
+  const targetPlateausValid = goal.mode !== 'settle' || maximumTarget - minimumTarget <= goal.maximumSteadyError!;
+  const overshootPercent = step?.valid ? maximumOvershoot / step.amplitude * 100 : null;
+  if (![steadyError, peakError, rmsTrackingError, maxOutput].every(Number.isFinite)
+    || overshootPercent !== null && !Number.isFinite(overshootPercent)) return { metrics: null, passed: false, message: '响应指标计算超出有限数值范围，不能作为评价或 AI 依据。' };
   const metrics: TuningMetrics = {
     steadyError,
     peakError,
@@ -302,7 +335,7 @@ export function evaluateResponse(
   const passed = (goal.mode === 'track'
     ? rmsTrackingError <= (goal.maximumTrackingError ?? 0)
     : steadyError <= (goal.maximumSteadyError ?? 0))
-    && (goal.mode !== 'step-response' || ((overshootPercent ?? Infinity) <= (goal.maximumOvershootPct ?? 0) && amplitude > 1e-9 && Number.isFinite(initialResponse)))
+    && (goal.mode !== 'step-response' || (overshootPercent ?? Infinity) <= goal.maximumOvershootPct!)
     && targetPlateausValid
     && maxOutput <= maximumOutputMagnitude;
   const message = passed
@@ -400,7 +433,8 @@ export function validatePlanShape(value: unknown): string[] {
   if (!isObject(p.confirmation) || !['manual', 'parameter-channels', 'acknowledgement'].includes(p.confirmation.mode as string)
     || !boundedString(p.confirmation.acknowledgementText, 512) || !nullableNumber(p.confirmation.timeoutSeconds) || !nullableNumber(p.confirmation.parameterTolerance)) return ['设备确认格式无效。'];
   if (!isObject(p.goal) || !['settle', 'step-response', 'track'].includes(p.goal.mode as string)
-    || !['maximumSteadyError', 'maximumOvershootPct', 'maximumTrackingError', 'targetPhaseMarginDeg', 'targetCrossoverRadPerSec'].every((key) => nullableNumber((p.goal as Record<string, unknown>)[key]))) return ['调参目标格式无效。'];
+    || !['maximumSteadyError', 'maximumOvershootPct', 'maximumTrackingError', 'targetPhaseMarginDeg', 'targetCrossoverRadPerSec'].every((key) => nullableNumber((p.goal as Record<string, unknown>)[key]))
+    || p.goal.stepSetpointTolerance !== undefined && !nullableNumber(p.goal.stepSetpointTolerance)) return ['调参目标格式无效。'];
   if (p.model !== null && (!isObject(p.model) || validatePlantModel(p.model as unknown as PlantModel).length)) return ['对象模型格式无效。'];
   if (p.suite !== undefined && !isScenarioContext(p.suite)) return ['场景套组格式无效。'];
   if (p.cascadeBinding !== undefined && !isCascadeDependencySnapshot(p.cascadeBinding)) return ['串级内环依赖快照格式无效。'];
@@ -521,6 +555,10 @@ export function limitsFromProject(limits: Record<PidParameter, [number, number]>
 
 function isPositive(value: number | null): value is number {
   return value !== null && Number.isFinite(value) && value > 0;
+}
+
+function isNonNegative(value: number | null): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 
 function median(values: number[]): number {

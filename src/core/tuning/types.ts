@@ -34,6 +34,8 @@ export interface TuningGoal {
   mode: 'settle' | 'step-response' | 'track';
   maximumSteadyError: number | null;
   maximumOvershootPct: number | null;
+  /** Reference-channel units; absent legacy values require explicit configuration. */
+  stepSetpointTolerance?: number | null;
   maximumTrackingError: number | null;
   targetPhaseMarginDeg: number | null;
   targetCrossoverRadPerSec: number | null;
