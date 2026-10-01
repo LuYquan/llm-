@@ -715,7 +715,7 @@ function refreshSubscription() {
       channelValues.value[channel] = {
         value: latest.v,
         receivedAt: batch.updatedAtMs[channel] ?? receivedAt,
-        generation: batch.generation,
+        generation: batch.updatedGenerations[channel] ?? batch.generation,
         revision: batch.updatedRevisions[channel] ?? 0,
       };
       }
@@ -971,11 +971,18 @@ function handleStructureChange(structure: LoopStructure) {
   syncManualParams();
 }
 
+function readLiveChannel(channel: string | undefined) {
+  if (!props.connected || !channel) return undefined;
+  const observation = globalChannelStore.observeLatest(channel);
+  if (!observation || observation.generation !== globalChannelStore.getGeneration()) return undefined;
+  return { value: observation.point.v, receivedAt: observation.updatedAtMs, generation: observation.generation, revision: observation.revision };
+}
+
 function readParametersFromChannels() {
   const values: Partial<Record<PidParameter, number>> = {};
   for (const key of activeParameters.value) {
     const channel = plan.value.channels.parameters[key];
-    const item = channel ? channelValues.value[channel] : undefined;
+    const item = readLiveChannel(channel);
     if (!item || item.generation !== globalChannelStore.getGeneration() || !plan.value.maximumTelemetryAgeSeconds || (Date.now() - item.receivedAt) / 1000 > plan.value.maximumTelemetryAgeSeconds) {
       setNotice('warning', '参数通道尚未就绪', `先绑定并接收当前会话的新鲜参数数据。请核对 ${key.toUpperCase()}。`);
       return;
@@ -1001,7 +1008,7 @@ function currentReadback(trial?: TuningTrial): Partial<Record<PidParameter, numb
   const context = globalChannelStore.getSessionContext();
   for (const key of activeParameters.value) {
     const channel = plan.value.channels.parameters[key];
-    const item = channel ? channelValues.value[channel] : undefined;
+    const item = readLiveChannel(channel);
     if (item && trial?.writeStartedAt !== undefined && trial.writeChannelGeneration !== undefined
       && trial.writeParameterRevisions?.[key] !== undefined && isFreshChannelValue(item, {
         startedAt: trial.writeStartedAt, channelGeneration: trial.writeChannelGeneration,
@@ -1382,7 +1389,7 @@ async function collectAndEvaluate(trial: TuningTrial, owner: OperationOwner, aut
       requestSafetyStop('采集中遥测超时，未完成当前评价窗口。');
       return false;
     }
-    const output = channelValues.value[plan.value.channels.output]?.value;
+    const output = readLiveChannel(plan.value.channels.output)?.value;
     if (Number.isFinite(output) && Math.abs(output as number) > (plan.value.maximumOutputMagnitude ?? 0)) {
       trial.status = 'failed';
       requestSafetyStop('采集中控制输出超过用户设置上限。');
@@ -1701,7 +1708,7 @@ function checkExecutionSafety() {
     requestSafetyStop(protocolErrors.value[0]);
     return;
   }
-  const reason = executionSafetyStopReason({ connected: props.connected, telemetryFresh: telemetryFresh(), output: channelValues.value[plan.value.channels.output]?.value, maximumOutputMagnitude: plan.value.maximumOutputMagnitude });
+  const reason = executionSafetyStopReason({ connected: props.connected, telemetryFresh: telemetryFresh(), output: readLiveChannel(plan.value.channels.output)?.value, maximumOutputMagnitude: plan.value.maximumOutputMagnitude });
   if (!reason) return;
   requestSafetyStop(reason);
 }
@@ -1745,7 +1752,7 @@ function readMetrics(afterTimestamp = 0, throughTimestamp = Infinity): ReturnTyp
   const selected = [bindings.setpoint, bindings.feedback, bindings.output];
   if (selected.some((channel) => !channel)) return { metrics: null, passed: false, message: '请先绑定目标值、实际反馈和控制输出。' };
   for (const channel of selected) {
-    const latest = channelValues.value[channel];
+    const latest = readLiveChannel(channel);
     if (!latest) return { metrics: null, passed: false, message: `通道 ${channel} 尚未收到数据。` };
     if ((Date.now() - latest.receivedAt) / 1000 > (plan.value.maximumTelemetryAgeSeconds ?? 0)) {
       return { metrics: null, passed: false, message: `通道 ${channel} 的数据已超过最大延迟。` };
@@ -1770,7 +1777,7 @@ function telemetryFresh(): boolean {
   const p = plan.value;
   if (!p.channels.setpoint || !p.channels.feedback || !p.channels.output || !p.maximumTelemetryAgeSeconds) return false;
   return [p.channels.setpoint, p.channels.feedback, p.channels.output].every((channel) => {
-    const value = channelValues.value[channel];
+    const value = readLiveChannel(channel);
     return value && value.generation === globalChannelStore.getGeneration() && (Date.now() - value.receivedAt) / 1000 <= p.maximumTelemetryAgeSeconds!;
   });
 }

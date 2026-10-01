@@ -28,7 +28,9 @@ export interface ChannelViewBatch {
   updatedAtMs: Record<string, number>;
   /** Canonical ingestion revisions, keyed by each requested subscription name. */
   updatedRevisions: Record<string, number>;
-  /** Increments whenever the live display buffers are cleared for a new session. */
+  /** Generation in which each updated channel was actually ingested. */
+  updatedGenerations: Record<string, number>;
+  /** Current display-store generation; a partial clear can leave older channel points. */
   generation: number;
   views: Record<string, ChannelSnapshot>;
   latest: Record<string, ChannelPoint | undefined>;

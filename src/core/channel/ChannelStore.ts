@@ -40,6 +40,20 @@ export interface ChannelSessionContext {
   epoch: number | null;
 }
 
+/** A detached latest point with its actual ingestion identity, independent of rendering. */
+export interface ChannelObservation {
+  point: ChannelPoint;
+  updatedAtMs: number;
+  revision: number;
+  generation: number;
+}
+
+interface DispatchTicket {
+  timer: ReturnType<typeof setTimeout> | null;
+  frame: number | null;
+  dueAt: number;
+}
+
 export class ChannelStore {
   private buffers: Map<string, RingBuffer> = new Map();
   private channelList: string[] = [];
@@ -50,10 +64,12 @@ export class ChannelStore {
   private clearListeners: Set<(channelId?: string) => void> = new Set();
   private subscribers: Map<number, SubscriptionRecord> = new Map();
   private nextSubId = 1;
-  private scheduledTimer: any = null;
+  private scheduledDispatch: DispatchTicket | null = null;
+  private dispatching = false;
   private dirtyChannels: Set<string> = new Set();
   private channelUpdatedAtMs: Map<string, number> = new Map();
   private channelRevisions: Map<string, number> = new Map();
+  private channelIngestedGenerations: Map<string, number> = new Map();
   private generation = 0;
   private capacityExceededListeners = new Set<(channelId: string) => void>();
   private capacityExceededReported = false;
@@ -97,6 +113,16 @@ export class ChannelStore {
   /** Capture the ingestion watermark before dispatching a device command. */
   public getChannelRevision(channelId: string): number {
     return this.channelRevisions.get(this.resolveChannelKey(channelId)) ?? 0;
+  }
+
+  public observeLatest(channelId: string): ChannelObservation | undefined {
+    const key = this.resolveChannelKey(channelId);
+    const point = this.buffers.get(key)?.latest();
+    const updatedAtMs = this.channelUpdatedAtMs.get(key);
+    const generation = this.channelIngestedGenerations.get(key);
+    if (!point || !Number.isFinite(point.t) || !Number.isFinite(point.v)
+      || updatedAtMs === undefined || generation === undefined) return undefined;
+    return { point: { ...point }, updatedAtMs, generation, revision: this.channelRevisions.get(key) ?? 0 };
   }
 
   /**
@@ -480,6 +506,7 @@ export class ChannelStore {
    * 清空指定或全部通道
    */
   public clear(channelId?: string): void {
+    this.cancelScheduledDispatch();
     this.generation++;
     if (channelId) {
       const key = this.resolveChannelKey(channelId);
@@ -487,6 +514,7 @@ export class ChannelStore {
       this.dirtyChannels.delete(key);
       this.channelUpdatedAtMs.delete(key);
       this.channelRevisions.delete(key);
+      this.channelIngestedGenerations.delete(key);
       for (const subscriber of this.subscribers.values()) subscriber.pendingChannels.delete(key);
     } else {
       for (const buf of this.buffers.values()) {
@@ -495,6 +523,7 @@ export class ChannelStore {
       this.dirtyChannels.clear();
       this.channelUpdatedAtMs.clear();
       this.channelRevisions.clear();
+      this.channelIngestedGenerations.clear();
       for (const subscriber of this.subscribers.values()) subscriber.pendingChannels.clear();
     }
     if (!channelId) this.sessionContext = { sessionId: null, epoch: null };
@@ -502,6 +531,7 @@ export class ChannelStore {
       try { listener(channelId); }
       catch (error) { console.error('[ChannelStore] onCleared listener error:', error); }
     }
+    if (this.dirtyChannels.size || [...this.subscribers.values()].some((sub) => sub.pendingChannels.size)) this.scheduleDispatch();
   }
 
   /**
@@ -526,9 +556,11 @@ export class ChannelStore {
     if (options.immediate) {
       this.emitToSubscriber(this.subscribers.get(id)!);
     }
+    if (this.dirtyChannels.size) this.scheduleDispatch();
 
     return () => {
       this.subscribers.delete(id);
+      if (this.subscribers.size === 0) this.cancelScheduledDispatch();
     };
   }
 
@@ -536,67 +568,88 @@ export class ChannelStore {
     this.dirtyChannels.add(channelId);
     this.channelUpdatedAtMs.set(channelId, Date.now());
     this.channelRevisions.set(channelId, (this.channelRevisions.get(channelId) ?? 0) + 1);
+    this.channelIngestedGenerations.set(channelId, this.generation);
     this.scheduleDispatch();
   }
 
   private scheduleDispatch(delayMs = 0) {
-    if (this.scheduledTimer) return;
+    const wait = delayMs > 0 ? delayMs : 16;
+    const dueAt = Date.now() + wait;
+    if (this.scheduledDispatch && this.scheduledDispatch.dueAt <= dueAt) return;
+    this.cancelScheduledDispatch();
+    const ticket: DispatchTicket = { timer: null, frame: null, dueAt };
+    this.scheduledDispatch = ticket;
+    const dispatch = () => {
+      // A cancelled callback may already be queued. It must not release a newer ticket.
+      if (this.scheduledDispatch !== ticket) return;
+      this.cancelScheduledDispatch();
+      this.flushDispatch();
+    };
+    ticket.timer = setTimeout(dispatch, wait);
+    // Rendering is optional. The timer races the frame; neither is a real-time guarantee.
+    if (delayMs <= 0 && typeof requestAnimationFrame === 'function') ticket.frame = requestAnimationFrame(dispatch);
+  }
 
-    if (delayMs > 0) {
-      this.scheduledTimer = setTimeout(() => {
-        this.scheduledTimer = null;
-        this.flushDispatch();
-      }, delayMs);
-      return;
-    }
-
-    // 优先采用 requestAnimationFrame，在 node 或后台环境降级为 setTimeout
-    if (typeof requestAnimationFrame === 'function') {
-      this.scheduledTimer = requestAnimationFrame(() => {
-        this.scheduledTimer = null;
-        this.flushDispatch();
-      });
-    } else {
-      this.scheduledTimer = setTimeout(() => {
-        this.scheduledTimer = null;
-        this.flushDispatch();
-      }, 16);
-    }
+  private cancelScheduledDispatch() {
+    const ticket = this.scheduledDispatch;
+    if (!ticket) return;
+    this.scheduledDispatch = null;
+    if (ticket.timer !== null) clearTimeout(ticket.timer);
+    if (ticket.frame !== null && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(ticket.frame);
   }
 
   /**
    * 触发所有订阅者的分发更新
    */
   public flushDispatch(): void {
+    if (this.dispatching) return;
+    this.cancelScheduledDispatch();
     if (this.subscribers.size === 0) {
       this.dirtyChannels.clear();
       return;
     }
 
     const updated = [...this.dirtyChannels];
-    const now = Date.now();
-    for (const sub of this.subscribers.values()) {
-      // Dirty keys are canonical IDs, while subscribers may use a display/name alias.
-      // Resolve both sides before filtering so an alias subscription receives the same
-      // update as a subscription made with the canonical channel ID.
-      const updatedForSubscriber = updated.filter((channel) =>
-        sub.channelIds.some((requested) => this.resolveChannelKey(requested) === channel),
-      );
-      for (const channel of updatedForSubscriber) sub.pendingChannels.add(channel);
-      if (sub.pendingChannels.size === 0) continue;
-      const minIntervalMs = sub.options.fps ? 1000 / sub.options.fps : 16;
-      const remainingMs = minIntervalMs - (now - sub.lastEmitTime);
-      if (remainingMs > 0) {
-        this.scheduleDispatch(remainingMs);
-        continue;
-      }
-      const pending = [...sub.pendingChannels];
-      sub.pendingChannels.clear();
-      this.emitToSubscriber(sub, pending);
-      sub.lastEmitTime = now;
-    }
-
+    // Detach before callbacks, so callback ingestion remains dirty for the next dispatch.
     this.dirtyChannels.clear();
+    const now = Date.now();
+    const generation = this.generation;
+    const subscribers = [...this.subscribers.values()];
+    this.dispatching = true;
+    try {
+      for (const sub of subscribers) {
+        // Dirty keys are canonical IDs, while subscribers may use a display/name alias.
+        const updatedForSubscriber = updated.filter((channel) =>
+          sub.channelIds.some((requested) => this.resolveChannelKey(requested) === channel),
+        );
+        for (const channel of updatedForSubscriber) sub.pendingChannels.add(channel);
+      }
+      for (const sub of subscribers) {
+        if (this.generation !== generation) break;
+        if (this.subscribers.get(sub.id) !== sub) continue;
+        if (sub.pendingChannels.size === 0) continue;
+        const remainingMs = this.subscriberInterval(sub) - (now - sub.lastEmitTime);
+        if (remainingMs > 0) continue;
+        const pending = [...sub.pendingChannels];
+        sub.pendingChannels.clear();
+        sub.lastEmitTime = now;
+        this.emitToSubscriber(sub, pending);
+      }
+    } finally {
+      this.dispatching = false;
+      if (this.dirtyChannels.size) this.scheduleDispatch();
+      else {
+        let remaining = Infinity;
+        for (const sub of this.subscribers.values()) {
+          if (sub.pendingChannels.size) remaining = Math.min(remaining, Math.max(0, this.subscriberInterval(sub) - (Date.now() - sub.lastEmitTime)));
+        }
+        if (remaining !== Infinity) this.scheduleDispatch(remaining);
+      }
+    }
+  }
+
+  private subscriberInterval(sub: SubscriptionRecord): number {
+    return sub.options.fps && Number.isFinite(sub.options.fps) && sub.options.fps > 0 ? 1000 / sub.options.fps : 16;
   }
 
   /**
@@ -618,6 +671,7 @@ export class ChannelStore {
     const latest: Record<string, ChannelPoint | undefined> = {};
     const updatedAtMs: Record<string, number> = {};
     const updatedRevisions: Record<string, number> = {};
+    const updatedGenerations: Record<string, number> = {};
     const updatedCanonical = new Set(updatedChannelIds.map((channel) => this.resolveChannelKey(channel)));
     for (const requestedChannel of sub.channelIds) {
       const canonical = this.resolveChannelKey(requestedChannel);
@@ -625,6 +679,8 @@ export class ChannelStore {
         const updatedAt = this.channelUpdatedAtMs.get(canonical);
         if (updatedAt !== undefined) updatedAtMs[requestedChannel] = updatedAt;
         updatedRevisions[requestedChannel] = this.channelRevisions.get(canonical) ?? 0;
+        const ingestedGeneration = this.channelIngestedGenerations.get(canonical);
+        if (ingestedGeneration !== undefined) updatedGenerations[requestedChannel] = ingestedGeneration;
       }
     }
 
@@ -675,6 +731,7 @@ export class ChannelStore {
         updatedChannelIds: sub.channelIds.filter((channel) => updatedCanonical.has(this.resolveChannelKey(channel))),
         updatedAtMs,
         updatedRevisions,
+        updatedGenerations,
         generation: this.generation,
         views,
         latest,

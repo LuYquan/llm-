@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>实际 App · 后台遥测与渲染分离验收</title></head>
+<body><div id="app"></div><section id="fixture-bar" aria-label="后台遥测合成夹具">
+  <strong>真实 App / Web Serial / Worker · 合成字节与本地 HTTP · 无硬件 / 云 AI</strong>
+  <label>分支 <select id="fixture-case"><option value="normal">参数回读成功</option><option value="confirmation-timeout">参数回读超时</option><option value="output-limit">写入后输出越界</option></select></label>
+  <button id="prepare-case">准备分支并重载</button>
+  <button id="hold-frames">截留全部 rAF</button><button id="resume-frames">恢复 rAF</button>
+  <button id="hold-subscribers">截留订阅回调</button><button id="resume-subscribers">恢复自然订阅分发</button>
+  <button id="pause-rx">暂停合成 RX</button><button id="resume-rx">恢复合成 RX</button>
+  <button id="force-output">下个数值帧输出设为 11</button><button id="restore-output">输出恢复 1</button>
+  <label><input id="hold-write" type="checkbox">截留后续流写入完成</label><button id="complete-write">完成当前流写入</button>
+  <button id="hold-http">下一候选保持延迟</button><button id="release-http">放行本地候选</button>
+  <button id="clear-ki">仅清除 ch4（Ki）</button><button id="capture-proof">记录新证据</button>
+  <output id="fixture-control-status" aria-label="后台遥测夹具控制状态"></output>
+  <details><summary>机器证据</summary><output id="fixture-proof" aria-label="后台遥测夹具机器证据"></output></details>
+</section><script type="module" src="./background-delivery-harness.ts"></script></body></html>

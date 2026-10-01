@@ -4,9 +4,11 @@
 
 import assert from 'node:assert/strict';
 import { RingBuffer, ChannelStore } from '../src/core/channel';
+import { runChannelDispatchTests } from './channel-dispatch.test.ts';
 
 export async function runChannelStoreTests() {
   console.log('--- [ChannelStore] 开始测试环形缓冲、多通道订阅与性能基准 ---');
+  runChannelDispatchTests();
 
   // 1. 单通道 RingBuffer 基础功能与容量绕回测试
   {
