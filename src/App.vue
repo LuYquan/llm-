@@ -1791,6 +1791,7 @@ onUnmounted(() => {
       :rx-bytes="totalRxBytes"
       :tx-bytes="totalTxBytes"
       :send-command="handleSendSerialData"
+      :send-blocked-reason="isTuningBusy ? 'AI 实验正在写入参数；先停止实验，再发送普通命令。' : session.softwareStopLocked.value ? '软件停止已锁定发送；核对设备状态后显式恢复。' : isApplyingProtocol ? '协议正在切换，请稍后发送。' : !isRunning ? '连接设备后发送。' : ''"
       @toggle-pause="handleToggleStreamPause"
       @clear-buffer="handleClearBuffer"
       @auto-scale="handleAutoScaleCharts"

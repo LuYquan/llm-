@@ -26,6 +26,7 @@ const props = defineProps<{
   activeChannels?: string[];
   rxBytes?: number | null;
   txBytes?: number | null;
+  sendBlockedReason?: string;
   sendCommand: (data: string, isHex: boolean, appendNewline: boolean, escapeText: boolean, lineEnding: CommandLineEnding) => Promise<void>;
 }>();
 
@@ -189,7 +190,7 @@ const sendError = ref('');
 let sendErrorTimer: number | null = null;
 
 async function handleSend() {
-  if (sendText.value.length === 0 || isSendingCommand.value) return;
+  if (sendText.value.length === 0 || isSendingCommand.value || props.sendBlockedReason || !props.isRunning) return;
   const content = sendText.value;
   isSendingCommand.value = true;
   sendError.value = '';
@@ -255,6 +256,7 @@ function handleQuickCmdClick(cmd: QuickCmd) {
     emit('emergency-stop');
     return;
   }
+  if (props.sendBlockedReason || !props.isRunning) return;
   emit('send-quick-command', cmd);
 }
 
@@ -378,8 +380,9 @@ defineExpose({
             :key="cmd.id"
             class="quick-cmd-pill"
             :class="{ 'pill-danger': cmd.danger }"
+            :disabled="!cmd.danger && (Boolean(props.sendBlockedReason) || !props.isRunning)"
             @click="handleQuickCmdClick(cmd)"
-            :title="`${cmd.name}: ${cmd.command}`"
+            :title="!cmd.danger && props.sendBlockedReason ? props.sendBlockedReason : `${cmd.name}: ${cmd.command}`"
           >
             <span>{{ cmd.name }}</span>
           </button>
@@ -396,9 +399,9 @@ defineExpose({
         <!-- Claude 标志性陶土色实心圆形发送按键 (↵) -->
         <button
           class="btn-dispatch-send"
-          :disabled="sendText.length === 0 || isSendingCommand"
+          :disabled="sendText.length === 0 || isSendingCommand || Boolean(props.sendBlockedReason) || !props.isRunning"
           @click="handleSend"
-          title="发送命令 (快捷键: Alt + S 或 Enter)"
+          :title="props.sendBlockedReason || '发送命令 (快捷键: Alt + S 或 Enter)'"
         >
           <svg v-if="!isSendingCommand" class="claude-send-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true">
             <path stroke-linecap="round" stroke-linejoin="round" d="M4.5 10.5L12 3m0 0l7.5 7.5M12 3v18" />
@@ -406,6 +409,7 @@ defineExpose({
           <span>{{ isSendingCommand ? '发送中' : '发送' }}</span>
         </button>
         <span v-if="sendError" class="send-error" role="alert">{{ sendError }}</span>
+        <span v-else-if="props.sendBlockedReason && (sendText || props.isRunning)" class="send-error send-blocked" role="status">{{ props.sendBlockedReason }}</span>
       </div>
 
       <!-- 3. 右侧区：解析数据速率与数据脉冲 + [⚙️ 流控与回溯] 气泡按钮 -->
@@ -1335,6 +1339,11 @@ defineExpose({
   background: var(--bg-surface);
   white-space: normal;
   overflow-wrap: anywhere;
+}
+
+.send-blocked {
+  border-color: var(--border-strong);
+  color: var(--text-secondary);
 }
 
 @container (max-width: 1000px) {

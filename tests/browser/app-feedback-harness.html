@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>实际 App · Web Serial 合成反馈验收</title></head>
+<body><div id="app"></div><section id="fixture-bar" aria-label="合成反馈夹具">
+  <strong>合成字节设备 · 无硬件 / 无在线 AI</strong>
+  <label>测试分支 <select id="fixture-case"><option value="two-rounds">精准 ACK 两轮</option><option value="early-ack">ACK 先于写入完成</option><option value="stale-ack">旧 ID ACK</option><option value="failed-write">ACK 后写入失败</option><option value="stop-observation">观察期间停止</option><option value="stop-write">写入未完成时软件停止</option></select></label>
+  <button id="prepare-case">准备分支并重载</button><button id="capture-proof">记录实际 App 证据</button>
+  <details><summary>机器证据</summary><output id="fixture-proof" aria-label="反馈夹具机器证据"></output></details>
+</section><script type="module" src="./app-feedback-harness.ts"></script></body></html>
