@@ -3,7 +3,7 @@ import { calculateModelCandidate, createCandidateRecord, evaluateResponse, forma
 import { buildFeedbackRequest, parsePlantModelDraft, proposeFeedbackCandidate, validateFeedbackObservation } from '../src/services/tuningAgent.ts';
 import { cascadeStageConfigurationSignature } from '../src/core/tuning/cascadeDependencies.ts';
 import type { TelemetryEvidence } from '../src/core/tuning/feedbackEvidence.ts';
-import { loadTuningSession, loadTuningStageSession, loadTuningGroupSessions, saveTuningSession } from '../src/core/tuning/sessionStore.ts';
+import { loadTuningSession, loadTuningStageSession, loadTuningGroupSessions, saveTuningSession, updateTuningTrialReceipt } from '../src/core/tuning/sessionStore.ts';
 import type { TuningPlan } from '../src/core/tuning/types.ts';
 import type { TuningSession } from '../src/core/tuning/types.ts';
 import { isAcknowledgementForWrite, isFreshChannelValue, isWriteResultForTrial } from '../src/core/tuning/write-correlation.ts';
@@ -368,6 +368,47 @@ try {
   groupDrafts[0].plan.baseline.params!.kp = 999;
   assert.notEqual(loadTuningGroupSessions('cascade-A')[0].plan.baseline.params?.kp, 999, 'readers receive independent configuration snapshots');
   assert.equal(loadTuningGroupSessions('cascade-B').length, 0);
+  const retiredTrial = { ...createCandidateRecord({ kp: 2.2, ki: .55, kd: 0 }, plan, plan.baseline.params!, '原轮次'),
+    status: 'failed' as const, writeStartedAt: 1000, writeRequestId: 'retired-request', writeSessionId: 'original-device', writeEpoch: 3 };
+  const newerTrial = createCandidateRecord({ kp: 2.1, ki: .52, kd: 0 }, plan, plan.baseline.params!, '新的独立候选');
+  const latestDraft: TuningSession = { ...firstSession, id: 'receipt-stage', status: 'paused', trials: [newerTrial, retiredTrial],
+    plan: { ...plan, prompt: '最新编辑约束', baseline: { ...plan.baseline, confirmed: false, stableBaseConfirmed: false } },
+    formDraft: { modelSource: 'transfer', numerator: '2', denominator: '1,2', delay: '0', parameters: { kp: '2', ki: '.5', kd: '0' } } };
+  assert.equal(saveTuningSession(latestDraft), true);
+  assert.equal(saveTuningSession({ ...secondSession, id: 'current-other-stage' }), true);
+  const priorRaw = JSON.parse(storageValues.get('llm-serial-tuning-sessions-v1')!);
+  const receiptPatch = { status: 'failed' as const, confirmation: '停止后 written，未确认', writeRequestId: 'retired-request',
+    writeSessionId: 'original-device', writeEpoch: 3, writeCompletedAt: 2000,
+    writeRxDispatch: { source: 'serial-read' as const, session_id: 'original-device', epoch: 3, rx_sequence: 12 } };
+  assert.equal(updateTuningTrialReceipt('receipt-stage', retiredTrial.id, receiptPatch), true);
+  const mergedRaw = JSON.parse(storageValues.get('llm-serial-tuning-sessions-v1')!);
+  const merged: TuningSession = mergedRaw.find((value: TuningSession) => value.id === 'receipt-stage');
+  assert.equal(merged.plan.prompt, latestDraft.plan.prompt, 'late receipt preserves latest edited plan');
+  assert.deepEqual(merged.formDraft, latestDraft.formDraft, 'late receipt preserves latest editable form');
+  assert.deepEqual(merged.trials[0], newerTrial, 'late receipt preserves new independent trials');
+  assert.equal(merged.trials[1].writeCompletedAt, 2000, 'original trial gets its driver completion fact');
+  assert.equal(merged.plan.baseline.confirmed, false, 'receipt never restores device authority');
+  assert.deepEqual(mergedRaw[0], priorRaw[0], 'other active stage and list order remain unchanged');
+  const rawAfterReceipt = storageValues.get('llm-serial-tuning-sessions-v1');
+  for (const invalid of [
+    { ...receiptPatch, writeRequestId: {} }, { ...receiptPatch, writeRequestId: ' ' }, { ...receiptPatch, writeSessionId: 'x'.repeat(161) },
+    { ...receiptPatch, writeRequestId: 'different-request' }, { ...receiptPatch, writeSessionId: 'different-device' },
+    { ...receiptPatch, writeEpoch: 4 }, { ...receiptPatch, status: 'confirmed' }, { ...receiptPatch, baseline: { confirmed: true } },
+    { ...receiptPatch, writeRxDispatch: { ...receiptPatch.writeRxDispatch, source: 'synthetic' } },
+    { ...receiptPatch, writeRxDispatch: { ...receiptPatch.writeRxDispatch, rx_sequence: -1 } },
+    { ...receiptPatch, writeRxDispatch: { ...receiptPatch.writeRxDispatch, rx_sequence: 1.5 } },
+    { ...receiptPatch, writeRxDispatch: { ...receiptPatch.writeRxDispatch, extra: true } },
+  ]) {
+    assert.equal(updateTuningTrialReceipt('receipt-stage', retiredTrial.id, invalid as any), false);
+    assert.equal(storageValues.get('llm-serial-tuning-sessions-v1'), rawAfterReceipt, 'rejected receipt cannot modify storage');
+  }
+  const evaluated = { ...merged, status: 'completed' as const, bestVerified: { ...retiredTrial.candidate },
+    trials: [{ ...merged.trials[1], status: 'evaluated' as const }, merged.trials[0]] };
+  assert.equal(saveTuningSession(evaluated), true);
+  const completedRaw = storageValues.get('llm-serial-tuning-sessions-v1');
+  assert.equal(updateTuningTrialReceipt('receipt-stage', retiredTrial.id, { ...receiptPatch, writeCompletedAt: 3000 }), true);
+  assert.equal(storageValues.get('llm-serial-tuning-sessions-v1'), completedRaw, 'duplicate written preserves evaluated state and bestVerified exactly');
+  console.log('迟到回执按最新trial合并：配置/表单/新trial/其他stage保留，12项非法身份拒绝，evaluated重复written幂等通过。');
   storageValues.set('llm-serial-tuning-sessions-v1', JSON.stringify(firstSession));
   assert.equal(loadTuningSession()?.id, 'first-session', 'legacy single-session drafts remain readable');
   storageValues.set('llm-serial-tuning-sessions-v1', JSON.stringify({ ...firstSession, plan: { ...plan, channels: null } }));

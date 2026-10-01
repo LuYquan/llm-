@@ -99,6 +99,86 @@ for (const invalid of [result({ requested_bytes: 2 }), result({ written_bytes: 2
   assert.equal(tracker.snapshot().ready, false);
 }
 
+{
+  const tracker = connected();
+  tracker.acceptReceipt(tracker.begin(3), receipt());
+  const controllerA = new AbortController();
+  const beforeCancel = tracker.snapshot();
+  const oldWait = tracker.wait(1000, controllerA.signal);
+  const newWait = tracker.wait(1000);
+  controllerA.abort();
+  const canceled = await oldWait;
+  assert.equal(canceled.ready, false);
+  assert.match(canceled.reason!, /取消等待/);
+  assert.deepEqual(tracker.snapshot(), beforeCancel, 'canceling A changes no write identity, pending count, generation or error');
+  tracker.acceptResult(result());
+  assert.deepEqual(await newWait, { ready: true }, 'another waiter still observes the real final driver event');
+}
+{
+  const tracker = connected();
+  const attemptA = tracker.begin(3);
+  const controllerA = new AbortController();
+  const oldWait = tracker.wait(1000, controllerA.signal);
+  controllerA.abort();
+  const attemptB = tracker.begin(3);
+  const beforeOldContinuation = tracker.snapshot();
+  assert.equal((await oldWait).ready, false);
+  assert.deepEqual(tracker.snapshot(), beforeOldContinuation, 'old canceled wait cannot clear inflight calls started before or after cancellation');
+  tracker.acceptReceipt(attemptA, { ...receipt('tx-A'), status: 'written' });
+  tracker.acceptReceipt(attemptB, receipt('tx-B'));
+  assert.equal(tracker.snapshot().pendingCount, 1);
+  assert.equal(tracker.snapshot().error, null);
+  const waitB = tracker.wait(1000);
+  tracker.acceptResult(result({ request_id: 'tx-B' }));
+  assert.deepEqual(await waitB, { ready: true });
+}
+{
+  const tracker = connected();
+  tracker.acceptReceipt(tracker.begin(3), receipt());
+  const controller = new AbortController(); controller.abort();
+  const before = tracker.snapshot();
+  assert.equal((await tracker.wait(0, controller.signal)).ready, false, 'preabort wins over a zero timeout');
+  assert.deepEqual(tracker.snapshot(), before, 'preabort cannot latch timeout uncertainty');
+  tracker.acceptResult(result());
+  assert.equal((await tracker.wait(0, controller.signal)).ready, false, 'canceled scope cannot claim success even if the writer is now drained');
+  assert.deepEqual(await tracker.wait(0), { ready: true });
+}
+{
+  // Use a controlled clock, not wall-clock sleep: after A cancels, advance past
+  // A's deadline while B has a new pending request in the same generation.
+  const realNow = Date.now;
+  let now = realNow();
+  try {
+    Date.now = () => now;
+    const tracker = connected();
+    tracker.acceptReceipt(tracker.begin(3), receipt('tx-A'));
+    const controllerA = new AbortController();
+    const oldWait = tracker.wait(10, controllerA.signal);
+    controllerA.abort();
+    tracker.acceptResult(result({ request_id: 'tx-A' }));
+    tracker.acceptReceipt(tracker.begin(3), receipt('tx-B'));
+    now += 20;
+    assert.equal((await oldWait).ready, false);
+    assert.equal(tracker.snapshot().pendingCount, 1);
+    assert.equal(tracker.snapshot().error, null, 'canceled old deadline cannot latch a global error on the fresh experiment');
+    const waitB = tracker.wait(1000);
+    tracker.acceptResult(result({ request_id: 'tx-B' }));
+    assert.deepEqual(await waitB, { ready: true });
+  } finally { Date.now = realNow; }
+}
+{
+  const tracker = connected();
+  tracker.acceptReceipt(tracker.begin(3), receipt());
+  const controller = new AbortController();
+  const waiting = tracker.wait(1000, controller.signal);
+  tracker.observeIdentity('fixture-session', 3);
+  const beforeAbort = tracker.snapshot();
+  controller.abort();
+  assert.equal((await waiting).ready, false);
+  assert.deepEqual(tracker.snapshot(), beforeAbort, 'abort preserves the actual uncertainty introduced by an epoch change');
+  assert.ok(tracker.snapshot().error);
+}
+
 // Real session integration, using a driver double through the existing factory.
 // This is a deterministic transport test, not native or hardware acceptance.
 await resetSession();
@@ -135,6 +215,19 @@ try {
   const waiting = session.waitForWriteQuiescence(1000);
   emitResult(result({ request_id: queued.request_id, session_id: queued.session_id!, epoch: queued.epoch! }));
   assert.equal((await waiting).ready, true);
+  assert.equal(session.pendingWriteCount.value, 0);
+
+  const cancelQueued = await session.write(new Uint8Array([1, 2, 3]));
+  const cancelController = new AbortController();
+  const canceledSessionWait = session.waitForWriteQuiescence(1000, cancelController.signal);
+  cancelController.abort();
+  const freshSessionWait = session.waitForWriteQuiescence(1000);
+  assert.equal((await canceledSessionWait).ready, false, 'the real session forwards the caller cancellation signal');
+  assert.equal(session.pendingWriteCount.value, 1, 'canceling a session waiter does not cancel its queued driver command');
+  assert.equal(session.writeQuiescenceError.value, null, 'caller cancellation does not latch global transport error');
+  assert.equal(session.writesReady.value, false);
+  emitResult(result({ request_id: cancelQueued.request_id, session_id: cancelQueued.session_id!, epoch: cancelQueued.epoch! }));
+  assert.equal((await freshSessionWait).ready, true, 'the fresh session waiter is fulfilled by the real final receipt');
   assert.equal(session.pendingWriteCount.value, 0);
 
   writeImpl = async () => {
@@ -264,4 +357,4 @@ try {
   TransportFactory.create = priorFactory;
 }
 
-console.log('✓ write quiescence: real session queued/inflight tracking, receipt ordering, full identities, timeouts, failures, and scope changes');
+console.log('✓ write quiescence: real session queued/inflight tracking, waiter-only cancellation, receipt ordering, full identities, timeouts, failures, and scope changes');

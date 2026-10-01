@@ -35,6 +35,15 @@ const server = await createServer({
           if (typeof body.model !== 'string' || !body.model.startsWith('fixture-')) throw new Error('synthetic model required');
           const user = body.messages?.find(message => message.role === 'user')?.content;
           const state = JSON.parse(user);
+          if (body.model.startsWith('fixture-model-stop-reenter-')) {
+            const history = histories.get(body.model) ?? [];
+            history.push(state); histories.set(body.model, history);
+            if (typeof state.description !== 'string') throw new Error('Synthetic model description required');
+            sendJson(response, 200, { choices: [{ message: { content: JSON.stringify({ canModel: true,
+              title: `合成模型草稿 ${history.length}`, numerator: ['1'], denominator: ['1', '1'], tau: '0', physicalFields: [],
+              assumptions: ['合成本地响应，只验证取消与操作身份。'], explanation: '合成输入输出关系，未验证设备。' }) } }] });
+            return;
+          }
           const evidence = state.evidence;
           if (!evidence?.params || !evidence.measured || !evidence.telemetryWindow?.sessionId?.startsWith('fixture-')) {
             throw new Error('current synthetic telemetry evidence required');

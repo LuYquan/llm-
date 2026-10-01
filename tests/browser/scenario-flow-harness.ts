@@ -74,10 +74,10 @@ async function prepare() {
   ingest(0, 0, 1);
   const config: AiConfig = { provider: 'openai', api_key: 'synthetic-flow-fixture-key', api_url: `${location.origin}/fixture-ai/v1`, model };
   const props = reactive({ connected: !offline, demo: false, connectionLabel: '合成设备 · 非硬件验收', aiConfig: config, logs: [], writeResult: null, stopToken: 0,
-    writeAccessReady: true, executionEnabled: !offline, protocolConfig: { type: 'firewater' as const }, ordinaryWritesReady: true, ordinaryWriteRevision: 0 });
+    writeAccessReady: true, writeAccessExecutionId: null as string | null, executionEnabled: !offline, protocolConfig: { type: 'firewater' as const }, ordinaryWritesReady: true, ordinaryWriteRevision: 0 });
   app = createApp({ render: () => h(TuningWorkbench, { ...props,
     onSendCommand: () => { writes++; record('unexpected-write'); throw new Error('Step fixture never authorizes device writes.'); },
-    onExecutionState: (working: boolean) => record('execution-state', { working }),
+    onExecutionState: (state: { executionId: string; working: boolean }) => { record('execution-state', state); if (state.working) { props.writeAccessExecutionId = state.executionId; props.writeAccessReady = true; } else if (props.writeAccessExecutionId === state.executionId) { props.writeAccessReady = false; props.writeAccessExecutionId = null; } },
     onSafetyStop: (reason: string) => { record('safety-stop', reason); props.executionEnabled = false; props.ordinaryWritesReady = false; props.stopToken++; },
   }) });
   app.mount(host);

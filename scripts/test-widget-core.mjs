@@ -12,6 +12,9 @@ import '../tests/tuning-alignment.test.ts';
 import '../tests/tuning-command-contract.test.ts';
 import '../tests/tuning-protocol-capabilities.test.ts';
 import '../tests/tuning-write-correlation.test.ts';
+import '../tests/tuning-execution-lease.test.ts';
+import '../tests/tuning-agent-config.test.ts';
+import '../tests/synthetic-telemetry-clock.test.ts';
 import {
   parseEscapeSequences,
   encodeNumberToHex,

@@ -24,7 +24,10 @@ export class SendGate {
   private queue: PendingTask[] = [];
   private isProcessing: boolean = false;
   private lastSentTime: number = 0;
-  private experimentLocked = false;
+  private experimentLock: { ownerId: string } | null = null;
+  private readonly experimentWaiters = new Set<() => void>();
+
+  private get experimentLocked(): boolean { return this.experimentLock !== null; }
 
   constructor(minIntervalMs: number = 20) {
     this.minIntervalMs = minIntervalMs;
@@ -59,17 +62,51 @@ export class SendGate {
     return this.isPortConnected;
   }
 
-  public async acquireExperimentLock(): Promise<void> {
-    this.experimentLocked = true;
+  public async acquireExperimentLock(ownerId: string, signal?: AbortSignal, timeoutMs = 5000): Promise<boolean> {
+    // One acquisition owns the lock before any await. Duplicate acquisitions
+    // are rejected so canceling one waiter cannot revoke another caller's lock.
+    if (!ownerId.trim() || signal?.aborted || this.experimentLock) return false;
+    const lock = { ownerId };
+    this.experimentLock = lock;
     while (this.queue.length > 0) {
       const task = this.queue.shift();
       task?.resolve({ ok: false, reason: 'disabled', message: '自动调参开始前，待发送的普通控件命令已取消。' });
     }
-    while (this.isProcessing) await new Promise((resolve) => setTimeout(resolve, 10));
+    const timeout = Math.min(30_000, Math.max(0, Number.isFinite(timeoutMs) ? timeoutMs : 5000));
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (acquired: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clearTimeout(timer);
+        signal?.removeEventListener('abort', aborted);
+        this.experimentWaiters.delete(check);
+        // Object identity also protects a newer acquisition which reused an ID.
+        if (!acquired && this.experimentLock === lock) this.experimentLock = null;
+        resolve(acquired);
+      };
+      const aborted = () => finish(false);
+      const check = () => {
+        if (signal?.aborted || this.experimentLock !== lock) finish(false);
+        else if (!this.isProcessing) finish(true);
+      };
+      this.experimentWaiters.add(check);
+      signal?.addEventListener('abort', aborted, { once: true });
+      check();
+      if (!settled) timer = setTimeout(() => finish(false), timeout);
+    });
   }
 
-  public releaseExperimentLock(): void {
-    this.experimentLocked = false;
+  public releaseExperimentLock(ownerId: string): boolean {
+    if (this.experimentLock?.ownerId !== ownerId) return false;
+    this.experimentLock = null;
+    this.notifyExperimentWaiters();
+    return true;
+  }
+
+  private notifyExperimentWaiters(): void {
+    for (const waiter of [...this.experimentWaiters]) waiter();
   }
 
   /**
@@ -224,6 +261,7 @@ export class SendGate {
       }
     } finally {
       this.isProcessing = false;
+      this.notifyExperimentWaiters();
     }
   }
 }

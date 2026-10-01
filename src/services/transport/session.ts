@@ -321,9 +321,9 @@ export function useSerialSession() {
     }
   }
 
-  async function waitForWriteQuiescence(timeoutMs = 5000): Promise<WriteQuiescenceResult> {
+  async function waitForWriteQuiescence(timeoutMs = 5000, signal?: AbortSignal): Promise<WriteQuiescenceResult> {
     if (softwareStopLocked.value) return { ready: false, reason: '软件停止已锁定发送，请先核对设备并显式恢复。' };
-    return writeTracker.wait(timeoutMs);
+    return writeTracker.wait(timeoutMs, signal);
   }
 
   async function write(data: Uint8Array | string): Promise<WriteReceipt> {

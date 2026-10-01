@@ -1,10 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import type { AiConfig } from '../services/ai';
 import { aiServiceNeedsKey } from '../services/ai';
 import { proposeFeedbackCandidate, proposePlantModelDraft } from '../services/tuningAgent';
 import { calculateModelCandidate, createCandidateRecord, evaluateResponse, fingerprint, formatTuningParameter, importCapabilityPlan, isActiveParameter, isTrialForPlan, matchesParameterReadback, packagePlan, trialBudgetUsed, tuningPlanSignature, validateCandidate, validateCandidateInputs, validateCapabilityPackage, validatePlan } from '../core/tuning/engine';
-import { loadTuningSession, loadTuningStageSession, loadTuningGroupSessions, saveTuningSession } from '../core/tuning/sessionStore';
+import { loadTuningSession, loadTuningStageSession, loadTuningGroupSessions, saveTuningSession, updateTuningTrialReceipt } from '../core/tuning/sessionStore';
 import { buildCascadeDependencySnapshot, checkCascadeDependencySnapshot, checkCascadeDeviceDependencies, cascadeStageConfigurationSignature } from '../core/tuning/cascadeDependencies';
 import type { CascadeRuntimeEvidence } from '../core/tuning/cascadeDependencies';
 import { selectFeedbackEvidence } from '../core/tuning/feedbackEvidence';
@@ -20,23 +20,24 @@ import { useWidgetStore } from '../stores/widgetStore';
 import { globalProjectModel } from '../core/project/ProjectModel';
 import { isAcknowledgementForWrite, isFreshChannelValue, isWriteResultForTrial } from '../core/tuning/write-correlation';
 import { confirmedTrialContextFailure, executionSafetyStopReason, manualCandidateEligibility } from '../core/tuning/flow';
-import { materializeTuningCommand, validateTuningCommandPayload, type TuningCommandPayload } from '../core/tuning/commandContract';
+import { materializeTuningCommand, validateTuningCommandPayload } from '../core/tuning/commandContract';
 import { validateTuningProtocolCapabilities } from '../core/tuning/protocolCapabilities';
 import type { ProtocolConfig } from '../core/protocol/types';
-import type { RxDispatch, RxOrigin } from '../types/ipc';
+import type { RxOrigin } from '../types/ipc';
+import type { TuningExecutionState, TuningSendRequest, TuningWriteResult } from '../core/tuning/execution-lease';
 
 type LogLine = { id: number; time: string; at?: number; tag: string; level: string; text: string; rx_origin?: RxOrigin };
-type WriteResult = { id: string; requestId?: string; sessionId?: string; epoch?: number; rxDispatch?: RxDispatch; status: 'queued' | 'written' | 'failed'; at: number; error?: string } | null;
-
 const props = defineProps<{
   connected: boolean;
   demo?: boolean;
   connectionLabel: string;
   aiConfig: AiConfig;
   logs: LogLine[];
-  writeResult: WriteResult;
+  writeResult: TuningWriteResult | null;
+  lateWriteResult?: TuningWriteResult | null;
   stopToken: number;
   writeAccessReady: boolean;
+  writeAccessExecutionId?: string | null;
   executionEnabled?: boolean;
   protocolConfig: ProtocolConfig;
   ordinaryWriteRevision: number;
@@ -44,8 +45,8 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
-  (event: 'send-command', request: { trialId: string; command: string; payload: TuningCommandPayload }): void;
-  (event: 'execution-state', working: boolean): void;
+  (event: 'send-command', request: TuningSendRequest): void;
+  (event: 'execution-state', state: TuningExecutionState): void;
   (event: 'leave', workspace: 'canvas' | 'tuning'): void;
   (event: 'open-ai-settings'): void;
   (event: 'open-protocol-settings'): void;
@@ -63,12 +64,15 @@ watch(assistantPane, async () => {
 const approvalDialog = ref<HTMLDialogElement | null>(null);
 const approvalText = ref('');
 let approvalResolve: ((approved: boolean) => void) | null = null;
+let approvalOwner: OperationOwner | null = null;
 
-async function requestApproval(text: string): Promise<boolean> {
-  if (approvalResolve) return false;
+async function requestApproval(text: string, owner: OperationOwner): Promise<boolean> {
+  if (approvalResolve || !ownsOperation(owner)) return false;
+  approvalOwner = owner;
   approvalText.value = text;
   const answer = new Promise<boolean>((resolve) => { approvalResolve = resolve; });
   await nextTick();
+  if (!ownsOperation(owner) || approvalOwner !== owner || !approvalResolve) return false;
   approvalDialog.value?.showModal();
   return answer;
 }
@@ -77,6 +81,7 @@ function finishApproval(approved: boolean) {
   approvalDialog.value?.close();
   const resolve = approvalResolve;
   approvalResolve = null;
+  approvalOwner = null;
   approvalText.value = '';
   resolve?.(approved);
 }
@@ -94,6 +99,7 @@ const channelIds = ref<string[]>(globalChannelStore.listChannels());
 const channelValues = ref<Record<string, { value: number; receivedAt: number; generation: number; revision: number }>>({});
 const clockNow = ref(Date.now());
 const isWorking = ref(false);
+const operationBusy = ref(false);
 const stopRequested = ref(false);
 const authorizedPlanSignature = ref<string | null>(null);
 const aiBusy = ref(false);
@@ -112,6 +118,70 @@ const channelListUnsubscribe = ref<(() => void) | null>(null);
 let sessionPersistTimer: number | null = null;
 let freshnessTimer: number | null = null;
 let observedChannelGeneration = globalChannelStore.getGeneration();
+
+type OperationKind = 'candidate' | 'model' | 'execution' | 'import';
+interface OperationOwner {
+  id: string;
+  kind: OperationKind;
+  sessionId: string;
+  planId: string;
+  controller: AbortController;
+  executionStarted: boolean;
+}
+let currentOperation: OperationOwner | null = null;
+let disposed = false;
+const dispatchedTrials = new Map<string, { trial: TuningTrial; owner: OperationOwner; session: TuningSession }>();
+
+function ownsOperation(owner: OperationOwner): boolean {
+  return !disposed && currentOperation === owner && !owner.controller.signal.aborted
+    && owner.sessionId === session.value.id && owner.planId === plan.value.id;
+}
+
+function beginOperation(kind: OperationKind): OperationOwner | null {
+  if (disposed || currentOperation || operationBusy.value || isWorking.value || aiBusy.value || modelBusy.value) return null;
+  const owner: OperationOwner = { id: id(), kind, sessionId: session.value.id, planId: plan.value.id,
+    controller: new AbortController(), executionStarted: false };
+  currentOperation = owner;
+  operationBusy.value = true;
+  return owner;
+}
+
+function startExecution(owner: OperationOwner): boolean {
+  if (!ownsOperation(owner) || owner.kind !== 'execution') return false;
+  owner.executionStarted = true;
+  stopRequested.value = false;
+  isWorking.value = true;
+  emit('execution-state', { executionId: owner.id, working: true });
+  return true;
+}
+
+function hasWriteAccess(owner: OperationOwner): boolean {
+  return ownsOperation(owner) && owner.executionStarted && isWorking.value && props.writeAccessReady
+    && props.writeAccessExecutionId === owner.id;
+}
+
+function endOperation(owner: OperationOwner): void {
+  if (currentOperation !== owner) return;
+  if (approvalOwner === owner) finishApproval(false);
+  if (owner.executionStarted) {
+    isWorking.value = false;
+    authorizedPlanSignature.value = null;
+    awaitingManualConfirmation.value = false;
+    emit('execution-state', { executionId: owner.id, working: false });
+  }
+  aiBusy.value = false;
+  modelBusy.value = false;
+  autoProgress.value = '';
+  operationBusy.value = false;
+  currentOperation = null;
+}
+
+function cancelCurrentOperation(): void {
+  const owner = currentOperation;
+  if (!owner) return;
+  owner.controller.abort();
+  endOperation(owner);
+}
 
 const activeLoop = computed(() => globalProjectModel.getLoop(plan.value.loopId));
 
@@ -445,7 +515,7 @@ function captureBaselineObservation() {
 }
 
 function confirmCurrentBaseline(confirmed: boolean) {
-  if (isWorking.value || aiBusy.value || modelBusy.value || props.ordinaryWritesReady === false) return;
+  if (operationBusy.value || isWorking.value || aiBusy.value || modelBusy.value || props.ordinaryWritesReady === false) return;
   plan.value.baseline.confirmed = confirmed && Boolean(plan.value.baseline.params);
   plan.value.baseline.stableBaseConfirmed = false;
   session.value.lastConfirmed = null;
@@ -482,10 +552,16 @@ watch(physicalModelResult, () => {
   syncPhysicalModel();
 }, { flush: 'post' });
 
-watch(() => props.writeResult, (result) => {
-  if (!result || result.id !== pendingTrialId.value) return;
-  const trial = findTrial(result.id);
+function recordWriteResult(result: TuningWriteResult | null | undefined, historical = false) {
+  if (!result) return;
+  const dispatched = dispatchedTrials.get(result.id);
+  if (!dispatched) return;
+  const { owner } = dispatched;
+  if (result.executionId !== owner.id || historical && ownsOperation(owner)) return;
+  const sameSession = session.value.id === dispatched.session.id;
+  const trial = sameSession ? findTrial(result.id) : dispatched.trial;
   if (!trial) return;
+  if (result.requestId && trial.writeRequestId && result.requestId !== trial.writeRequestId) return;
   // A successful/queued result must carry the transport request id. Without it
   // a late result from an earlier attempt could advance this trial by id alone.
   if (result.status !== 'failed' && !isWriteResultForTrial({
@@ -495,13 +571,31 @@ watch(() => props.writeResult, (result) => {
     epoch: result.epoch,
     status: result.status,
   }, trial.id, trial.writeRequestId)) return;
+  const retired = historical || !ownsOperation(owner) || !hasWriteAccess(owner) || result.id !== pendingTrialId.value || stopRequested.value;
+  if (retired && (trial.writeSessionId && result.sessionId !== trial.writeSessionId
+    || trial.writeEpoch !== undefined && result.epoch !== trial.writeEpoch)) return;
+  // Repeated driver completion is not a new device failure or a new trial.
+  if (result.status === 'written' && trial.writeCompletedAt !== undefined
+    && ['confirmed', 'evaluated'].includes(trial.status)) return;
   if (result.requestId) trial.writeRequestId = result.requestId;
   trial.writeSessionId = result.sessionId;
   trial.writeEpoch = result.epoch;
   trial.writeRxDispatch = result.rxDispatch;
-  if (stopRequested.value) {
+  if (retired) {
     trial.status = 'failed';
     trial.confirmation = `停止后收到驱动回执：${result.status}；设备状态需重新核对。`;
+    if (result.status === 'written') trial.writeCompletedAt = result.at;
+    if (sameSession) {
+      // The stage may have been restored into a new object and edited since
+      // dispatch. Save the live draft, never its captured predecessor.
+      archiveCurrentStage();
+    } else {
+      updateTuningTrialReceipt(dispatched.session.id, trial.id, {
+        status: trial.status, confirmation: trial.confirmation, writeRequestId: trial.writeRequestId,
+        writeSessionId: trial.writeSessionId, writeEpoch: trial.writeEpoch, writeRxDispatch: trial.writeRxDispatch,
+        ...(result.status === 'written' ? { writeCompletedAt: result.at } : {}),
+      });
+    }
     return;
   }
   if (result.status === 'failed') {
@@ -532,7 +626,9 @@ watch(() => props.writeResult, (result) => {
   session.value.status = 'awaiting-confirmation';
   trial.confirmation = '串口写入已完成；等待设备回传或应答。';
   session.value.updatedAt = Date.now();
-}, { deep: true });
+}
+watch(() => props.writeResult, (result) => recordWriteResult(result), { deep: true });
+watch(() => props.lateWriteResult, (result) => recordWriteResult(result, true), { deep: true });
 
 watch(() => props.stopToken, (token, previous) => {
   if (token === previous) return;
@@ -541,10 +637,8 @@ watch(() => props.stopToken, (token, previous) => {
   plan.value.baseline.confirmed = false;
   plan.value.baseline.stableBaseConfirmed = false;
   requireCurrentStageRevalidation();
-  if (isWorking.value) requestStop('设备紧急操作已触发，调参循环暂停。');
+  if (currentOperation) requestStop('设备紧急操作已触发，当前操作取消。');
 });
-
-watch(isWorking, (working) => emit('execution-state', working), { flush: 'sync' });
 
 watch(() => props.connected, (connected) => {
   invalidateDeviceContext();
@@ -565,11 +659,14 @@ watch(() => props.ordinaryWriteRevision, (revision, previous) => {
   requireCurrentStageRevalidation();
   rejectPendingStageProposals('普通设备命令已提交，需重新核对当前参数和观察窗口。');
   if (isWorking.value) requestSafetyStop('实验范围之外有设备写入请求，当前基线与授权已失效。');
-  else setNotice('warning', '设备参数需重新核对', '普通命令可能改变设备状态。等待驱动队列完成，再确认当前参数并重新观察遥测。');
+  else {
+    cancelCurrentOperation();
+    setNotice('warning', '设备参数需重新核对', '普通命令可能改变设备状态。等待驱动队列完成，再确认当前参数并重新观察遥测。');
+  }
 }, { flush: 'sync' });
 
 watch(() => props.executionEnabled, (enabled) => {
-  if (enabled !== true && (isWorking.value || ['awaiting-confirmation', 'collecting'].includes(session.value.status))) requestStop('采集、设备保护或会话执行条件已变化；调参流程暂停。');
+  if (enabled !== true && (currentOperation?.executionStarted || ['awaiting-confirmation', 'collecting'].includes(session.value.status))) requestStop('采集、设备保护或会话执行条件已变化；调参流程暂停。');
 });
 
 watch(() => [plan.value.channels, plan.value.confirmation.mode, plan.value.confirmation.acknowledgementText], () => refreshSubscription(), { deep: true });
@@ -601,6 +698,11 @@ onUnmounted(() => {
   if (freshnessTimer) window.clearInterval(freshnessTimer);
 });
 
+onBeforeUnmount(() => {
+  if (currentOperation) requestStop('调参面板已关闭；未完成操作取消，已派发命令仍需核对设备。');
+  disposed = true;
+});
+
 function refreshSubscription() {
   channelUnsubscribe.value?.();
   const p = plan.value;
@@ -626,7 +728,7 @@ function setNotice(type: NonNullable<typeof notice.value>['type'], title: string
 }
 
 function selectScenario(scenarioId: TuningScenarioId) {
-  if (isWorking.value || aiBusy.value || modelBusy.value) return;
+  if (operationBusy.value || operationBusy.value || isWorking.value || aiBusy.value || modelBusy.value) return;
   if (plan.value.suite?.id === scenarioId) return;
   deviceSettingsOpen.value = false;
   const suite = getScenarioSuite(scenarioId);
@@ -659,7 +761,7 @@ function selectScenario(scenarioId: TuningScenarioId) {
 }
 
 function selectTopology(topologyId: string) {
-  if (!plan.value.suite || !selectedSuite.value || isWorking.value || aiBusy.value || modelBusy.value || plan.value.suite.topologyId === topologyId) return;
+  if (!plan.value.suite || !selectedSuite.value || operationBusy.value || isWorking.value || aiBusy.value || modelBusy.value || plan.value.suite.topologyId === topologyId) return;
   const topology = selectedSuite.value.topologies.find((item) => item.id === topologyId);
   if (!topology) return;
   archiveCurrentStage();
@@ -670,7 +772,7 @@ function selectTopology(topologyId: string) {
 }
 
 function selectStage(stageId: string) {
-  if (!plan.value.suite || isWorking.value) return;
+  if (!plan.value.suite || operationBusy.value) return;
   const stage = sceneStages.value.find((item) => item.id === stageId);
   if (!stage) return;
   if (stageId === plan.value.suite.stageId) return;
@@ -704,7 +806,7 @@ function activateStage(context: TuningScenarioContext) {
 }
 
 function setRoute(route: 'feedback' | 'model') {
-  if (route === plan.value.route || isWorking.value || aiBusy.value || modelBusy.value) return;
+  if (route === plan.value.route || operationBusy.value || isWorking.value || aiBusy.value || modelBusy.value) return;
   if (plan.value.route === 'feedback') feedbackModes.set(plan.value.id, plan.value.mode);
   plan.value.route = route;
   plan.value.mode = route === 'feedback' && plan.value.confirmation.mode !== 'manual' ? feedbackModes.get(plan.value.id) ?? 'manual' : 'manual';
@@ -712,7 +814,7 @@ function setRoute(route: 'feedback' | 'model') {
 }
 
 function setModelSource(source: 'physical' | 'transfer' | 'ai') {
-  if (source === modelSource.value || isWorking.value || aiBusy.value || modelBusy.value) return;
+  if (source === modelSource.value || operationBusy.value || isWorking.value || aiBusy.value || modelBusy.value) return;
   modelSource.value = source;
   plan.value.model = null;
   if (plan.value.suite) { plan.value.suite.modelConfirmed = false; plan.value.suite.assumptions = []; }
@@ -767,21 +869,25 @@ function updateDraftModel() {
 }
 
 async function deriveWithAi() {
+  if (operationBusy.value) return;
   if (!plan.value.suite || !plan.value.description.trim()) {
     setNotice('warning', '先说明对象与工况', '描述执行器、传感器、输入输出和所控制的运动或过程；AI 将据此提出可核对的模型草稿。');
     return;
   }
-  const scope = tuningPlanSignature(plan.value);
-  const upstreamScope = JSON.stringify(availableDependencies.value);
-  const serviceScope = aiServiceSignature();
-  if (!await requestApproval(`将对象描述、当前场景和补充提示词发送给 AI 服务，用于生成模型草稿及物理输入表。\n\n服务：${props.aiConfig.api_url}\n模型：${props.aiConfig.model}\n\n请核对接收方与待发送描述。`)) return;
-  if (scope !== tuningPlanSignature(plan.value) || upstreamScope !== JSON.stringify(availableDependencies.value) || serviceScope !== aiServiceSignature()) {
-    setNotice('warning', '模型请求范围已变化', '配置或 AI 接收方在确认期间已变化，请重新核对后请求。');
-    return;
-  }
-  modelBusy.value = true;
+  const owner = beginOperation('model');
+  if (!owner) return;
   try {
-    const draft = await proposePlantModelDraft({ config: props.aiConfig, description: plan.value.description, prompt: plan.value.prompt, suite: plan.value.suite });
+    const scope = tuningPlanSignature(plan.value);
+    const upstreamScope = JSON.stringify(availableDependencies.value);
+    const serviceScope = aiServiceSignature();
+    if (!await requestApproval(`将对象描述、当前场景和补充提示词发送给 AI 服务，用于生成模型草稿及物理输入表。\n\n服务：${props.aiConfig.api_url}\n模型：${props.aiConfig.model}\n\n请核对接收方与待发送描述。`, owner) || !ownsOperation(owner)) return;
+    if (scope !== tuningPlanSignature(plan.value) || upstreamScope !== JSON.stringify(availableDependencies.value) || serviceScope !== aiServiceSignature()) {
+      setNotice('warning', '模型请求范围已变化', '配置或 AI 接收方在确认期间已变化，请重新核对后请求。');
+      return;
+    }
+    modelBusy.value = true;
+    const draft = await proposePlantModelDraft({ config: props.aiConfig, description: plan.value.description, prompt: plan.value.prompt, suite: plan.value.suite, signal: owner.controller.signal });
+    if (!ownsOperation(owner)) return;
     if (tuningPlanSignature(plan.value) !== scope || JSON.stringify(availableDependencies.value) !== upstreamScope || serviceScope !== aiServiceSignature()) {
       setNotice('warning', '模型草稿已失效', '对象或场景配置已变化，请重新请求模型推导。');
       return;
@@ -792,9 +898,10 @@ async function deriveWithAi() {
     updateDraftModel();
     setNotice('info', '请核对模型草稿', '填写模型列出的物理参数，并核对方程、单位和假设；确认前不会计算 PID 候选。');
   } catch (error) {
+    if (!ownsOperation(owner)) return;
     setNotice('error', '模型推导没有完成', error instanceof Error ? error.message : String(error));
   } finally {
-    modelBusy.value = false;
+    endOperation(owner);
   }
 }
 
@@ -848,7 +955,7 @@ function syncManualParams(changedKey?: PidParameter, rawValue?: string) {
 }
 
 function handleStructureChange(structure: LoopStructure) {
-  if (structure === plan.value.structure || isWorking.value || aiBusy.value || modelBusy.value) return;
+  if (structure === plan.value.structure || operationBusy.value || isWorking.value || aiBusy.value || modelBusy.value) return;
   plan.value.structure = structure;
   if (plan.value.suite?.id === 'custom') {
     const stage = customStages.value.find((item) => item.id === plan.value.suite?.stageId);
@@ -906,7 +1013,7 @@ function currentReadback(trial?: TuningTrial): Partial<Record<PidParameter, numb
 }
 
 function toggleConfirmationMode(mode: WriteConfirmationMode) {
-  if (mode === plan.value.confirmation.mode || isWorking.value || aiBusy.value || modelBusy.value) return;
+  if (mode === plan.value.confirmation.mode || operationBusy.value || isWorking.value || aiBusy.value || modelBusy.value) return;
   if (mode === 'acknowledgement' && props.protocolConfig.type !== 'firewater') {
     setNotice('warning', '当前协议不接收文本 ACK', 'JustFloat、RawData 和 CustomFrame 请使用参数变量回传，或逐轮人工核对。文本应答需先切换到 FireWater。');
     return;
@@ -950,7 +1057,8 @@ function aiServiceSignature(): string {
   return JSON.stringify({ provider: props.aiConfig.provider, url: props.aiConfig.api_url, model: props.aiConfig.model });
 }
 
-async function proposeCandidate(aiTransferAlreadyAuthorized = false): Promise<TuningTrial | null> {
+async function proposeCandidate(owner: OperationOwner, aiTransferAlreadyAuthorized = false): Promise<TuningTrial | null> {
+  if (!ownsOperation(owner)) return null;
   if (candidateErrors.value.length || stageErrors.value.length) {
     proposalErrors.value = [...candidateErrors.value, ...stageErrors.value];
     setNotice('warning', '暂时不能生成候选', proposalErrors.value[0]);
@@ -1007,8 +1115,8 @@ async function proposeCandidate(aiTransferAlreadyAuthorized = false): Promise<Tu
     const telemetryEvidence: TelemetryEvidence = { ...selectedEvidence.evidence, sampleCount: measured.metrics.sampleCount };
     const planWithoutSending = JSON.parse(JSON.stringify(plan.value)) as TuningPlan;
     const offeredService = aiServiceSignature();
-    const authorized = aiTransferAlreadyAuthorized || await requestApproval(`AI 将向 ${props.aiConfig.api_url}（模型 ${props.aiConfig.model}）发送以下摘要：项目/控制结构、当前参数、目标、约束、遥测统计及窗口身份。\n\n请确认接收方与发送范围，再请求候选。`);
-    if (!authorized) return null;
+    const authorized = aiTransferAlreadyAuthorized || await requestApproval(`AI 将向 ${props.aiConfig.api_url}（模型 ${props.aiConfig.model}）发送以下摘要：项目/控制结构、当前参数、目标、约束、遥测统计及窗口身份。\n\n请确认接收方与发送范围，再请求候选。`, owner);
+    if (!authorized || !ownsOperation(owner)) return null;
     if (offeredService !== aiServiceSignature() || capturedPlanSignature !== tuningPlanSignature(plan.value) || capturedGeneration !== globalChannelStore.getGeneration()
       || aiTransferAlreadyAuthorized && authorizedPlanSignature.value !== executionPlanSignature()) {
       setNotice('warning', '请求范围已变化', '设备会话或配置已变化，请重新核对基线后请求候选。');
@@ -1016,16 +1124,19 @@ async function proposeCandidate(aiTransferAlreadyAuthorized = false): Promise<Tu
     }
     aiBusy.value = true;
     try {
-      const result = await proposeFeedbackCandidate({ config: props.aiConfig, plan: planWithoutSending, params: before, metrics: measured.metrics, telemetryEvidence });
+      const result = await proposeFeedbackCandidate({ config: props.aiConfig, plan: planWithoutSending, params: before, metrics: measured.metrics, telemetryEvidence, signal: owner.controller.signal });
+      if (!ownsOperation(owner)) return null;
       proposal = result.proposal;
       evidence = result.record;
     } catch (error) {
+      if (!ownsOperation(owner)) return null;
       setNotice('error', '没有生成候选值', error instanceof Error ? error.message : String(error));
       return null;
     } finally {
-      aiBusy.value = false;
+      if (ownsOperation(owner)) aiBusy.value = false;
     }
   }
+  if (!ownsOperation(owner)) return null;
   if (capturedPlanSignature !== tuningPlanSignature(plan.value) || evidence.planSignature !== capturedPlanSignature || capturedGeneration !== globalChannelStore.getGeneration()) {
     setNotice('warning', '候选已失效', '模型、约束或场景配置在请求期间发生变化。请重新生成候选。');
     return null;
@@ -1065,7 +1176,8 @@ async function proposeCandidate(aiTransferAlreadyAuthorized = false): Promise<Tu
   return trial;
 }
 
-async function sendTrial(trial: TuningTrial, auto = false): Promise<boolean> {
+async function sendTrial(trial: TuningTrial, owner: OperationOwner, auto = false): Promise<boolean> {
+  if (!ownsOperation(owner) || !hasWriteAccess(owner)) return false;
   if (props.executionEnabled !== true) {
     setNotice('warning', '调参执行暂不可用', '候选生成和审阅可用；参数写入在驱动写入回执与本轮设备确认完成关联前保持禁用。');
     return false;
@@ -1084,7 +1196,7 @@ async function sendTrial(trial: TuningTrial, auto = false): Promise<boolean> {
     requestStop('实验配置或停止状态已变化；参数命令未下发。');
     return false;
   }
-  if (auto && !props.writeAccessReady) {
+  if (auto && !hasWriteAccess(owner)) {
     setNotice('warning', '等待串口写入权切换', '普通控件命令尚未完成排空，自动试验不会提前发送。');
     return false;
   }
@@ -1100,9 +1212,10 @@ async function sendTrial(trial: TuningTrial, auto = false): Promise<boolean> {
     return false;
   }
   const payload = trial.commandPayload;
-  if (!auto && !await requestApproval(`即将向当前设备发送 UTF-8 参数命令，共 ${payload.byteLength} 字节：\n\n可见文本：${payload.visibleText}\nHEX：${payload.hex}\n\n转义：${payload.format.escapeText ? '启用' : '保留字面字符'}；行尾：${payload.format.lineEnding.toUpperCase()}。请核对最终字节与固件协议。`)) return false;
+  if (!auto && !await requestApproval(`即将向当前设备发送 UTF-8 参数命令，共 ${payload.byteLength} 字节：\n\n可见文本：${payload.visibleText}\nHEX：${payload.hex}\n\n转义：${payload.format.escapeText ? '启用' : '保留字面字符'}；行尾：${payload.format.lineEnding.toUpperCase()}。请核对最终字节与固件协议。`, owner)) return false;
+  if (!ownsOperation(owner)) return false;
   checkExecutionSafety();
-  if (stopRequested.value || !isWorking.value || !props.writeAccessReady || !authorizedPlanSignature.value || executionPlanSignature() !== authorizedPlanSignature.value || !isTrialForPlan(trial, plan.value, globalChannelStore.getGeneration())) return false;
+  if (!hasWriteAccess(owner) || stopRequested.value || !authorizedPlanSignature.value || executionPlanSignature() !== authorizedPlanSignature.value || !isTrialForPlan(trial, plan.value, globalChannelStore.getGeneration())) return false;
   if (planErrors.value.length || !validateTuningCommandPayload(payload, trial.command)) return false;
   session.value.status = 'awaiting-confirmation';
   clearCurrentStageEvidence();
@@ -1120,11 +1233,14 @@ async function sendTrial(trial: TuningTrial, auto = false): Promise<boolean> {
   pendingTrialId.value = trial.id;
   manualConfirmation.value = false;
   session.value.updatedAt = Date.now();
-  emit('send-command', { trialId: trial.id, command: trial.command, payload });
+  dispatchedTrials.set(trial.id, { trial, owner, session: session.value });
+  if (dispatchedTrials.size > 256) dispatchedTrials.delete(dispatchedTrials.keys().next().value!);
+  emit('send-command', { executionId: owner.id, trialId: trial.id, command: trial.command, payload });
   const sent = await waitFor(() => {
     const result = props.writeResult;
     return Boolean(result && result.id === trial.id && (result.status === 'failed' || result.requestId));
-  }, 8000);
+  }, 8000, owner);
+  if (!ownsOperation(owner)) return false;
   if (!sent || !props.writeResult || props.writeResult.status === 'failed') {
     trial.status = 'failed';
     if (stopRequested.value) return false;
@@ -1140,13 +1256,15 @@ async function sendTrial(trial: TuningTrial, auto = false): Promise<boolean> {
   // Vue may deliver the prop watcher on the next scheduler turn when a Web
   // Serial write completes synchronously. Wait for the same watcher to commit
   // the correlated trial metadata before the caller advances the state machine.
-  if (findTrial(trial.id)?.status !== 'sent') await waitFor(() => findTrial(trial.id)?.status === 'sent', 1000, 10);
+  if (findTrial(trial.id)?.status !== 'sent') await waitFor(() => findTrial(trial.id)?.status === 'sent', 1000, owner, 10);
+  if (!ownsOperation(owner)) return false;
   return findTrial(trial.id)?.status === 'sent';
 }
 
 async function confirmManualTrial() {
+  const owner = currentOperation;
   const trial = currentProposal.value;
-  if (!awaitingManualConfirmation.value || !isWorking.value || stopRequested.value || props.executionEnabled !== true || !props.writeAccessReady || !trial || !manualConfirmation.value || trial.status !== 'sent') return;
+  if (!owner || !hasWriteAccess(owner) || !awaitingManualConfirmation.value || stopRequested.value || props.executionEnabled !== true || !trial || !manualConfirmation.value || trial.status !== 'sent') return;
   if (!isTrialForPlan(trial, plan.value, globalChannelStore.getGeneration()) || !authorizedPlanSignature.value || executionPlanSignature() !== authorizedPlanSignature.value || trial.writeChannelGeneration !== globalChannelStore.getGeneration()) {
     requestStop('设备会话或确认配置已变化，原轮次不能继续确认。');
     setNotice('warning', '设备确认配置已变化', '请停止当前轮次并核对设备状态；原候选不再适用于当前配置。');
@@ -1155,12 +1273,11 @@ async function confirmManualTrial() {
   awaitingManualConfirmation.value = false;
   try {
     checkExecutionSafety();
-    if (stopRequested.value) return;
-    acceptWrite(trial, 'manual', '用户根据固件或仪器核对并确认。');
-    if (trialStatus(trial.id) === 'confirmed') await collectAndEvaluate(trial);
+    if (!ownsOperation(owner) || stopRequested.value) return;
+    acceptWrite(trial, 'manual', '用户根据固件或仪器核对并确认。', owner);
+    if (trialStatus(trial.id) === 'confirmed') await collectAndEvaluate(trial, owner);
   } finally {
-    isWorking.value = false;
-    authorizedPlanSignature.value = null;
+    endOperation(owner);
   }
 }
 
@@ -1179,8 +1296,8 @@ function detectedAcknowledgement(trial: TuningTrial): LogLine | undefined {
   }));
 }
 
-async function waitForWriteConfirmation(trial: TuningTrial): Promise<boolean> {
-  if (props.executionEnabled !== true || trial.status !== 'sent') return false;
+async function waitForWriteConfirmation(trial: TuningTrial, owner: OperationOwner): Promise<boolean> {
+  if (!hasWriteAccess(owner) || props.executionEnabled !== true || trial.status !== 'sent') return false;
   const mode = plan.value.confirmation.mode;
   if (mode === 'manual') return false;
   const timeoutMs = (plan.value.confirmation.timeoutSeconds ?? 0) * 1000;
@@ -1189,17 +1306,18 @@ async function waitForWriteConfirmation(trial: TuningTrial): Promise<boolean> {
     if (mode === 'acknowledgement') return Boolean(detectedAcknowledgement(trial));
     const values = currentReadback(trial);
     return matchesParameterReadback(trial.candidate, values, plan.value.confirmation.parameterTolerance ?? 0, plan.value.structure);
-  }, timeoutMs);
-  if (!confirmed) return false;
+  }, timeoutMs, owner);
+  if (!confirmed || !hasWriteAccess(owner)) return false;
   const ackLog = mode === 'acknowledgement' ? detectedAcknowledgement(trial) : undefined;
   const ack = ackLog?.text ?? (mode === 'parameter-channels' ? '设备参数通道在本次驱动写入后回传了候选值。' : undefined);
   if (ackLog) trial.acknowledgementLogId = ackLog.id;
   if (!ack) return false;
-  acceptWrite(trial, mode, ack || '收到配置的设备应答。');
+  acceptWrite(trial, mode, ack || '收到配置的设备应答。', owner);
   return trialStatus(trial.id) === 'confirmed';
 }
 
-function acceptWrite(trial: TuningTrial, mode: WriteConfirmationMode, evidence: string) {
+function acceptWrite(trial: TuningTrial, mode: WriteConfirmationMode, evidence: string, owner: OperationOwner) {
+  if (!hasWriteAccess(owner)) return;
   if (!cascadeDeviceCheck.value.ready) {
     requestSafetyStop('写入确认前内环依据已失效，不能进入外环评价。');
     return;
@@ -1231,7 +1349,8 @@ function acceptWrite(trial: TuningTrial, mode: WriteConfirmationMode, evidence: 
   if (loop) globalProjectModel.updateLoopParams(plan.value.loopId, trial.candidate);
 }
 
-async function collectAndEvaluate(trial: TuningTrial, automatic = false): Promise<boolean> {
+async function collectAndEvaluate(trial: TuningTrial, owner: OperationOwner, automatic = false): Promise<boolean> {
+  if (!hasWriteAccess(owner)) return false;
   if (props.executionEnabled !== true || trial.status !== 'confirmed') {
     session.value.status = 'paused';
     session.value.stopReason = '没有当前会话的写入回执与设备确认，不能开始试验评价。';
@@ -1248,6 +1367,7 @@ async function collectAndEvaluate(trial: TuningTrial, automatic = false): Promis
   const windowMs = (plan.value.evaluationWindowSeconds ?? 0) * 1000;
   const collectionStart = performance.now();
   while (performance.now() - collectionStart < windowMs) {
+    if (!ownsOperation(owner)) return false;
     if (isWorking.value && (!authorizedPlanSignature.value || executionPlanSignature() !== authorizedPlanSignature.value)) {
       requestStop('实验配置在执行期间发生变化；本轮采集结束后不会继续试参。');
     }
@@ -1268,8 +1388,9 @@ async function collectAndEvaluate(trial: TuningTrial, automatic = false): Promis
       requestSafetyStop('采集中控制输出超过用户设置上限。');
       return false;
     }
-    await sleep(Math.min(150, Math.max(1, windowMs - (performance.now() - collectionStart))));
+    await sleep(Math.min(150, Math.max(1, windowMs - (performance.now() - collectionStart))), owner);
   }
+  if (!ownsOperation(owner)) return false;
   if (stopRequested.value || !props.connected) {
     trial.status = 'failed';
     if ((session.value.status as TuningSession['status']) !== 'stopped') {
@@ -1358,6 +1479,7 @@ async function collectAndEvaluate(trial: TuningTrial, automatic = false): Promis
 }
 
 async function generateManualCandidate() {
+  if (operationBusy.value) return;
   const eligibility = manualCandidateEligibility({
     planErrorCount: candidateErrors.value.length,
     isWorking: isWorking.value,
@@ -1370,47 +1492,54 @@ async function generateManualCandidate() {
     setNotice('warning', '暂时不能生成候选', eligibility.reason || '当前状态不允许生成候选。');
     return;
   }
-  await proposeCandidate();
+  const owner = beginOperation('candidate');
+  if (!owner) return;
+  try { await proposeCandidate(owner); }
+  finally { endOperation(owner); }
 }
 
 async function sendManualTrial(chosen: TuningTrial) {
+  if (operationBusy.value) return;
   if (!props.ordinaryWritesReady) {
     setNotice('warning', '驱动写入状态未就绪', '先等待普通命令完成；写入失败或未知时重新连接并核对设备。');
     return;
   }
+  const owner = beginOperation('execution');
+  if (!owner) return;
   authorizedPlanSignature.value = executionPlanSignature();
-  isWorking.value = true;
-  stopRequested.value = false;
+  startExecution(owner);
   try {
-    if (!await waitFor(() => props.writeAccessReady, 5000, 20)) {
+    if (!await waitFor(() => hasWriteAccess(owner), 5000, owner, 20)) {
+      if (!ownsOperation(owner)) return;
       setNotice('warning', '尚未取得写入权', '等待普通发送队列结束后再重试；本轮没有发送命令。');
       return;
     }
-    const sent = await sendTrial(chosen);
-    if (!sent) return;
+    const sent = await sendTrial(chosen, owner);
+    if (!sent || !ownsOperation(owner)) return;
     if (plan.value.confirmation.mode !== 'manual' && chosen.status === 'sent') {
-      const confirmed = await waitForWriteConfirmation(chosen);
+      const confirmed = await waitForWriteConfirmation(chosen, owner);
+      if (!ownsOperation(owner)) return;
       if (!confirmed) {
         if (stopRequested.value) return;
         chosen.status = 'failed';
         requestSafetyStop('已发送，但未收到参数回传或设备应答。');
         return;
       }
-      await collectAndEvaluate(chosen);
+      await collectAndEvaluate(chosen, owner);
     } else if (chosen.status === 'sent') {
       awaitingManualConfirmation.value = true;
       setNotice('warning', '等待人工核对设备', '命令已发送但没有生效确认。请核对设备后勾选确认，或停止本次实验。');
     }
   } finally {
-    if (!awaitingManualConfirmation.value) {
-      invalidateUnconfirmedWrite('流程在设备确认前结束，当前参数需重新核对。');
-      isWorking.value = false;
-      authorizedPlanSignature.value = null;
+    if (currentOperation === owner && !awaitingManualConfirmation.value) {
+      if (ownsOperation(owner)) invalidateUnconfirmedWrite('流程在设备确认前结束，当前参数需重新核对。');
+      endOperation(owner);
     }
   }
 }
 
 async function runBoundedExperiment() {
+  if (operationBusy.value) return;
   if (props.ordinaryWritesReady === false) {
     setNotice('warning', '普通命令尚未确认完成', '等待驱动写入队列完成；失败或未知状态需要重新连接并核对参数。');
     return;
@@ -1432,59 +1561,65 @@ async function runBoundedExperiment() {
     setNotice('warning', '需要确认现有控制器可稳定运行', '自动反馈试验从已运行的控制器微调参数。请先确认当前基线正在控制设备，并已准备独立设备保护。');
     return;
   }
-  const roundLimit = plan.value.route === 'model' ? 1 : plan.value.maximumTrials;
-  const activeBoundSummary = activeParameters.value.map((key) => `${key.toUpperCase()} (${plan.value.units.parameters[key]}) ${plan.value.bounds[key]?.min}–${plan.value.bounds[key]?.max}`).join(' · ');
-  const routeSummary = plan.value.route === 'model' ? '本机 PID 数学工具计算一个候选' : `每轮将参数和遥测指标摘要发送到 ${props.aiConfig.api_url}（模型 ${props.aiConfig.model}）`;
-  const confirmationSummary = plan.value.confirmation.mode === 'acknowledgement' ? `应答包含“${plan.value.confirmation.acknowledgementText}”` : '活动参数通道回传与候选在容差内一致';
-  const goalSummary = plan.value.goal.mode === 'track'
-    ? `轨迹跟踪 RMS ≤ ${plan.value.goal.maximumTrackingError} ${plan.value.units.feedback}`
-    : plan.value.goal.mode === 'step-response'
-      ? `稳态误差 ≤ ${plan.value.goal.maximumSteadyError} ${plan.value.units.feedback}，超调 ≤ ${plan.value.goal.maximumOvershootPct}%，单次阶跃设定值容差 ${plan.value.goal.stepSetpointTolerance} ${plan.value.units.setpoint}`
-      : `稳态误差 ≤ ${plan.value.goal.maximumSteadyError} ${plan.value.units.feedback}`;
-  const modelTarget = plan.value.route === 'model'
-    ? `\n模型目标：ωc ${plan.value.goal.targetCrossoverRadPerSec} rad/s · 相位裕度 ${plan.value.goal.targetPhaseMarginDeg}°`
-    : '';
-  const offeredExecutionScope = executionPlanSignature();
-  const offeredPlan = tuningPlanSignature(plan.value);
-  const offeredGeneration = globalChannelStore.getGeneration();
-  const offeredDeviceSession = JSON.stringify(globalChannelStore.getSessionContext());
-  const consent = await requestApproval(`请检查自动试验授权范围\n\n项目 / 环路：${plan.value.project} / ${activeLoop.value?.name || plan.value.loopId}\n路线：${routeSummary}\n控制结构 / 方向：${plan.value.structure} / ${plan.value.controlDirection}\n基线：Kp ${currentParams.value?.kp} · Ki ${currentParams.value?.ki} · Kd ${currentParams.value?.kd}\n参数边界：${activeBoundSummary}\n目标：${goalSummary}${modelTarget}\n采样周期：${plan.value.sampleTimeSeconds} 秒 · 最大遥测延迟：${plan.value.maximumTelemetryAgeSeconds} 秒\n输出绝对上限：${plan.value.maximumOutputMagnitude} ${plan.value.units.output}\n每轮最大变化：${plan.value.maxParameterChangePercent}%\n观察窗口：${plan.value.evaluationWindowSeconds} 秒 · 最多 ${roundLimit} 轮\n停止条件：遥测过期、串口断开、输出越界、目标达成或用户停止\n设备确认：${confirmationSummary}\n命令模板：\n${plan.value.commandTemplate}\nUTF-8 字节格式：行尾 ${(plan.value.commandFormat?.lineEnding ?? 'crlf').toUpperCase()}；${plan.value.commandFormat?.escapeText === false ? '保留字面字符' : '解析文本转义'}。每轮冻结最终字节与预览后使用同一契约写入。\n\n程序会逐轮检查候选值。是否授权此范围？`);
-  if (!consent) return;
-  if (offeredExecutionScope !== executionPlanSignature() || offeredPlan !== tuningPlanSignature(plan.value)
-    || offeredGeneration !== globalChannelStore.getGeneration() || offeredDeviceSession !== JSON.stringify(globalChannelStore.getSessionContext())
-    || !props.ordinaryWritesReady || !props.connected || props.executionEnabled !== true || !telemetryFresh() || !plan.value.baseline.stableBaseConfirmed
-    || planErrors.value.length || plan.value.route === 'feedback' && feedbackEvidenceStatus.value.status !== 'ready') {
-    setNotice('warning', '授权范围已失效', '授权等待期间的配置、基线或设备会话已变化，或当前遥测不足。请重新检查后授权。');
-    return;
-  }
-  if (!cascadeDeviceCheck.value.ready) {
-    setNotice('warning', '授权范围已失效', cascadeDeviceCheck.value.issues[0]);
-    return;
-  }
-  authorizedPlanSignature.value = offeredExecutionScope;
-  isWorking.value = true;
-  stopRequested.value = false;
-  session.value.status = 'collecting';
-  session.value.startedAt = Date.now();
-  session.value.stopReason = null;
+  const owner = beginOperation('execution');
+  if (!owner) return;
   try {
-    const lockReady = await waitFor(() => props.writeAccessReady, 5000, 20);
+    const roundLimit = plan.value.route === 'model' ? 1 : plan.value.maximumTrials;
+    const activeBoundSummary = activeParameters.value.map((key) => `${key.toUpperCase()} (${plan.value.units.parameters[key]}) ${plan.value.bounds[key]?.min}–${plan.value.bounds[key]?.max}`).join(' · ');
+    const routeSummary = plan.value.route === 'model' ? '本机 PID 数学工具计算一个候选' : `每轮将参数和遥测指标摘要发送到 ${props.aiConfig.api_url}（模型 ${props.aiConfig.model}）`;
+    const confirmationSummary = plan.value.confirmation.mode === 'acknowledgement' ? `应答包含“${plan.value.confirmation.acknowledgementText}”` : '活动参数通道回传与候选在容差内一致';
+    const goalSummary = plan.value.goal.mode === 'track'
+      ? `轨迹跟踪 RMS ≤ ${plan.value.goal.maximumTrackingError} ${plan.value.units.feedback}`
+      : plan.value.goal.mode === 'step-response'
+        ? `稳态误差 ≤ ${plan.value.goal.maximumSteadyError} ${plan.value.units.feedback}，超调 ≤ ${plan.value.goal.maximumOvershootPct}%，单次阶跃设定值容差 ${plan.value.goal.stepSetpointTolerance} ${plan.value.units.setpoint}`
+        : `稳态误差 ≤ ${plan.value.goal.maximumSteadyError} ${plan.value.units.feedback}`;
+    const modelTarget = plan.value.route === 'model'
+      ? `\n模型目标：ωc ${plan.value.goal.targetCrossoverRadPerSec} rad/s · 相位裕度 ${plan.value.goal.targetPhaseMarginDeg}°`
+      : '';
+    const offeredExecutionScope = executionPlanSignature();
+    const offeredPlan = tuningPlanSignature(plan.value);
+    const offeredGeneration = globalChannelStore.getGeneration();
+    const offeredDeviceSession = JSON.stringify(globalChannelStore.getSessionContext());
+    const consent = await requestApproval(`请检查自动试验授权范围\n\n项目 / 环路：${plan.value.project} / ${activeLoop.value?.name || plan.value.loopId}\n路线：${routeSummary}\n控制结构 / 方向：${plan.value.structure} / ${plan.value.controlDirection}\n基线：Kp ${currentParams.value?.kp} · Ki ${currentParams.value?.ki} · Kd ${currentParams.value?.kd}\n参数边界：${activeBoundSummary}\n目标：${goalSummary}${modelTarget}\n采样周期：${plan.value.sampleTimeSeconds} 秒 · 最大遥测延迟：${plan.value.maximumTelemetryAgeSeconds} 秒\n输出绝对上限：${plan.value.maximumOutputMagnitude} ${plan.value.units.output}\n每轮最大变化：${plan.value.maxParameterChangePercent}%\n观察窗口：${plan.value.evaluationWindowSeconds} 秒 · 最多 ${roundLimit} 轮\n停止条件：遥测过期、串口断开、输出越界、目标达成或用户停止\n设备确认：${confirmationSummary}\n命令模板：\n${plan.value.commandTemplate}\nUTF-8 字节格式：行尾 ${(plan.value.commandFormat?.lineEnding ?? 'crlf').toUpperCase()}；${plan.value.commandFormat?.escapeText === false ? '保留字面字符' : '解析文本转义'}。每轮冻结最终字节与预览后使用同一契约写入。\n\n程序会逐轮检查候选值。是否授权此范围？`, owner);
+    if (!consent || !ownsOperation(owner)) return;
+    if (offeredExecutionScope !== executionPlanSignature() || offeredPlan !== tuningPlanSignature(plan.value)
+      || offeredGeneration !== globalChannelStore.getGeneration() || offeredDeviceSession !== JSON.stringify(globalChannelStore.getSessionContext())
+      || !props.ordinaryWritesReady || !props.connected || props.executionEnabled !== true || !telemetryFresh() || !plan.value.baseline.stableBaseConfirmed
+      || planErrors.value.length || plan.value.route === 'feedback' && feedbackEvidenceStatus.value.status !== 'ready') {
+      setNotice('warning', '授权范围已失效', '授权等待期间的配置、基线或设备会话已变化，或当前遥测不足。请重新检查后授权。');
+      return;
+    }
+    if (!cascadeDeviceCheck.value.ready) {
+      setNotice('warning', '授权范围已失效', cascadeDeviceCheck.value.issues[0]);
+      return;
+    }
+    authorizedPlanSignature.value = offeredExecutionScope;
+    startExecution(owner);
+    session.value.status = 'collecting';
+    session.value.startedAt = Date.now();
+    session.value.stopReason = null;
+    const lockReady = await waitFor(() => hasWriteAccess(owner), 5000, owner, 20);
+    if (!ownsOperation(owner)) return;
     if (!lockReady) throw new Error('没有取得独占串口写入权，自动实验没有发送参数。');
     for (let round = trialBudgetUsed(session.value.trials); round < (roundLimit ?? 0); round += 1) {
-      if (stopRequested.value || !props.connected || !telemetryFresh()) break;
+      if (!ownsOperation(owner) || stopRequested.value || !props.connected || !telemetryFresh()) break;
       autoProgress.value = `第 ${round + 1} / ${roundLimit} 轮 · 读取遥测`;
-      const trial = await proposeCandidate(true);
+      const trial = await proposeCandidate(owner, true);
+      if (!ownsOperation(owner)) return;
       if (!trial || stopRequested.value) break;
-      const sent = await sendTrial(trial, true);
+      const sent = await sendTrial(trial, owner, true);
+      if (!ownsOperation(owner)) return;
       if (!sent || trial.status !== 'sent') break;
-      const confirmed = await waitForWriteConfirmation(trial);
+      const confirmed = await waitForWriteConfirmation(trial, owner);
+      if (!ownsOperation(owner)) return;
       if (!confirmed) {
         trial.status = 'failed';
         if (stopRequested.value) break;
         requestSafetyStop('已发送，但在超时时间内没有确认写入生效。');
         break;
       }
-      const reachedGoal = await collectAndEvaluate(trial, true);
+      const reachedGoal = await collectAndEvaluate(trial, owner, true);
+      if (!ownsOperation(owner)) return;
       if (reachedGoal || trialStatus(trial.id) === 'failed' || stopRequested.value) break;
     }
     if (!['completed', 'stopped', 'paused'].includes(session.value.status)) {
@@ -1497,17 +1632,19 @@ async function runBoundedExperiment() {
     }
     if (session.value.status === 'paused' && !notice.value) setNotice('info', '实验已暂停', session.value.stopReason || '检查试验记录后再继续。');
   } catch (error) {
-    if (stopRequested.value) return;
+    if (!ownsOperation(owner) || stopRequested.value) return;
     session.value.status = 'paused';
     session.value.stopReason = error instanceof Error ? error.message : String(error);
     setNotice('error', '自动实验已暂停', session.value.stopReason);
   } finally {
-    invalidateUnconfirmedWrite('自动流程在设备确认前结束，当前参数需重新核对。');
-    isWorking.value = false;
-    authorizedPlanSignature.value = null;
-    autoProgress.value = '';
-    session.value.updatedAt = Date.now();
-    saveTuningSession(session.value);
+    if (currentOperation === owner) {
+      if (ownsOperation(owner)) {
+        invalidateUnconfirmedWrite('自动流程在设备确认前结束，当前参数需重新核对。');
+        session.value.updatedAt = Date.now();
+        saveTuningSession(session.value);
+      }
+      endOperation(owner);
+    }
   }
 }
 
@@ -1527,6 +1664,11 @@ function invalidateUnconfirmedWrite(reason: string) {
 
 function requestStop(reason = '用户请求停止。') {
   stopRequested.value = true;
+  const collectingTrial = currentProposal.value;
+  if (isWorking.value && session.value.status === 'collecting' && collectingTrial?.status === 'confirmed') {
+    collectingTrial.status = 'failed';
+    collectingTrial.confirmation = `${collectingTrial.confirmation || ''} ${reason} 本轮观察窗口未完成。`.trim();
+  }
   invalidateUnconfirmedWrite(reason);
   if (approvalResolve) finishApproval(false);
   if (session.value.status !== 'stopped' && (isWorking.value || ['awaiting-confirmation', 'collecting'].includes(session.value.status))) {
@@ -1540,10 +1682,9 @@ function requestStop(reason = '用户请求停止。') {
     const trial = currentProposal.value;
     if (trial?.status === 'sent') { trial.status = 'failed'; trial.confirmation = '人工确认前流程停止，当前设备参数需重新核对。'; }
     awaitingManualConfirmation.value = false;
-    isWorking.value = false;
-    authorizedPlanSignature.value = null;
   }
-  if (session.value.status !== 'stopped') setNotice('warning', '停止信号已记录', '实验执行器会在本次未完成的请求或设备等待结束后停止，并保留已发送命令。');
+  cancelCurrentOperation();
+  if (session.value.status !== 'stopped') setNotice('warning', '停止信号已记录', '当前请求和设备等待已取消。已派发字节无法撤回，驱动队列仍需排空；设备状态需重新核对。');
 }
 
 function checkExecutionSafety() {
@@ -1577,11 +1718,14 @@ function invalidateDeviceContext() {
   const trial = currentProposal.value;
   if (trial?.status === 'proposed') { trial.status = 'rejected'; trial.note += ' 设备会话变化，候选已作废。'; }
   if (isWorking.value) requestSafetyStop('设备或解析会话发生变化，当前轮次不能继续。');
+  else cancelCurrentOperation();
 }
 
 function requestSafetyStop(reason: string) {
   if (stopRequested.value) return;
   stopRequested.value = true;
+  const collectingTrial = currentProposal.value;
+  if (session.value.status === 'collecting' && collectingTrial?.status === 'confirmed') collectingTrial.status = 'failed';
   if (approvalResolve) finishApproval(false);
   invalidateUnconfirmedWrite(reason);
   clearVolatileDeviceEvidence();
@@ -1592,11 +1736,7 @@ function requestSafetyStop(reason: string) {
   session.value.stopReason = `${reason} 已请求本机发送屏障和配置的设备停止命令；设备是否停机仍需确认。`;
   setNotice('error', '调参安全停止', session.value.stopReason);
   emit('safety-stop', reason);
-  if (awaitingManualConfirmation.value) {
-    awaitingManualConfirmation.value = false;
-    isWorking.value = false;
-    authorizedPlanSignature.value = null;
-  }
+  cancelCurrentOperation();
 }
 
 function readMetrics(afterTimestamp = 0, throughTimestamp = Infinity): ReturnType<typeof evaluateResponse> {
@@ -1635,20 +1775,26 @@ function telemetryFresh(): boolean {
   });
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs: number, interval = 120, respectStop = false): Promise<boolean> {
+async function waitFor(predicate: () => boolean, timeoutMs: number, owner: OperationOwner, interval = 120): Promise<boolean> {
   const deadline = Date.now() + Math.max(0, timeoutMs);
   while (Date.now() <= deadline) {
-    if ((respectStop || isWorking.value) && (stopRequested.value || !props.connected)) return false;
+    if (!ownsOperation(owner) || stopRequested.value || !props.connected) return false;
     checkExecutionSafety();
-    if ((respectStop || isWorking.value) && stopRequested.value) return false;
+    if (!ownsOperation(owner) || stopRequested.value) return false;
     if (predicate()) return true;
-    await sleep(Math.min(interval, Math.max(0, deadline - Date.now())));
+    await sleep(Math.min(interval, Math.max(1, deadline - Date.now())), owner);
   }
-  return !((respectStop || isWorking.value) && stopRequested.value) && predicate();
+  return ownsOperation(owner) && !stopRequested.value && predicate();
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, Math.max(0, ms)));
+function sleep(ms: number, owner: OperationOwner): Promise<void> {
+  return new Promise((resolve) => {
+    const signal = owner.controller.signal;
+    if (signal.aborted) { resolve(); return; }
+    const done = () => { window.clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); };
+    const timer = window.setTimeout(done, Math.max(0, ms));
+    signal.addEventListener('abort', done, { once: true });
+  });
 }
 
 function findTrial(trialId: string): TuningTrial | undefined {
@@ -1660,7 +1806,7 @@ function trialStatus(trialId: string): TuningTrial['status'] | undefined {
 }
 
 function useLastVerified() {
-  if (isWorking.value || aiBusy.value || modelBusy.value) return;
+  if (operationBusy.value || operationBusy.value || isWorking.value || aiBusy.value || modelBusy.value) return;
   if (!session.value.bestVerified) return;
   parameterForm.kp = String(session.value.bestVerified.kp);
   parameterForm.ki = String(session.value.bestVerified.ki);
@@ -1670,15 +1816,24 @@ function useLastVerified() {
 }
 
 function importPackage() {
-  if (isWorking.value) return;
+  if (operationBusy.value) return;
   const file = importInput.value?.files?.[0];
   if (!file) return;
   if (file.size > 512 * 1024) {
     setNotice('error', '套件文件过大', '首版只接受小于 512 KiB 的 JSON 配置套件。');
     return;
   }
+  const owner = beginOperation('import');
+  if (!owner) return;
   const reader = new FileReader();
+  const abortRead = () => { if (reader.readyState === FileReader.LOADING) reader.abort(); };
+  owner.controller.signal.addEventListener('abort', abortRead, { once: true });
+  const finishRead = () => {
+    owner.controller.signal.removeEventListener('abort', abortRead);
+    endOperation(owner);
+  };
   reader.onload = () => {
+    if (!ownsOperation(owner)) { finishRead(); return; }
     try {
       const value = JSON.parse(String(reader.result));
       const errors = validateCapabilityPackage(value);
@@ -1702,11 +1857,22 @@ function importPackage() {
       modelDraft.value = plan.value.suite?.modelDraft ?? null;
       modelSource.value = plan.value.suite?.modelOrigin === 'ai-proposal' ? 'ai' : plan.value.suite?.modelOrigin === 'user-transfer-function' || plan.value.suite?.id === 'custom' ? 'transfer' : 'physical';
     } catch (error) {
+      if (!ownsOperation(owner)) return;
       setNotice('error', '套件导入失败', error instanceof Error ? error.message : String(error));
+    } finally {
+      finishRead();
     }
   };
-  reader.onerror = () => setNotice('error', '文件读取失败', '请检查 JSON 文件后重试。');
-  reader.readAsText(file);
+  reader.onerror = () => {
+    if (ownsOperation(owner)) setNotice('error', '文件读取失败', '请检查 JSON 文件后重试。');
+    finishRead();
+  };
+  reader.onabort = finishRead;
+  try { reader.readAsText(file); }
+  catch (error) {
+    if (ownsOperation(owner)) setNotice('error', '文件读取失败', error instanceof Error ? error.message : String(error));
+    finishRead();
+  }
   if (importInput.value) importInput.value.value = '';
 }
 
@@ -1723,7 +1889,7 @@ function exportPackage() {
 }
 
 function newExperiment() {
-  if (isWorking.value) return;
+  if (operationBusy.value) return;
   deviceSettingsOpen.value = false;
   archiveCurrentStage();
   const next = newPlan();
@@ -1807,7 +1973,7 @@ function id(): string {
       <div v-if="notice" class="notice" :class="[`notice-${notice.type}`, { 'notice-compact': assistantPane === 'result' && notice.type === 'success' }]" role="status"><div><strong>{{ notice.title }}</strong><p v-if="assistantPane !== 'result' || notice.type !== 'success'">{{ notice.body }}</p></div><button type="button" class="icon-button" aria-label="关闭提示" @click="notice = null"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg></button></div>
       <div v-if="!selectedSuite" class="scene-start"><p>选择对象与控制环节，绑定串口解析出的变量。AI 反馈与模型计算共用当前串口会话。</p><div class="suite-options" role="group" aria-label="调参场景"><button v-for="suite in SCENARIO_SUITES" :key="suite.id" type="button" @click="selectScenario(suite.id)"><span><strong>{{ suite.title }}</strong><small>{{ suite.description }}</small></span><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m7 4 6 6-6 6"/></svg></button></div><p class="field-note">套组包含控制结构、物理模型与场景约束。自定义套组由你构建环路、模型和提示词。</p><p class="field-note">{{ liveStatus }}</p></div>
       <template v-else>
-        <fieldset v-if="assistantPane === 'setup'" class="scene-form" :disabled="isWorking || aiBusy || modelBusy">
+        <fieldset v-if="assistantPane === 'setup'" class="scene-form" :disabled="operationBusy || isWorking || aiBusy || modelBusy">
           <div class="form-row"><label class="field"><span>场景套组</span><select :value="plan.suite?.id" @change="selectScenario(($event.target as HTMLSelectElement).value as TuningScenarioId)"><option v-for="suite in SCENARIO_SUITES" :key="suite.id" :value="suite.id">{{ suite.title }}</option></select></label><label v-if="plan.suite?.id !== 'custom'" class="field"><span>控制方案</span><select :value="plan.suite?.topologyId" @change="selectTopology(($event.target as HTMLSelectElement).value)"><option v-for="topology in selectedSuite.topologies" :key="topology.id" :value="topology.id">{{ topology.title }}</option></select></label></div>
           <p v-if="plan.suite?.id !== 'custom'" class="field-note">{{ selectedTopology?.description }}</p>
           <details v-else class="settings-section" open><summary>构建控制环路 <span>{{ customStages.length === 1 ? '单环' : `${customStages.length} 级串级` }}</span></summary><div class="details-body"><p class="field-note">按从内到外的顺序添加，每次整定当前选中的环节。</p><div v-for="(stage,index) in customStages" :key="stage.id" class="custom-stage-row"><label class="field"><span>{{ index === 0 ? '内环 / 单环名称' : `外环 ${index} 名称` }}</span><input :value="stage.title" @input="updateCustomStage(stage.id,'title',($event.target as HTMLInputElement).value)" placeholder="例如：角速度环"></label><label class="field"><span>结构</span><select :value="stage.structure" @change="updateCustomStage(stage.id,'structure',($event.target as HTMLSelectElement).value)"><option v-for="structure in stage.supportedStructures" :key="structure">{{ structure }}</option></select></label><button v-if="customStages.length > 1" type="button" class="icon-button remove-stage" :aria-label="`删除${stage.title}`" @click="removeCustomStage(stage.id)"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h12M8 6V4h4v2M6 6l1 10h6l1-10M9 9v4M11 9v4"/></svg></button></div><button type="button" class="text-button" :disabled="customStages.length >= 4" @click="addCustomStage">添加外环</button><p v-for="error in stageErrors" :key="error" class="field-error">{{ error }}</p></div></details>
@@ -1833,22 +1999,22 @@ function id(): string {
           </section>
           <div class="form-row execution-context"><label class="field"><span>控制方向</span><select v-model="plan.controlDirection"><option :value="null">核对反馈方向</option><option value="direct">输出增加 → 反馈增加</option><option value="reverse">输出增加 → 反馈减少</option></select></label><label class="field"><span>固件采样周期 · 秒</span><input v-model.number="plan.sampleTimeSeconds" type="number" min="0" step="any" placeholder="需从固件确认"></label></div>
           <div class="device-settings"><button v-if="plan.route === 'model'" type="button" class="device-settings-toggle" :aria-expanded="deviceSettingsOpen" aria-controls="scene-device-settings" @click="deviceSettingsOpen = !deviceSettingsOpen"><span>设备执行设置</span><small>计算后再填</small><span aria-hidden="true">{{ deviceSettingsOpen ? '−' : '+' }}</span></button><div id="scene-device-settings" v-show="plan.route === 'feedback' || deviceSettingsOpen"><details class="settings-section" :open="channelSettingsOpen" @toggle="channelSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>绑定串口变量 <span>{{ plan.channels.feedback || '待绑定' }}</span></summary><div class="details-body"><p class="field-note">当前解析协议：{{ protocolConfig.type.toUpperCase() }}。收到变量后绑定原始通道 ID；设定值与反馈使用相同单位。</p><button type="button" class="text-button" :disabled="isWorking" @click="emit('open-protocol-settings')">设置串口与解析协议</button><p v-if="!liveChannelOptions.length" class="field-note">尚无已解析变量。先连接并接收数值帧；无设备时可使用物理模型计算路线。</p><div v-for="item in latestSummary" :key="item.key" class="channel-binding"><label class="field"><span>{{ item.key }} <output>{{ format(item.reading?.value,4) }}</output></span><select :value="item.channel" :aria-label="`${item.key}通道`" @change="plan.channels[item.key === '目标' ? 'setpoint' : item.key === '实际反馈' ? 'feedback' : 'output'] = ($event.target as HTMLSelectElement).value"><option value="">选择已解析变量</option><option v-for="channel in liveChannelOptions" :key="channel" :value="channel">{{ channelOptionLabel(channel) }}</option></select></label><label class="field"><span>单位</span><input :value="plan.units[item.key === '目标' ? 'setpoint' : item.key === '实际反馈' ? 'feedback' : 'output']" :aria-label="`${item.key}单位`" @input="plan.units[item.key === '目标' ? 'setpoint' : item.key === '实际反馈' ? 'feedback' : 'output'] = ($event.target as HTMLInputElement).value" placeholder="需确认"></label></div><label class="field"><span>最大遥测延迟 · 秒</span><input v-model.number="plan.maximumTelemetryAgeSeconds" type="number" min="0" step="any" placeholder="按设备上报周期提供"></label><p class="field-note">{{ telemetryAge === null ? '当前绑定通道还没有数据' : `最近遥测 ${format(telemetryAge,1)} 秒前` }}</p></div></details>
-          <details class="settings-section" :open="parameterSettingsOpen" @toggle="parameterSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>当前参数与写入边界 <span>{{ plan.baseline.confirmed ? '用户已核对' : '执行前必填' }}</span></summary><div class="details-body"><p class="field-note">按固件实际公式填写参数单位；非活动项固定为 0。模型离线计算可先跳过。</p><div v-for="key in activeParameters" :key="key" class="parameter-setting"><h4>{{ key.toUpperCase() }}</h4><div class="parameter-values"><label class="field"><span>设备当前值</span><input v-model="parameterForm[key]" type="number" step="any" placeholder="待核对" @input="syncManualParams(key,($event.target as HTMLInputElement).value)"></label><label class="field"><span>下限</span><input :value="plan.bounds[key]?.min ?? ''" type="number" step="any" placeholder="待确认" @input="setBound(key,'min',($event.target as HTMLInputElement).value)"></label><label class="field"><span>上限</span><input :value="plan.bounds[key]?.max ?? ''" type="number" step="any" placeholder="待确认" @input="setBound(key,'max',($event.target as HTMLInputElement).value)"></label></div><div class="form-row"><label class="field"><span>参数单位 / 固件定义</span><input v-model.trim="plan.units.parameters[key]" :aria-label="`${key.toUpperCase()}单位`" placeholder="按固件公式填写"></label><label class="field"><span>设备回传变量</span><select v-model="plan.channels.parameters[key]"><option value="">未绑定</option><option v-for="channel in liveChannelOptions" :key="channel" :value="channel">{{ channelOptionLabel(channel) }}</option></select><small v-if="plan.channels.parameters[key]">当前 {{ format(parameterChannelValue(key)) }}</small></label></div></div><button type="button" class="text-button" :disabled="!activeParameters.every((key) => plan.channels.parameters[key])" @click="readParametersFromChannels">从本次遥测读取当前参数</button><label class="check-field"><input :checked="plan.baseline.confirmed" type="checkbox" :disabled="!plan.baseline.params || isWorking || aiBusy || modelBusy || ordinaryWritesReady === false" @change="confirmCurrentBaseline(($event.target as HTMLInputElement).checked)"><span>我已核对设备当前值与边界。</span></label><p v-if="ordinaryWritesReady === false" class="field-note">普通命令尚未写完，或写入状态未知。处理发送队列后，再确认当前参数；软件停止锁定时需先恢复发送。</p><label v-if="plan.mode === 'bounded-auto'" class="check-field"><input v-model="plan.baseline.stableBaseConfirmed" type="checkbox"><span>当前控制器在稳定的保守基线下运行，设备已有独立保护。</span></label></div></details>
+          <details class="settings-section" :open="parameterSettingsOpen" @toggle="parameterSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>当前参数与写入边界 <span>{{ plan.baseline.confirmed ? '用户已核对' : '执行前必填' }}</span></summary><div class="details-body"><p class="field-note">按固件实际公式填写参数单位；非活动项固定为 0。模型离线计算可先跳过。</p><div v-for="key in activeParameters" :key="key" class="parameter-setting"><h4>{{ key.toUpperCase() }}</h4><div class="parameter-values"><label class="field"><span>设备当前值</span><input v-model="parameterForm[key]" type="number" step="any" placeholder="待核对" @input="syncManualParams(key,($event.target as HTMLInputElement).value)"></label><label class="field"><span>下限</span><input :value="plan.bounds[key]?.min ?? ''" type="number" step="any" placeholder="待确认" @input="setBound(key,'min',($event.target as HTMLInputElement).value)"></label><label class="field"><span>上限</span><input :value="plan.bounds[key]?.max ?? ''" type="number" step="any" placeholder="待确认" @input="setBound(key,'max',($event.target as HTMLInputElement).value)"></label></div><div class="form-row"><label class="field"><span>参数单位 / 固件定义</span><input v-model.trim="plan.units.parameters[key]" :aria-label="`${key.toUpperCase()}单位`" placeholder="按固件公式填写"></label><label class="field"><span>设备回传变量</span><select v-model="plan.channels.parameters[key]"><option value="">未绑定</option><option v-for="channel in liveChannelOptions" :key="channel" :value="channel">{{ channelOptionLabel(channel) }}</option></select><small v-if="plan.channels.parameters[key]">当前 {{ format(parameterChannelValue(key)) }}</small></label></div></div><button type="button" class="text-button" :disabled="!activeParameters.every((key) => plan.channels.parameters[key])" @click="readParametersFromChannels">从本次遥测读取当前参数</button><label class="check-field"><input :checked="plan.baseline.confirmed" type="checkbox" :disabled="!plan.baseline.params || operationBusy || isWorking || aiBusy || modelBusy || ordinaryWritesReady === false" @change="confirmCurrentBaseline(($event.target as HTMLInputElement).checked)"><span>我已核对设备当前值与边界。</span></label><p v-if="ordinaryWritesReady === false" class="field-note">普通命令尚未写完，或写入状态未知。处理发送队列后，再确认当前参数；软件停止锁定时需先恢复发送。</p><label v-if="plan.mode === 'bounded-auto'" class="check-field"><input v-model="plan.baseline.stableBaseConfirmed" type="checkbox"><span>当前控制器在稳定的保守基线下运行，设备已有独立保护。</span></label></div></details>
           <details class="settings-section" :open="goalSettingsOpen" @toggle="goalSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>目标、预算与设备确认 <span>{{ plan.confirmation.mode === 'manual' ? '人工确认' : '设备确认' }}</span></summary><div class="details-body"><label class="field"><span>成功目标</span><select v-model="plan.goal.mode"><option value="settle">保持在目标误差内</option><option value="step-response">阶跃响应</option><option value="track">轨迹跟踪</option></select></label><div class="form-row"><label v-if="plan.goal.mode !== 'track'" class="field"><span>最大稳态误差</span><input v-model.number="plan.goal.maximumSteadyError" type="number" min="0" step="any" :placeholder="plan.units.feedback || '反馈变量单位'"></label><label v-if="plan.goal.mode === 'step-response'" class="field"><span>最大超调 · %</span><input v-model.number="plan.goal.maximumOvershootPct" type="number" min="0" step="any" placeholder="由目标设定"></label><label v-if="plan.goal.mode === 'step-response'" class="field"><span>阶跃设定值容差</span><input v-model.number="plan.goal.stepSetpointTolerance" aria-label="阶跃设定值容差" aria-describedby="step-setpoint-help" type="number" min="0" step="any" :placeholder="plan.units.setpoint || '设定值单位'"><small id="step-setpoint-help">0 表示设定值精确相等。按遥测精度填写，须小于阶跃幅度的一半；窗口仅包含一次跳变，前后各至少 5 组平台采样。</small></label><label v-if="plan.goal.mode === 'track'" class="field"><span>最大 RMS 跟踪误差</span><input v-model.number="plan.goal.maximumTrackingError" type="number" min="0" step="any" :placeholder="plan.units.feedback || '反馈变量单位'"></label><label class="field"><span>最大输出绝对值</span><input v-model.number="plan.maximumOutputMagnitude" type="number" min="0" step="any" :placeholder="plan.units.output || '执行器单位'"></label><label class="field"><span>单轮最大变化 · %</span><input v-model.number="plan.maxParameterChangePercent" type="number" min="0" max="100" step="any" placeholder="自行确认幅度"></label><label class="field"><span>观察时长 · 秒</span><input v-model.number="plan.evaluationWindowSeconds" type="number" min="0" step="any" placeholder="覆盖对象响应"></label><label class="field"><span>最多试验轮数</span><input v-model.number="plan.maximumTrials" type="number" min="1" max="100" step="1" placeholder="有限试验预算"></label></div><label class="field"><span>参数生效确认</span><select :value="plan.confirmation.mode" @change="toggleConfirmationMode(($event.target as HTMLSelectElement).value as WriteConfirmationMode)"><option value="parameter-channels">参数变量回传</option><option value="acknowledgement" :disabled="protocolConfig.type !== 'firewater'">带本轮 ID 的设备应答 · FireWater</option><option value="manual">逐轮人工核对</option></select></label><p v-if="protocolConfig.type !== 'firewater'" class="field-note">当前协议按数值帧接收，无法读取文本 ACK。可用独立参数变量回传，或逐轮人工核对。</p><label v-if="plan.confirmation.mode === 'acknowledgement'" class="field"><span>设备成功应答模板</span><input v-model="plan.confirmation.acknowledgementText" placeholder="例如：PID_APPLIED {request_id}"></label><div v-if="plan.confirmation.mode !== 'manual'" class="form-row"><label class="field"><span>确认超时 · 秒</span><input v-model.number="plan.confirmation.timeoutSeconds" type="number" min="0" step="any" placeholder="按设备响应提供"></label><label v-if="plan.confirmation.mode === 'parameter-channels'" class="field"><span>回传容差 · %</span><input v-model.number="plan.confirmation.parameterTolerance" type="number" min="0" step="any" placeholder="按数值精度提供"></label></div><label class="field"><span>参数写入命令模板</span><textarea v-model="plan.commandTemplate" rows="2" placeholder="按固件协议填写，例如 PID,{request_id},{id},{kp},{ki},{kd}"></textarea><small>变量：{id}、{order}、{kp}、{ki}、{kd}、{request_id}。应答确认需携带本轮 ID。</small></label><div v-if="plan.commandFormat" class="form-row"><label class="field"><span>UTF-8 命令行尾</span><select v-model="plan.commandFormat.lineEnding"><option value="none">不追加</option><option value="lf">LF · \n</option><option value="cr">CR · \r</option><option value="crlf">CRLF · \r\n</option></select></label><label class="check-field"><input v-model="plan.commandFormat.escapeText" type="checkbox"><span>解析命令中的 \r、\n、\t 与 \\ 转义</span></label></div><p class="field-note">已以 CR 或 LF 结尾的命令不会再追加行尾。候选页显示最终字节。</p></div></details>
           </div></div>
           <details class="settings-section" :open="suiteSettingsOpen" @toggle="suiteSettingsOpen = ($event.target as HTMLDetailsElement).open"><summary>套组提示词与能力 <span>{{ selectedSuite.skills.length }} 项约束</span></summary><div class="details-body"><label class="field"><span>实验名称</span><input v-model="plan.name" placeholder="为本次实验命名"></label><label v-if="modelSource !== 'ai' || plan.route !== 'model'" class="field"><span>对象与工作点</span><textarea v-model="plan.description" rows="3" placeholder="说明执行器、传感器、单位、工况与已知限制。"></textarea></label><label class="field"><span>补充提示词约束</span><textarea v-model="plan.prompt" rows="3" placeholder="补充调参经验、任务要求与约束；提示词不会扩大写入权限。"></textarea></label><p class="field-note">基础约束与 skills 随请求发送；本地参数边界和停止规则始终生效。</p><ul class="capability-list"><li v-for="skill in plan.suite?.skills" :key="skill.id"><strong>{{ skill.title }}</strong><p>{{ skill.instructions }}</p></li></ul><p class="field-note">工具：本机 PID 解算、AI 有界反馈建议。套组是可分享的结构化配置。</p><details class="base-prompt"><summary>查看场景基础提示词</summary><p>{{ plan.suite?.prompt }}</p></details></div></details>
         </fieldset>
         <div v-else class="result-pane">
           <p class="field-note">{{ connectionLabel }} · {{ currentProposal?.evidence?.tool === 'pid-solver' ? '本机模型计算' : !connected ? '离线' : props.demo ? '演示遥测' : '设备遥测' }}</p><p v-if="isWorking" class="working-message" role="status">{{ autoProgress || '正在处理当前轮次；配置暂时锁定' }}</p>
-          <section v-if="currentProposal" class="proposal-review" aria-label="参数候选"><div class="result-heading"><h3>{{ currentProposal.evidence?.tool === 'pid-solver' ? '本机模型计算候选' : 'AI 反馈候选' }}</h3><span>{{ trialStateName(currentProposal.status) }}</span></div><p class="proposal-rationale">{{ proposalRationale }}</p><p class="field-note">{{ currentParams ? currentParamsLabel : '尚未配置设备基线；左列 0 仅为计算参考。' }}</p><div class="parameter-comparison"><div v-for="key in activeParameters" :key="key"><strong>{{ key.toUpperCase() }}</strong><code>{{ format(currentProposal.before[key]) }}</code><span>→</span><code>{{ format(currentProposal.candidate[key]) }}</code></div></div><template v-if="validateTuningCommandPayload(currentProposal.commandPayload,currentProposal.command)"><p class="field-note">UTF-8 · {{ currentProposal.commandPayload!.byteLength }} 字节 · 行尾 {{ currentProposal.commandPayload!.format.lineEnding.toUpperCase() }} · {{ currentProposal.commandPayload!.format.escapeText ? '解析转义' : '保留字面字符' }}</p><pre class="command-preview" aria-label="最终发送字节的可见文本"><code>{{ currentProposal.commandPayload!.visibleText }}</code></pre><details class="wire-details"><summary>查看最终 HEX 字节</summary><pre class="command-preview"><code>{{ currentProposal.commandPayload!.hex }}</code></pre></details></template><p v-else-if="currentProposal.command" class="field-error">此候选缺少有效的最终字节预览，请重新生成后再核对发送。</p><p v-if="currentProposal.status === 'proposed' && !isTrialForPlan(currentProposal,plan,globalChannelStore.getGeneration())" class="field-error">配置已变化，重新生成候选后才能发送。</p><div v-if="currentProposal.status === 'proposed' && !isWorking" class="proposal-actions"><button type="button" class="secondary-button" :disabled="!executionEnabled || planErrors.length > 0 || !validateTuningCommandPayload(currentProposal.commandPayload,currentProposal.command) || !isTrialForPlan(currentProposal,plan,globalChannelStore.getGeneration())" @click="sendManualTrial(currentProposal)">核对命令并发送</button><button type="button" class="text-button" @click="currentProposal.status = 'rejected'; pendingTrialId = null">忽略候选</button></div><p v-if="currentProposal.status === 'queued'" class="field-note">仅已排队，驱动写入与设备生效尚未确认。</p><template v-if="executionEnabled && currentProposal.status === 'sent' && plan.confirmation.mode === 'manual'"><label class="check-field"><input v-model="manualConfirmation" type="checkbox"><span>我已在设备上核对，这组参数已生效。</span></label><button type="button" class="secondary-button" :disabled="!manualConfirmation || !awaitingManualConfirmation || stopRequested" @click="confirmManualTrial">确认并观察遥测</button></template><p v-else-if="currentProposal.status === 'sent'" class="field-note">等待{{ confirmationLabel(plan.confirmation.mode) }}，超时暂停。</p><dl v-if="currentProposal.metrics" class="trial-metrics"><div><dt>{{ plan.goal.mode === 'track' ? 'RMS 跟踪误差' : '稳态误差' }}</dt><dd>{{ format(plan.goal.mode === 'track' ? currentProposal.metrics.rmsTrackingError : currentProposal.metrics.steadyError,4) }} {{ plan.units.feedback }}</dd></div><div><dt>最大输出</dt><dd>{{ format(currentProposal.metrics.maximumOutputMagnitude) }} {{ plan.units.output }}</dd></div><div v-if="currentProposal.metrics.overshootPercent !== null"><dt>实测超调</dt><dd>{{ format(currentProposal.metrics.overshootPercent,2) }}%</dd></div></dl></section>
+          <section v-if="currentProposal" class="proposal-review" aria-label="参数候选"><div class="result-heading"><h3>{{ currentProposal.evidence?.tool === 'pid-solver' ? '本机模型计算候选' : 'AI 反馈候选' }}</h3><span>{{ trialStateName(currentProposal.status) }}</span></div><p class="proposal-rationale">{{ proposalRationale }}</p><p class="field-note">{{ currentParams ? currentParamsLabel : '尚未配置设备基线；左列 0 仅为计算参考。' }}</p><div class="parameter-comparison"><div v-for="key in activeParameters" :key="key"><strong>{{ key.toUpperCase() }}</strong><code>{{ format(currentProposal.before[key]) }}</code><span>→</span><code>{{ format(currentProposal.candidate[key]) }}</code></div></div><template v-if="validateTuningCommandPayload(currentProposal.commandPayload,currentProposal.command)"><p class="field-note">UTF-8 · {{ currentProposal.commandPayload!.byteLength }} 字节 · 行尾 {{ currentProposal.commandPayload!.format.lineEnding.toUpperCase() }} · {{ currentProposal.commandPayload!.format.escapeText ? '解析转义' : '保留字面字符' }}</p><pre class="command-preview" aria-label="最终发送字节的可见文本"><code>{{ currentProposal.commandPayload!.visibleText }}</code></pre><details class="wire-details"><summary>查看最终 HEX 字节</summary><pre class="command-preview"><code>{{ currentProposal.commandPayload!.hex }}</code></pre></details></template><p v-else-if="currentProposal.command" class="field-error">此候选缺少有效的最终字节预览，请重新生成后再核对发送。</p><p v-if="currentProposal.status === 'proposed' && !isTrialForPlan(currentProposal,plan,globalChannelStore.getGeneration())" class="field-error">配置已变化，重新生成候选后才能发送。</p><div v-if="currentProposal.status === 'proposed' && !operationBusy" class="proposal-actions"><button type="button" class="secondary-button" :disabled="!executionEnabled || planErrors.length > 0 || !validateTuningCommandPayload(currentProposal.commandPayload,currentProposal.command) || !isTrialForPlan(currentProposal,plan,globalChannelStore.getGeneration())" @click="sendManualTrial(currentProposal)">核对命令并发送</button><button type="button" class="text-button" @click="currentProposal.status = 'rejected'; pendingTrialId = null">忽略候选</button></div><p v-if="currentProposal.status === 'queued'" class="field-note">仅已排队，驱动写入与设备生效尚未确认。</p><template v-if="executionEnabled && currentProposal.status === 'sent' && plan.confirmation.mode === 'manual'"><label class="check-field"><input v-model="manualConfirmation" type="checkbox"><span>我已在设备上核对，这组参数已生效。</span></label><button type="button" class="secondary-button" :disabled="!manualConfirmation || !awaitingManualConfirmation || stopRequested" @click="confirmManualTrial">确认并观察遥测</button></template><p v-else-if="currentProposal.status === 'sent'" class="field-note">等待{{ confirmationLabel(plan.confirmation.mode) }}，超时暂停。</p><dl v-if="currentProposal.metrics" class="trial-metrics"><div><dt>{{ plan.goal.mode === 'track' ? 'RMS 跟踪误差' : '稳态误差' }}</dt><dd>{{ format(plan.goal.mode === 'track' ? currentProposal.metrics.rmsTrackingError : currentProposal.metrics.steadyError,4) }} {{ plan.units.feedback }}</dd></div><div><dt>最大输出</dt><dd>{{ format(currentProposal.metrics.maximumOutputMagnitude) }} {{ plan.units.output }}</dd></div><div v-if="currentProposal.metrics.overshootPercent !== null"><dt>实测超调</dt><dd>{{ format(currentProposal.metrics.overshootPercent,2) }}%</dd></div></dl></section>
           <div v-else class="result-empty"><h3>在波形旁审阅参数候选</h3><p>每轮记录计算依据、命令写入、设备确认和遥测评价。候选与设备结果分别标记。</p><button type="button" class="text-button" @click="assistantPane = 'setup'">返回场景与设置</button></div>
-          <details class="settings-section" :open="session.trials.length > 0"><summary>试验记录 <span>{{ session.trials.length }} 轮</span></summary><div class="details-body"><ol v-if="session.trials.length" class="trial-list"><li v-for="trial in session.trials.slice(0,30)" :key="trial.id"><div><time>{{ formatTimestamp(trial.createdAt) }}</time><span>{{ trialStateName(trial.status) }}</span></div><code>Kp {{ format(trial.candidate.kp) }} · Ki {{ format(trial.candidate.ki) }} · Kd {{ format(trial.candidate.kd) }}</code><p>{{ trial.metrics ? `${trial.metrics.sampleCount} 点设备遥测 · 误差 ${format(trial.metrics.steadyError,4)}` : trial.status === 'rejected' ? trial.note : trial.confirmation || '尚未设备确认 / 评价' }}</p></li></ol><p v-else class="field-note">还没有候选。配置后可先审阅一轮。</p><button v-if="session.bestVerified" type="button" class="text-button" :disabled="isWorking || aiBusy || modelBusy" @click="useLastVerified">载入最佳实测验证参数</button></div></details>
+          <details class="settings-section" :open="session.trials.length > 0"><summary>试验记录 <span>{{ session.trials.length }} 轮</span></summary><div class="details-body"><ol v-if="session.trials.length" class="trial-list"><li v-for="trial in session.trials.slice(0,30)" :key="trial.id"><div><time>{{ formatTimestamp(trial.createdAt) }}</time><span>{{ trialStateName(trial.status) }}</span></div><code>Kp {{ format(trial.candidate.kp) }} · Ki {{ format(trial.candidate.ki) }} · Kd {{ format(trial.candidate.kd) }}</code><p>{{ trial.metrics ? `${trial.metrics.sampleCount} 点设备遥测 · 误差 ${format(trial.metrics.steadyError,4)}` : trial.status === 'rejected' ? trial.note : trial.confirmation || '尚未设备确认 / 评价' }}</p></li></ol><p v-else class="field-note">还没有候选。配置后可先审阅一轮。</p><button v-if="session.bestVerified" type="button" class="text-button" :disabled="operationBusy || isWorking || aiBusy || modelBusy" @click="useLastVerified">载入最佳实测验证参数</button></div></details>
           <p v-if="session.stopReason" class="notice notice-warning">{{ session.stopReason }}</p><div v-if="plan.route === 'feedback' && openIssues.length" class="execution-check"><strong>发送与试验前待完成</strong><ul><li v-for="issue in openIssues" :key="issue">{{ issue }}</li></ul><button type="button" class="text-button" @click="openDeviceSettings">完善执行设置</button></div><div v-if="plan.route === 'model'" class="offline-execution-note"><p class="field-note">模型计算结果与设备验证分别记录。准备设备试验时，再核对串口变量、参数边界与设备确认。</p><p v-if="openIssues.length" class="field-note">设备试验待完成：{{ openIssues[0] }}</p><button type="button" class="text-button" @click="openDeviceSettings">查看设备试验设置</button></div>
         </div>
       </template>
-      <details class="suite-management"><summary>套组管理</summary><div class="suite-tools"><button type="button" :disabled="isWorking || aiBusy || modelBusy" @click="importInput?.click()">导入套组</button><button type="button" :disabled="!selectedSuite || isWorking" @click="exportPackage">导出套组</button><button type="button" :disabled="isWorking || aiBusy || modelBusy" @click="newExperiment">新建</button></div></details>
+      <details class="suite-management"><summary>套组管理</summary><div class="suite-tools"><button type="button" :disabled="operationBusy || isWorking || aiBusy || modelBusy" @click="importInput?.click()">导入套组</button><button type="button" :disabled="!selectedSuite || operationBusy" @click="exportPackage">导出套组</button><button type="button" :disabled="operationBusy || isWorking || aiBusy || modelBusy" @click="newExperiment">新建</button></div></details>
     </div>
-    <footer v-if="selectedSuite && (assistantPane === 'setup' || isWorking)" class="scene-footer"><details v-if="candidateErrors.length || stageErrors.length" class="preflight-summary"><summary>还需完成 {{ candidateErrors.length + stageErrors.length }} 项信息</summary><ul><li v-for="issue in [...candidateErrors,...stageErrors]" :key="issue">{{ issue }}</li></ul><button type="button" class="text-button" @click="openCandidateSettings">{{ plan.route === 'model' ? '查看计算配置' : '展开执行配置' }}</button></details><p v-else-if="!executionEnabled" class="field-note">可审阅候选。实机执行需开启采集、设备保护与本次授权。</p><div class="main-actions"><button v-if="isWorking" type="button" class="stop-button" @click="requestStop()">停止调参流程</button><template v-else-if="plan.route === 'feedback' && plan.mode === 'bounded-auto'"><button type="button" class="primary-button" :disabled="!experimentCanStart || aiBusy || modelBusy || stageErrors.length > 0" @click="assistantPane = 'result'; runBoundedExperiment()">{{ aiBusy ? '正在请求候选…' : '检查并启动自动反馈' }}</button><button type="button" class="text-button" :disabled="!canProposeCandidate || aiBusy || modelBusy || stageErrors.length > 0" @click="generateManualCandidate">先审阅一轮</button></template><button v-else type="button" class="primary-button" :disabled="!canProposeCandidate || aiBusy || modelBusy || stageErrors.length > 0" @click="generateManualCandidate">{{ aiBusy ? '正在请求候选…' : plan.route === 'model' ? '计算 PID 候选' : '生成本轮 AI 候选' }}</button></div></footer>
+    <footer v-if="selectedSuite && (assistantPane === 'setup' || operationBusy)" class="scene-footer"><details v-if="candidateErrors.length || stageErrors.length" class="preflight-summary"><summary>还需完成 {{ candidateErrors.length + stageErrors.length }} 项信息</summary><ul><li v-for="issue in [...candidateErrors,...stageErrors]" :key="issue">{{ issue }}</li></ul><button type="button" class="text-button" @click="openCandidateSettings">{{ plan.route === 'model' ? '查看计算配置' : '展开执行配置' }}</button></details><p v-else-if="!executionEnabled" class="field-note">可审阅候选。实机执行需开启采集、设备保护与本次授权。</p><div class="main-actions"><button v-if="operationBusy" type="button" class="stop-button" @click="requestStop()">{{ isWorking ? '停止调参流程' : '取消本次请求' }}</button><template v-else-if="plan.route === 'feedback' && plan.mode === 'bounded-auto'"><button type="button" class="primary-button" :disabled="!experimentCanStart || operationBusy || aiBusy || modelBusy || stageErrors.length > 0" @click="assistantPane = 'result'; runBoundedExperiment()">{{ aiBusy ? '正在请求候选…' : '检查并启动自动反馈' }}</button><button type="button" class="text-button" :disabled="!canProposeCandidate || operationBusy || aiBusy || modelBusy || stageErrors.length > 0" @click="generateManualCandidate">先审阅一轮</button></template><button v-else type="button" class="primary-button" :disabled="!canProposeCandidate || operationBusy || aiBusy || modelBusy || stageErrors.length > 0" @click="generateManualCandidate">{{ aiBusy ? '正在请求候选…' : plan.route === 'model' ? '计算 PID 候选' : '生成本轮 AI 候选' }}</button></div></footer>
     <input ref="importInput" class="visually-hidden" type="file" accept="application/json,.json" @change="importPackage">
   </section>
 </template>

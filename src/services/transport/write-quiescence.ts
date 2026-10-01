@@ -145,10 +145,13 @@ export class WriteQuiescenceTracker {
     this.publish();
   }
 
-  async wait(timeoutMs = 5000): Promise<WriteQuiescenceResult> {
+  async wait(timeoutMs = 5000, signal?: AbortSignal): Promise<WriteQuiescenceResult> {
     const generation = this.generation;
     const deadline = Date.now() + Math.min(30_000, Math.max(0, Number.isFinite(timeoutMs) ? timeoutMs : 5000));
     for (;;) {
+      // Canceling an experiment abandons only this observation. The actual
+      // driver calls, queued receipts and uncertainty latch remain untouched.
+      if (signal?.aborted) return { ready: false, reason: '当前实验已取消等待写入；实际驱动写入状态仍需核对。' };
       if (generation !== this.generation) return { ready: false, reason: '等待写入期间设备或解析会话已变化；原授权不能继续。' };
       const state = this.snapshot();
       if (!state.connected) return { ready: false, reason: '当前串口没有连接，不能确认写入队列已排空。' };
@@ -158,7 +161,16 @@ export class WriteQuiescenceTracker {
         this.latch('等待驱动最终写入回执超时，队列是否已排空未知；请重新连接并核对设备。');
         return { ready: false, reason: this.error! };
       }
-      await new Promise(resolve => setTimeout(resolve, Math.min(20, Math.max(1, deadline - Date.now()))));
+      await new Promise<void>((resolve) => {
+        const finish = () => {
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, Math.min(20, Math.max(1, deadline - Date.now())));
+        signal?.addEventListener('abort', finish, { once: true });
+        if (signal?.aborted) finish();
+      });
     }
   }
 

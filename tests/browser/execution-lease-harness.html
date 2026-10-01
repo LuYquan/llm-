@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>实际 App · 候选并发与执行租约验收</title></head>
+<body><div id="app"></div><section id="fixture-bar" aria-label="执行租约合成夹具">
+  <strong>真实 App / Worker · 合成字节与本地 HTTP · 无硬件 / 云 AI</strong>
+  <label>测试分支 <select id="fixture-case"><option value="overlap-send">候选 A 与延迟 B 并发发送</option><option value="stop-candidate">取消候选请求与迟到响应</option><option value="restart-owner">停止后独立新 owner</option></select></label>
+  <button id="prepare-case">准备分支并重载</button><button id="release-http">放行延迟候选请求</button><button id="immediate-next">下一候选请求立即响应</button><button id="hold-next">下一候选请求保持延迟</button><button id="complete-write">完成当前合成参数写入</button><button id="capture-proof">记录实际 App 证据</button>
+  <output id="fixture-control-status" aria-label="执行租约夹具控制状态"></output><details><summary>机器证据</summary><output id="fixture-proof" aria-label="执行租约夹具机器证据"></output></details>
+</section><script type="module" src="./execution-lease-harness.ts"></script></body></html>

@@ -41,14 +41,15 @@ import {
 import { RecordingReplayController } from './services/recording/replay-controller';
 import type { SerialSettings, Unsubscribe, WriteReceipt, WriteResultEvent } from './services/transport/types';
 import type { ProtocolConfig } from './core/protocol/types';
-import type { RxDispatch, RxOrigin, StepSnapshot } from './types/ipc';
+import type { RxOrigin, StepSnapshot } from './types/ipc';
 import {
   buildWorkspaceDocument,
   previewWorkspaceDocument,
   type WorkspaceDocument,
 } from './services/workspace/document';
 import { runWorkspaceTransaction } from './services/workspace/transaction';
-import { tuningCommandBytes, type TuningCommandPayload } from './core/tuning/commandContract';
+import { tuningCommandBytes } from './core/tuning/commandContract';
+import { TuningExecutionLease, type TuningExecutionState, type TuningSendRequest, type TuningWriteResult } from './core/tuning/execution-lease';
 
 interface AppConfig {
   port_name: string | null;
@@ -76,19 +77,13 @@ const copilotVisited = ref(false);
 const recordingsVisited = ref(false);
 const isTuningBusy = ref(false);
 const tuningWriteAccessReady = ref(true);
+const tuningWriteAccessExecutionId = ref<string | null>(null);
 const ordinaryWriteRevision = ref(0);
 const pendingSignalChanges = ref(0);
 const tuningStopToken = ref(0);
-const tuningWriteResult = ref<{
-  id: string;
-  requestId?: string;
-  sessionId?: string;
-  epoch?: number;
-  rxDispatch?: RxDispatch;
-  status: 'queued' | 'written' | 'failed';
-  at: number;
-  error?: string;
-} | null>(null);
+const tuningWriteResult = ref<TuningWriteResult | null>(null);
+const lateTuningWriteResult = ref<TuningWriteResult | null>(null);
+const tuningWriteOwners = new Map<string, { executionId: string; trialId: string }>();
 const isStreamPaused = ref(false);
 const isAcquiring = ref(false);
 const connectionState = ref<'connected' | 'disconnected' | 'connecting' | 'reconnecting' | 'error'>('disconnected');
@@ -147,7 +142,10 @@ provide(CHART_EVIDENCE_CONTEXT, computed(() => ({
   canReview: !isTuningBusy.value && !isApplyingProtocol.value,
   disabledReason: isTuningBusy.value ? '先停止当前参数实验，再审阅选区。' : isApplyingProtocol.value ? '协议切换完成后重新选择区间。' : '',
 })));
-const clearAssistantOnChannelClear = globalChannelStore.onCleared(() => clearEvidenceSelection());
+const clearAssistantOnChannelClear = globalChannelStore.onCleared(() => {
+  clearEvidenceSelection();
+  cancelChangedTuningContext();
+});
 watch(assistantEvidenceSelection, (selection) => {
   if (!selection) return;
   if (isTuningBusy.value || isApplyingProtocol.value) {
@@ -345,16 +343,19 @@ function rememberWriteResult(result: WriteResultEvent) {
   if (trackedWriteRequests.has(result.request_id) || result.source === 'software_stop') {
     reportWriteResult(result);
   }
-  if (tuningWriteResult.value?.requestId === result.request_id) {
-    tuningWriteResult.value = {
-      ...tuningWriteResult.value,
+  const tuningOwner = tuningWriteOwners.get(result.request_id);
+  if (tuningOwner) {
+    publishTuningWriteResult({
+      id: tuningOwner.trialId,
+      executionId: tuningOwner.executionId,
+      requestId: result.request_id,
       sessionId: result.session_id,
       epoch: result.epoch,
       rxDispatch: result.rx_dispatch,
       status: result.status === 'written' ? 'written' : 'failed',
       error: result.status === 'written' ? undefined : result.reason || `写入状态：${result.status}`,
       at: Date.now(),
-    };
+    });
   }
 }
 
@@ -1015,7 +1016,7 @@ function handleKeyDown(event: KeyboardEvent) {
   }
 
   event.preventDefault();
-  triggerEmergencyStop();
+  void triggerEmergencyStop('keyboard');
 }
 
 // ADR 0004 急停发送状态机
@@ -1029,8 +1030,10 @@ function reportSoftwareStopFailure(error: unknown) {
   resetEmergencyTimer();
 }
 
-async function triggerEmergencyStop() {
+async function triggerEmergencyStop(source: unknown = 'control') {
+  const sourceLabel = source === 'keyboard' ? '全局空格键' : source === 'tuning' ? '调参安全检查' : '停止控件';
   if (!isTuningBusy.value) ordinaryWriteRevision.value += 1;
+  tuningExecutionLease.cancel();
   tuningStopToken.value += 1;
   const cmd = appConfig.value.emergency_command?.trim();
 
@@ -1061,7 +1064,7 @@ async function triggerEmergencyStop() {
     emergencyToastDesc.value = `普通发送已锁定；端口未打开，设备停止字节 [${cmd}] 未发送。`;
     emergencyToastLevel.value = 'error';
     showEmergencyToast.value = true;
-    appendLog('error', '[EMERGENCY]', `全局空格键触发：串口未打开，急停指令未送达: ${cmd} (ADR 0004)。`);
+    appendLog('error', '[EMERGENCY]', `${sourceLabel}触发：串口未打开，急停指令未送达: ${cmd} (ADR 0004)。`);
     resetEmergencyTimer();
     return;
   }
@@ -1072,7 +1075,7 @@ async function triggerEmergencyStop() {
     emergencyToastDesc.value = `文本停止命令 [${cmd}] 已提交到本地串口发送线程；驱动写入结果尚待回执，且不代表设备已收到或已停止。普通发送仍保持锁定。`;
     emergencyToastLevel.value = 'warn';
     showEmergencyToast.value = true;
-    appendLog('warn', '[EMERGENCY]', `全局空格键触发：停止字节已提交到本地发送线程，驱动写入待回执：${cmd}。`);
+    appendLog('warn', '[EMERGENCY]', `${sourceLabel}触发：停止字节已提交到本地发送线程，驱动写入待回执：${cmd}。`);
     resetEmergencyTimer();
   } catch (err: any) {
     emergencyToastTitle.value = '急停发送失败 (ADR 0004)';
@@ -1086,7 +1089,7 @@ async function triggerEmergencyStop() {
 
 function handleTuningSafetyStop(reason: string) {
   appendLog('error', '[TUNING SAFETY]', reason);
-  void triggerEmergencyStop();
+  void triggerEmergencyStop('tuning');
 }
 
 function resetEmergencyTimer() {
@@ -1145,7 +1148,9 @@ async function handleSendSerialData(data: string, isHex: boolean, appendNewline:
   }
 }
 
-async function handleTuningSend(request: { trialId: string; command: string; payload: TuningCommandPayload }) {
+async function handleTuningSend(request: TuningSendRequest) {
+  // A retired component task must not clear or overwrite a newer task's receipt.
+  if (!tuningExecutionLease.owns(request.executionId)) return;
   tuningWriteResult.value = null;
   try {
     if (!isRunning.value) throw new Error('串口未连接，参数命令没有发送。');
@@ -1154,11 +1159,13 @@ async function handleTuningSend(request: { trialId: string; command: string; pay
     if (mode.value === 'mock') throw new Error('当前为演示数据源，无法验证设备控制，参数命令没有发送。');
     if (!appConfig.value.emergency_command?.trim()) throw new Error('请先配置设备停止命令，再授权参数实验。');
     if (session.softwareStopLocked.value) throw new Error('软件停止已锁定发送，参数命令没有发送。');
-    if (!isTuningBusy.value || !tuningWriteAccessReady.value) throw new Error('本轮实验未取得独占写入权限，参数命令没有发送。');
+    if (!tuningExecutionLease.hasWriteAccess(request.executionId)) throw new Error('本轮实验未取得独占写入权限，参数命令没有发送。');
     // The reviewed payload owns escaping and line endings. Write these exact
     // bytes through the shared barrier without a second text transformation.
     const bytes = tuningCommandBytes(request.payload, request.command);
     const result = await session.write(bytes);
+    tuningWriteOwners.set(result.request_id, { executionId: request.executionId, trialId: request.trialId });
+    if (tuningWriteOwners.size > 256) tuningWriteOwners.delete(tuningWriteOwners.keys().next().value!);
     reportWriteReceipt(result, result.status === 'queued' ? '[TX:TUNING_QUEUED]' : '[TX:TUNING_WRITTEN]', request.payload.visibleText);
     const completed = result.status === 'queued'
       ? await waitForWriteResult(result.request_id, 3000)
@@ -1166,8 +1173,9 @@ async function handleTuningSend(request: { trialId: string; command: string; pay
     const status = completed
       ? completed.status === 'written' ? 'written' : 'failed'
       : result.status;
-    tuningWriteResult.value = {
+    publishTuningWriteResult({
       id: request.trialId,
+      executionId: request.executionId,
       requestId: result.request_id,
       sessionId: completed?.session_id ?? result.session_id,
       epoch: completed?.epoch ?? result.epoch,
@@ -1177,33 +1185,57 @@ async function handleTuningSend(request: { trialId: string; command: string; pay
       error: completed && completed.status !== 'written'
         ? completed.reason || `参数写入状态为 ${completed.status}`
         : undefined,
-    };
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     appendLog('error', '[TX:TUNING_ERR]', `参数命令发送失败: ${message}`);
-    tuningWriteResult.value = { id: request.trialId, status: 'failed', at: Date.now(), error: message };
+    publishTuningWriteResult({ id: request.trialId, executionId: request.executionId, status: 'failed', at: Date.now(), error: message });
   }
 }
 
-async function handleTuningExecutionState(working: boolean) {
-  isTuningBusy.value = working;
-  if (working) {
-    tuningWriteAccessReady.value = false;
-    await globalSendGate.acquireExperimentLock();
-    if (!isTuningBusy.value) return;
-    const drained = await session.waitForWriteQuiescence(5000);
-    if (!isTuningBusy.value) return;
-    if (!drained.ready) {
-      appendLog('error', '[TUNING QUEUE]', drained.reason || '普通命令的驱动写入状态尚未明确，实验不会取得写入权。');
-      tuningStopToken.value += 1;
-      return;
-    }
-    tuningWriteAccessReady.value = true;
-    return;
-  }
-  globalSendGate.releaseExperimentLock();
-  tuningWriteAccessReady.value = true;
+function publishTuningWriteResult(result: TuningWriteResult) {
+  if (tuningExecutionLease.owns(result.executionId)) tuningWriteResult.value = result;
+  else lateTuningWriteResult.value = result;
 }
+
+function tuningExecutionContext(): string {
+  const context = globalChannelStore.getSessionContext();
+  return JSON.stringify([context.sessionId, context.epoch, globalChannelStore.getGeneration(),
+    selectedPort.value, selectedBaud.value, mode.value, isRunning.value, isAcquiring.value,
+    isApplyingProtocol.value, session.softwareStopLocked.value, appConfig.value.serial_settings]);
+}
+
+const tuningExecutionLease = new TuningExecutionLease({
+  context: tuningExecutionContext,
+  acquire: (owner, signal) => globalSendGate.acquireExperimentLock(owner, signal),
+  drain: (signal) => session.waitForWriteQuiescence(5000, signal),
+  release: (owner) => globalSendGate.releaseExperimentLock(owner),
+  changed: (state) => {
+    isTuningBusy.value = Boolean(state);
+    tuningWriteAccessReady.value = state?.ready ?? true;
+    tuningWriteAccessExecutionId.value = state?.ready ? state.executionId : null;
+  },
+  failed: (reason) => {
+    appendLog('error', '[TUNING QUEUE]', reason);
+    tuningStopToken.value += 1;
+  },
+});
+
+function handleTuningExecutionState(state: TuningExecutionState) {
+  if (state.working) void tuningExecutionLease.start(state.executionId);
+  else tuningExecutionLease.finish(state.executionId);
+}
+
+function cancelChangedTuningContext() {
+  if (tuningExecutionLease.cancelChangedContext()) {
+    appendLog('warn', '[TUNING CONTEXT]', '连接、采集或解析上下文已变化，本次实验写入授权已撤销。');
+    tuningStopToken.value += 1;
+  }
+}
+
+watch([isRunning, isAcquiring, isApplyingProtocol, selectedPort, selectedBaud, mode,
+  session.softwareStopLocked, () => JSON.stringify(appConfig.value.serial_settings)],
+cancelChangedTuningContext, { flush: 'sync' });
 
 function openSceneAssistant() {
   analysisOpen.value = false;
@@ -1597,6 +1629,7 @@ watch(isRunning, (val) => {
 });
 
 onUnmounted(() => {
+  tuningExecutionLease.cancel();
   clearAssistantOnChannelClear();
   clearEvidenceSelection();
   recordingReplayController.close();
@@ -1834,8 +1867,10 @@ onUnmounted(() => {
         :protocol-config="appConfig.protocol_config"
         :logs="logs"
         :write-result="tuningWriteResult"
+        :late-write-result="lateTuningWriteResult"
         :stop-token="tuningStopToken"
         :write-access-ready="tuningWriteAccessReady"
+        :write-access-execution-id="tuningWriteAccessExecutionId"
         :ordinary-write-revision="ordinaryWriteRevision"
         :ordinary-writes-ready="session.writesReady.value && pendingSignalChanges === 0 && !isApplyingProtocol"
         :execution-enabled="isRunning && isAcquiring && !isApplyingProtocol && mode !== 'mock' && Boolean(appConfig.emergency_command?.trim()) && !session.softwareStopLocked.value"

@@ -13,6 +13,7 @@
     <header class="fixture-header">
       <h1>场景调参 · 合成协议交互夹具</h1>
       <p class="disclaimer">真实 Vue 组件、协议解析器、调参服务和本地 AI HTTP 响应；串口驱动、设备响应、遥测与授权点击均为合成测试。结果不构成原生界面或硬件验收。此页仅运行于独立 localhost:5191，不读取应用来源的设置、密钥或用户数据。</p>
+      <p class="disclaimer">合成时间契约：对象每 10 ms 产生样本，浏览器每 100 ms 投递有界缓冲批次，并调用公开 ChannelStore.flushDispatch 分发给订阅者；授权的遥测最大延迟为 5 秒。超过 5 秒的浏览器停顿记为测试失败。外部观察异步完成和持久化最多等待 30 秒，逐段记录等待事件；此观察上限不改变产品的确认、采集或保护时限。独立过期用例在有效设备确认后停止遥测，并验证真实 5 秒保护停止和无下一次下发。</p>
       <div class="controls"><select id="case-select" aria-label="交互用例"></select><button id="prepare-case">准备所选用例（手动交互）</button><button id="run-case">运行所选合成交互</button><button id="run-all">运行全部合成交互</button></div>
     </header>
     <div class="layout">

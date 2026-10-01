@@ -1,4 +1,4 @@
-import type { TuningSession } from './types';
+import type { TuningSession, TuningTrial } from './types';
 import { validatePlanShape } from './engine';
 
 const STORAGE_KEY = 'llm-serial-tuning-sessions-v1';
@@ -76,6 +76,47 @@ export function saveTuningSession(session: TuningSession): boolean {
   } catch {
     return false;
   }
+}
+
+export type TuningTrialReceiptPatch = Partial<Pick<TuningTrial, 'confirmation' | 'writeRequestId'
+  | 'writeSessionId' | 'writeEpoch' | 'writeRxDispatch' | 'writeCompletedAt'>> & { status?: 'failed' };
+
+/** A retired write may update its historical trial, never a whole old draft. */
+export function updateTuningTrialReceipt(sessionId: string, trialId: string, patch: TuningTrialReceiptPatch): boolean {
+  try {
+    const identity = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.trim() === value && value.length <= 160;
+    if (!identity(sessionId) || !identity(trialId) || !patch || typeof patch !== 'object' || Array.isArray(patch)) return false;
+    const fields = new Set(['status', 'confirmation', 'writeRequestId', 'writeSessionId', 'writeEpoch', 'writeRxDispatch', 'writeCompletedAt']);
+    if (Object.keys(patch).some(field => !fields.has(field)) || patch.status !== undefined && patch.status !== 'failed'
+      || patch.confirmation !== undefined && (typeof patch.confirmation !== 'string' || patch.confirmation.length > 4000)
+      || patch.writeCompletedAt !== undefined && (!Number.isFinite(patch.writeCompletedAt) || patch.writeCompletedAt < 0)) return false;
+    if (!identity(patch.writeRequestId) || !identity(patch.writeSessionId) || !Number.isSafeInteger(patch.writeEpoch) || patch.writeEpoch! < 0) return false;
+    if (patch.writeRxDispatch !== undefined) {
+      const dispatch = patch.writeRxDispatch;
+      if (!dispatch || typeof dispatch !== 'object' || Array.isArray(dispatch)
+        || Object.keys(dispatch).length !== 4 || Object.keys(dispatch).some(key => !['source', 'session_id', 'epoch', 'rx_sequence'].includes(key))
+        || !['serial-read', 'web-serial-read'].includes(dispatch.source)
+        || dispatch.session_id !== patch.writeSessionId || dispatch.epoch !== patch.writeEpoch
+        || !Number.isSafeInteger(dispatch.rx_sequence) || dispatch.rx_sequence < 0) return false;
+    }
+    const raw: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+    const sessions = Array.isArray(raw) ? raw : [raw];
+    const index = sessions.findIndex(value => isTuningSession(value) && value.id === sessionId);
+    if (index < 0) return false;
+    const latest = sessions[index] as TuningSession;
+    const trial = latest.trials.find(value => value.id === trialId);
+    if (!trial || !Number.isFinite(trial.writeStartedAt) || trial.writeStartedAt! < 0
+      || trial.writeRequestId && trial.writeRequestId !== patch.writeRequestId
+      || trial.writeSessionId && trial.writeSessionId !== patch.writeSessionId
+      || trial.writeEpoch !== undefined && trial.writeEpoch !== patch.writeEpoch) return false;
+    if (patch.writeCompletedAt !== undefined && trial.writeCompletedAt !== undefined
+      && ['confirmed', 'evaluated'].includes(trial.status)) return true;
+    const updated = { ...latest, trials: latest.trials.map(value => value.id === trialId ? { ...value, ...patch } : value), updatedAt: Date.now() };
+    if (!isTuningSession(updated)) return false;
+    sessions[index] = updated;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
+    return true;
+  } catch { return false; }
 }
 
 function isTuningSession(value: unknown): value is TuningSession {
