@@ -21,7 +21,7 @@ export function runWorkspaceDocumentTests() {
       provider: 'deepseek',
       api_url: 'https://api.deepseek.com/v1',
       model: 'deepseek-chat',
-      api_key: 'sk-secret-must-not-leak',
+      api_key: 'sk-test-placeholder-invalid',
     },
     dashboard: createDefaultVofaPreset(),
     projectModel: BUILTIN_PROJECT_TEMPLATES.generic_single(),

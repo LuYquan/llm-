@@ -187,7 +187,7 @@ export async function runAiModelsTests() {
         {
           provider: 'custom',
           api_url: 'https://example.test/v1',
-          api_key: 'sk-renderer-must-not-be-forwarded',
+          api_key: 'sk-test-placeholder-invalid',
           api_key_configured: true,
           model: 'test',
         },
@@ -205,7 +205,7 @@ export async function runAiModelsTests() {
       const models = await fetchAvailableModels({
         provider: 'custom',
         api_url: 'https://example.test/v1',
-        api_key: 'sk-models-must-not-be-forwarded',
+        api_key: 'sk-test-placeholder-invalid',
         api_key_configured: true,
       });
       assert.strictEqual(invokedCommand, 'fetch_ai_models');

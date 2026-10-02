@@ -1,16 +1,5 @@
-# VOFA AI development preparation; old app is archived under reference/.
 # Dependencies
 node_modules/
-
-# Local tools and archive-only material
-/.agents/
-/.codegraph/
-/reference/legacy-llm-serial/release/
-/reference/legacy-llm-serial/implementation-checkpoint-2026-09-28-stage-a/
-/reference/retained-build-artifacts/
-/maintenance/2026-10-02-vofa-transition/*.json
-/maintenance/2026-10-02-vofa-transition/empty-git-excludes
-/maintenance/2026-10-02-vofa-transition/publication/
 
 # Production build outputs
 dist/
@@ -25,7 +14,6 @@ data/
 
 # Rust / Tauri build outputs
 src-tauri/target/
-target/
 
 # Logs
 *.log

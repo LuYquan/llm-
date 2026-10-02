@@ -1,0 +1,2 @@
+# 保持串口测试数据集的原始二进制与换行符不变
+tests/fixtures/stream/*.raw binary
