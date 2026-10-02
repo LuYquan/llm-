@@ -73,4 +73,6 @@ npm run check:advisories:strict
 
 构建证据位于 `output/builds/<构建编号>/`，包含检查结果、日志、输入文件摘要与最终产物哈希。程序清单位于便携包的 `build-manifest.json`。源码测试、浏览器运行、原生启动与硬件验收是不同证据层级，请以本次验收报告为准。
 
+当前产品既有 Windows 桌面包，也有浏览器 Web Serial 路径。GitHub 源码提交不会自动生成公开下载或公网网站；对外提供 Windows Beta、部署 HTTPS 网页及配置 AI 服务的步骤见[项目交接与公开使用说明](MODEL_HANDOFF_2026-09-28.md)，已更新至 2026-10-02。
+
 产品定位见 [PRODUCT.md](PRODUCT.md)，界面规范见 [DESIGN.md](DESIGN.md)，本次场景 AI 需求、实施与验收见 [实施方案](docs/SCENARIO_AI_IMPLEMENTATION_2026-09-30.md)。此前参考项目和问题台账见 [产品体验审查](docs/PRODUCT_REVIEW_2026-09-30.md)，历史变更见 [变更记录](docs/CHANGELOG.md)。贡献入口见 [CONTRIBUTING.md](CONTRIBUTING.md)。源码已按所有者要求提交 GitHub，产品许可证与资源权属仍待所有者确认，当前提交不构成开源许可授予。
